@@ -1,2 +1,4 @@
 # ExfilGuard-static-taint-analysis
 ExfilGuard - Detecting Secret Exfiltration in GitHub Actions Workflows Using Static Taint Analysis.
+
+ExfilGuard is a static taint analysis framework for detecting potential secret exfiltration in GitHub Actions workflows. The framework analyzes workflow YAML files together with embedded Bash, Python, and Node.js scripts to track sensitive data flows from sources, including repository secrets and environment variables, to network-related sinks such as HTTP requests, command-line transfer utilities, and DNS queries. ExfilGuard constructs interpretable taint-flow paths and assigns risk levels to suspicious flows, enabling developers to identify both the origin and potential destination of sensitive data exposure. The framework is evaluated using a benchmark comprising real-world GitHub Actions workflows and controlled CI/CD attack scenarios, with precision, recall, F1-score, and false-positive rate as the primary evaluation metrics.
