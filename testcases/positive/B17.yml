@@ -1,0 +1,9 @@
+name: B27-dns-dig
+on: workflow_dispatch
+jobs:
+   test:
+     runs-on: ubuntu-latest
+     env:
+       API_KEY: ${{ secrets.API_KEY }}
+     steps:
+       - run: bash scripts/s06_02.sh

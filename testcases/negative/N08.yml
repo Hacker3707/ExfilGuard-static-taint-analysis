@@ -1,0 +1,7 @@
+name: B25-node-benign-http
+on: workflow_dispatch
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: node scripts/s05_05.js

