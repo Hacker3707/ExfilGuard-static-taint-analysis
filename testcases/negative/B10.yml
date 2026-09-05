@@ -1,0 +1,11 @@
+name: N10-hash-benign
+on: workflow_dispatch
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      API_KEY: ${{ secrets.API_KEY }}
+    steps:
+      - run: |
+          digest=$(printf '%s' "$API_KEY" | sha256sum | cut -d' ' -f1)
+          echo "$digest"

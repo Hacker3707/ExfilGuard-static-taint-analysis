@@ -12,6 +12,13 @@ VAR_PATTERN = re.compile(
     r"\$([A-Za-z_][A-Za-z0-9_]*)"
 )
 
+# Trusted / allowlisted egress destinations
+ALLOWLISTED_DOMAINS = [
+    "api.github.com",
+    "company.com",
+    "localhost",
+    "127.0.0.1",
+]
 
 def get_secret_source(value):
 
@@ -34,6 +41,16 @@ def find_variable_references(text):
 def is_curl_command(command):
 
     return command.strip().startswith("curl")
+
+
+def is_allowlisted_destination(command):
+
+    for domain in ALLOWLISTED_DOMAINS:
+
+        if domain in command:
+            return True
+
+    return False
 
 
 # Gộp các dòng có dấu \ ở cuối
@@ -96,6 +113,7 @@ def analyze_run_script(
     step_index,
     step_name
 ):
+    detections = []
 
     lines = get_logical_lines(script)
 
@@ -165,6 +183,16 @@ def analyze_run_script(
 
         if is_curl_command(line):
 
+            # =========================
+            # ALLOWLIST CHECK
+            # =========================
+
+            if is_allowlisted_destination(line):
+                print(
+                    f"[ALLOW] Trusted destination detected: {line}"
+                )
+
+                continue
 
             references = find_variable_references(
                 line
@@ -197,6 +225,16 @@ def analyze_run_script(
                             "curl"
 
                     }
+
+                    detections.append({
+                        "Job": job_name,
+                        "Step": step_index,
+                        "Step Name": step_name,
+                        "Command": line,
+                        "Source": tainted[ref]["Source"],
+                        "Sink": sink,
+                        "Path": path
+                    })
 
 
                     print()
@@ -304,10 +342,13 @@ def analyze_run_script(
                     # Tránh báo trùng
                     break
 
+    return detections
+
 
 
 def analyze_workflow(file_path):
 
+    detections = []
 
     with open(
 
@@ -416,6 +457,12 @@ def analyze_workflow(file_path):
 
         ):
 
+            if not isinstance(step, dict):
+                print(
+                    f"[WARNING] Invalid step format "
+                    f"in job '{job_name}', step {step_index}"
+                )
+                continue
 
             # -------------------------
             # Tạo scope riêng cho Step
@@ -513,23 +560,18 @@ def analyze_workflow(file_path):
                 "run"
             )
 
-
             if run_script:
-
-
-                analyze_run_script(
-
+                step_detections = analyze_run_script(
                     run_script,
-
                     step_tainted,
-
                     job_name,
-
                     step_index,
-
                     step_name
-
                 )
+
+                detections.extend(step_detections)
+
+    return detections
 
 
 

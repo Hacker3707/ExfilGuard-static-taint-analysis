@@ -1,0 +1,7 @@
+name: N29-dns-benign-no-secret
+on: workflow_dispatch
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: nslookup example.invalid
