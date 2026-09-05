@@ -1,124 +1,167 @@
 import os
+import traceback
 from exfilguard import analyze_workflow
 
+POSITIVE_DIR = "testcases/positive"
+NEGATIVE_DIR = "testcases/negative"
 
-TESTCASE_DIR = "testcases"
 
+def evaluate_directory(directory, ground_truth):
+    results = []
 
-def evaluate():
-    tp = 0
-    tn = 0
-    fp = 0
-    fn = 0
+    if not os.path.exists(directory):
+        print(f"[WARNING] Directory not found: {directory}")
+        return results
 
-    details = []
-
-    # ============================================================
-    # Evaluate Positive Test Cases
-    # ============================================================
-    positive_dir = os.path.join(TESTCASE_DIR, "positive")
-
-    for filename in sorted(os.listdir(positive_dir)):
-
+    for filename in sorted(os.listdir(directory)):
         if not filename.endswith((".yml", ".yaml")):
             continue
 
-        file_path = os.path.join(positive_dir, filename)
+        file_path = os.path.join(directory, filename)
 
         print(f"\n>>> Evaluating: {file_path}")
 
-        detections = analyze_workflow(file_path)
+        try:
+            detections = analyze_workflow(file_path)
+            dangerous_detections = [
+                d for d in detections
+                if d.get("Risk_Level") in ["MEDIUM", "HIGH", "CRITICAL"]
+            ]
 
-        detected = len(detections) > 0
+            detected = len(dangerous_detections) > 0
 
-        if detected:
-            tp += 1
-            result = "TP"
-        else:
-            fn += 1
-            result = "FN"
+            if ground_truth == "Positive":
+                label = "TP" if detected else "FN"
+            else:
+                label = "FP" if detected else "TN"
 
-        details.append(
-            (filename, "Positive", detected, result)
-        )
+            # Lấy thông tin risk
+            if detections:
+                max_risk = max(
+                    detections,
+                    key=lambda d: d.get("Risk_Score", 0)
+                )
 
-    # ============================================================
-    # Evaluate Negative Test Cases
-    # ============================================================
-    negative_dir = os.path.join(TESTCASE_DIR, "negative")
+                risk_score = max_risk.get("Risk_Score", 0)
+                risk_level = max_risk.get("Risk_Level", "UNKNOWN")
+                sink = max_risk.get("Sink", "UNKNOWN")
+                source = max_risk.get("Source", "UNKNOWN")
+                destination = max_risk.get(
+                    "Destination_Type",
+                    "UNKNOWN"
+                )
+            else:
+                risk_score = 0
+                risk_level = "NONE"
+                sink = "-"
+                source = "-"
+                destination = "-"
 
-    for filename in sorted(os.listdir(negative_dir)):
+            results.append({
+                "file": filename,
+                "ground_truth": ground_truth,
+                "detected": detected,
+                "label": label,
+                "risk_score": risk_score,
+                "risk_level": risk_level,
+                "source": source,
+                "sink": sink,
+                "destination": destination
+            })
 
-        if not filename.endswith((".yml", ".yaml")):
-            continue
+            print(
+                f"{filename:<25}"
+                f"{ground_truth:<12}"
+                f"{'DETECTED' if detected else 'NOT DETECTED':<18}"
+                f"{label:<6}"
+                f"Risk={risk_score:<4}"
+                f"{risk_level}"
+            )
 
-        file_path = os.path.join(negative_dir, filename)
+            if detections:
+                print(f"    Source      : {source}")
+                print(f"    Sink        : {sink}")
+                print(f"    Destination : {destination}")
 
-        detections = analyze_workflow(file_path)
+                for d in detections:
+                    print(
+                        f"    Path        : "
+                        f"{' -> '.join(d['Path'])}"
+                    )
 
-        detected = len(detections) > 0
+        except Exception as e:
+            print(f"[ERROR] {filename}: {e}")
+            traceback.print_exc()
 
-        if detected:
-            fp += 1
-            result = "FP"
-        else:
-            tn += 1
-            result = "TN"
+    return results
 
-        details.append(
-            (filename, "Negative", detected, result)
-        )
 
-    # ============================================================
-    # Calculate Metrics
-    # ============================================================
+def calculate_metrics(results):
+    TP = sum(1 for r in results if r["label"] == "TP")
+    TN = sum(1 for r in results if r["label"] == "TN")
+    FP = sum(1 for r in results if r["label"] == "FP")
+    FN = sum(1 for r in results if r["label"] == "FN")
 
-    precision = tp / (tp + fp) if (tp + fp) > 0 else 0
-    recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+    precision = TP / (TP + FP) if TP + FP > 0 else 0
+    recall = TP / (TP + FN) if TP + FN > 0 else 0
 
     f1 = (
         2 * precision * recall / (precision + recall)
-        if (precision + recall) > 0
+        if precision + recall > 0
         else 0
     )
 
-    fpr = fp / (fp + tn) if (fp + tn) > 0 else 0
+    fpr = FP / (FP + TN) if FP + TN > 0 else 0
 
-    # ============================================================
-    # Print Results
-    # ============================================================
+    return TP, TN, FP, FN, precision, recall, f1, fpr
 
-    print("=" * 60)
+
+def main():
+    all_results = []
+
+    all_results.extend(
+        evaluate_directory(POSITIVE_DIR, "Positive")
+    )
+
+    all_results.extend(
+        evaluate_directory(NEGATIVE_DIR, "Negative")
+    )
+
+    TP, TN, FP, FN, precision, recall, f1, fpr = calculate_metrics(
+        all_results
+    )
+
+    print("\n" + "=" * 80)
     print("EXFILGUARD DETECTION EFFECTIVENESS")
-    print("=" * 60)
+    print("=" * 80)
 
-    print(f"True Positive  (TP): {tp}")
-    print(f"True Negative  (TN): {tn}")
-    print(f"False Positive (FP): {fp}")
-    print(f"False Negative (FN): {fn}")
+    print(f"True Positive  (TP): {TP}")
+    print(f"True Negative  (TN): {TN}")
+    print(f"False Positive (FP): {FP}")
+    print(f"False Negative (FN): {FN}")
 
-    print("-" * 60)
+    print("-" * 80)
 
-    print(f"Precision       : {precision:.4f} ({precision * 100:.2f}%)")
-    print(f"Recall          : {recall:.4f} ({recall * 100:.2f}%)")
-    print(f"F1-score        : {f1:.4f} ({f1 * 100:.2f}%)")
+    print(f"Precision         : {precision:.4f} ({precision * 100:.2f}%)")
+    print(f"Recall            : {recall:.4f} ({recall * 100:.2f}%)")
+    print(f"F1-score          : {f1:.4f} ({f1 * 100:.2f}%)")
     print(f"False Positive Rate: {fpr:.4f} ({fpr * 100:.2f}%)")
 
-    print("=" * 60)
+    print("=" * 80)
 
     print("\nDETAILED RESULTS")
-    print("-" * 60)
+    print("-" * 80)
 
-    for filename, label, detected, result in details:
-        status = "DETECTED" if detected else "NOT DETECTED"
-
+    for r in all_results:
         print(
-            f"{filename:25} "
-            f"{label:10} "
-            f"{status:15} "
-            f"{result}"
+            f"{r['file']:<25}"
+            f"{r['ground_truth']:<12}"
+            f"{'DETECTED' if r['detected'] else 'NOT DETECTED':<18}"
+            f"{r['label']:<6}"
+            f"Risk={r['risk_score']:<4}"
+            f"{r['risk_level']}"
         )
 
 
 if __name__ == "__main__":
-    evaluate()
+    main()
