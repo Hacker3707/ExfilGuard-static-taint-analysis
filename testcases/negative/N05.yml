@@ -1,4 +1,4 @@
-name: B19-python-benign-hash
+name: N05-python-benign-hash
 on: workflow_dispatch
 jobs:
   test:

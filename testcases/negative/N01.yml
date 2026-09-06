@@ -1,4 +1,4 @@
-name: N04-benign-whitelist
+name: N01-benign-whitelist
 on: workflow_dispatch
 jobs:
   test:

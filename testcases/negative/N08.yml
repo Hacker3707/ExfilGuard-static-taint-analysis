@@ -1,4 +1,4 @@
-name: B25-node-benign-http
+name: N08-node-benign-http
 on: workflow_dispatch
 jobs:
   test:

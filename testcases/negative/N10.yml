@@ -1,4 +1,4 @@
-name: N30-dns-benign-secret-unused
+name: N10-dns-benign-secret-unused
 
 on: workflow_dispatch
 

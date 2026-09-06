@@ -8,8 +8,8 @@ from dataclasses import dataclass
 SOURCE_WEIGHTS = {
     "S_ctx": 3.0,    # ${{ secrets.* }}
     "S_dyn": 3.0,    # IMDS / dynamic cloud credentials
+    "S_prog": 2.0,    # programmatic environment keys
     "S_env": 2.0,    # environment credentials
-    "S_lang": 2.0,   # programmatic environment keys
     "S_inp": 1.0,    # workflow inputs
 }
 

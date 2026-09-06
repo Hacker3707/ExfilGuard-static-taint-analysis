@@ -1,4 +1,4 @@
-name: B20-python-benign-http
+name: N06-python-benign-http
 on: workflow_dispatch
 jobs:
   test:

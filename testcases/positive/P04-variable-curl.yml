@@ -1,4 +1,4 @@
-name: B06-variable-curl
+name: P04-variable-curl
 on: workflow_dispatch
 jobs:
   test:

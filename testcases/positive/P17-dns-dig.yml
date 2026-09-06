@@ -1,4 +1,4 @@
-name: B27-dns-dig
+name: P17-dns-dig
 on: workflow_dispatch
 jobs:
    test:

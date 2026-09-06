@@ -1,4 +1,4 @@
-name: N29-dns-benign-no-secret
+name: N09-dns-benign-no-secret
 on: workflow_dispatch
 jobs:
   test:

@@ -1,4 +1,4 @@
-name: B07-three-hop
+name: P05-three-hop
 on: workflow_dispatch
 jobs:
   test:

@@ -1,4 +1,4 @@
-name: N09-mask-benign
+name: N03-mask-benign
 on: workflow_dispatch
 jobs:
   test:

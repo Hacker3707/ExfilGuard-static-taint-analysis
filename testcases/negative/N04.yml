@@ -1,4 +1,4 @@
-name: N10-hash-benign
+name: N04-hash-benign
 on: workflow_dispatch
 jobs:
   test:
