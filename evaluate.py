@@ -1,9 +1,34 @@
 import os
 import traceback
-from exfilguard import analyze_workflow
+from main import analyze_workflow
 
 POSITIVE_DIR = "testcases/positive"
 NEGATIVE_DIR = "testcases/negative"
+
+# Bảng quy tắc Rule ID chuẩn cho Source và Sink
+SOURCE_RULES = {
+    "S_ctx": "RULE-SRC-01 (Context Secrets / GitHub Token)",
+    "S_dyn": "RULE-SRC-02 (Cloud IMDS / Dynamic Credentials)",
+    "S_prog": "RULE-SRC-03 (Programmatic Env Variable Access)",
+    "S_env": "RULE-SRC-04 (Workflow Environment Binding)",
+    "S_inp": "RULE-SRC-05 (Untrusted Workflow Trigger Inputs)",
+}
+
+SINK_RULES = {
+    "K_cli": "RULE-SNK-01 (CLI Network Transfer Utility)",
+    "K_dns": "RULE-SNK-02 (DNS Exfiltration Channel)",
+    "K_lib": "RULE-SNK-03 (HTTP/Socket Client Library)",
+    "K_raw": "RULE-SNK-04 (Raw Network Socket Egress)",
+    "K_scm": "RULE-SNK-05 (SCM Push / Insecure Commit)",
+}
+
+
+def get_src_rule_id(cat: str) -> str:
+    return SOURCE_RULES.get(cat, "RULE-SRC-UNKNOWN")
+
+
+def get_snk_rule_id(cat: str) -> str:
+    return SINK_RULES.get(cat, "RULE-SNK-UNKNOWN")
 
 
 def evaluate_directory(directory, ground_truth):
@@ -18,13 +43,13 @@ def evaluate_directory(directory, ground_truth):
             continue
 
         file_path = os.path.join(directory, filename)
-
         print(f"\n>>> Evaluating: {file_path}")
 
         try:
             detections = analyze_workflow(file_path)
             dangerous_detections = [
-                d for d in detections
+                d
+                for d in detections
                 if d.get("Risk_Level") in ["MEDIUM", "HIGH", "CRITICAL"]
             ]
 
@@ -35,26 +60,23 @@ def evaluate_directory(directory, ground_truth):
             else:
                 label = "FP" if detected else "TN"
 
-            # Lấy thông tin risk
+            # Trích xuất thông tin rủi ro cao nhất
             if detections:
-                max_risk = max(
-                    detections,
-                    key=lambda d: d.get("Risk_Score", 0)
-                )
-
+                max_risk = max(detections, key=lambda d: d.get("Risk_Score", 0))
                 risk_score = max_risk.get("Risk_Score", 0)
                 risk_level = max_risk.get("Risk_Level", "UNKNOWN")
-                sink = max_risk.get("Sink", "UNKNOWN")
-                source = max_risk.get("Source", "UNKNOWN")
-                destination = max_risk.get(
-                    "Destination_Type",
-                    "UNKNOWN"
-                )
+                sink = max_risk.get("Sink", "-")
+                sink_cat = max_risk.get("Sink_Category", "K_cli")
+                source = max_risk.get("Source", "-")
+                source_cat = max_risk.get("Source_Category", "S_ctx")
+                destination = max_risk.get("Destination_Type", "UNKNOWN")
             else:
                 risk_score = 0
                 risk_level = "NONE"
                 sink = "-"
+                sink_cat = "-"
                 source = "-"
+                source_cat = "-"
                 destination = "-"
 
             results.append({
@@ -65,8 +87,10 @@ def evaluate_directory(directory, ground_truth):
                 "risk_score": risk_score,
                 "risk_level": risk_level,
                 "source": source,
+                "source_cat": source_cat,
                 "sink": sink,
-                "destination": destination
+                "sink_cat": sink_cat,
+                "destination": destination,
             })
 
             print(
@@ -78,16 +102,23 @@ def evaluate_directory(directory, ground_truth):
                 f"{risk_level}"
             )
 
+            # In chi tiết Sink, Source, Rule ID và Taint Path
             if detections:
-                print(f"    Source      : {source}")
-                print(f"    Sink        : {sink}")
+                src_full_rule = get_src_rule_id(source_cat)
+                snk_full_rule = get_snk_rule_id(sink_cat)
+
+                print(f"    Source      : {source} [{source_cat}] ({src_full_rule})")
+                print(f"    Sink        : {sink} [{sink_cat}] ({snk_full_rule})")
                 print(f"    Destination : {destination}")
 
                 for d in detections:
-                    print(
-                        f"    Path        : "
-                        f"{' -> '.join(d['Path'])}"
-                    )
+                    d_src_cat = d.get("Source_Category", source_cat)
+                    d_snk_cat = d.get("Sink_Category", sink_cat)
+                    d_src_code = get_src_rule_id(d_src_cat).split()[0]
+                    d_snk_code = get_snk_rule_id(d_snk_cat).split()[0]
+                    path_str = " -> ".join(d.get("Path", []))
+
+                    print(f"    Path [{d_src_code} -> {d_snk_code}] : {path_str}")
 
         except Exception as e:
             print(f"[ERROR] {filename}: {e}")
@@ -102,56 +133,37 @@ def calculate_metrics(results):
     FP = sum(1 for r in results if r["label"] == "FP")
     FN = sum(1 for r in results if r["label"] == "FN")
 
-    precision = TP / (TP + FP) if TP + FP > 0 else 0
-    recall = TP / (TP + FN) if TP + FN > 0 else 0
-
-    f1 = (
-        2 * precision * recall / (precision + recall)
-        if precision + recall > 0
-        else 0
-    )
-
-    fpr = FP / (FP + TN) if FP + TN > 0 else 0
+    precision = TP / (TP + FP) if (TP + FP) > 0 else 0.0
+    recall = TP / (TP + FN) if (TP + FN) > 0 else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+    fpr = FP / (FP + TN) if (FP + TN) > 0 else 0.0
 
     return TP, TN, FP, FN, precision, recall, f1, fpr
 
 
 def main():
     all_results = []
+    all_results.extend(evaluate_directory(POSITIVE_DIR, "Positive"))
+    all_results.extend(evaluate_directory(NEGATIVE_DIR, "Negative"))
 
-    all_results.extend(
-        evaluate_directory(POSITIVE_DIR, "Positive")
-    )
-
-    all_results.extend(
-        evaluate_directory(NEGATIVE_DIR, "Negative")
-    )
-
-    TP, TN, FP, FN, precision, recall, f1, fpr = calculate_metrics(
-        all_results
-    )
+    TP, TN, FP, FN, precision, recall, f1, fpr = calculate_metrics(all_results)
 
     print("\n" + "=" * 80)
     print("EXFILGUARD DETECTION EFFECTIVENESS")
     print("=" * 80)
-
     print(f"True Positive  (TP): {TP}")
     print(f"True Negative  (TN): {TN}")
     print(f"False Positive (FP): {FP}")
     print(f"False Negative (FN): {FN}")
-
     print("-" * 80)
-
-    print(f"Precision         : {precision:.4f} ({precision * 100:.2f}%)")
-    print(f"Recall            : {recall:.4f} ({recall * 100:.2f}%)")
-    print(f"F1-score          : {f1:.4f} ({f1 * 100:.2f}%)")
+    print(f"Precision          : {precision:.4f} ({precision * 100:.2f}%)")
+    print(f"Recall             : {recall:.4f} ({recall * 100:.2f}%)")
+    print(f"F1-score           : {f1:.4f} ({f1 * 100:.2f}%)")
     print(f"False Positive Rate: {fpr:.4f} ({fpr * 100:.2f}%)")
-
     print("=" * 80)
 
     print("\nDETAILED RESULTS")
     print("-" * 80)
-
     for r in all_results:
         print(
             f"{r['file']:<25}"
