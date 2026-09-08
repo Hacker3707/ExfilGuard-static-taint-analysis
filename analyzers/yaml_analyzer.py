@@ -15,6 +15,10 @@ from engine.common import (
     calculate_risk,
 )
 from engine.models import DetectionResult
+from engine.arg_roles import evaluate_cli_flow
+from engine.file_taint import FileTaintState
+from engine.models import FINDING_EXPOSURE
+from catalogs import ARTIFACT_ACTIONS
 from analyzers.bash_analyzer import BashAnalyzer
 from analyzers.python_analyzer import PythonAnalyzer
 from analyzers.nodejs_analyzer import NodejsAnalyzer
@@ -24,8 +28,14 @@ class YamlAnalyzer:
     def __init__(self, config: ExfilGuardConfig = DEFAULT_CONFIG):
         self.config = config
         self.bash_engine = BashAnalyzer() if config.enable_bash else None
-        self.python_engine = PythonAnalyzer() if config.enable_python else None
-        self.nodejs_engine = NodejsAnalyzer() if config.enable_nodejs else None
+        self.python_engine = (
+            PythonAnalyzer(config.enable_lexical_source)
+            if config.enable_python else None
+        )
+        self.nodejs_engine = (
+            NodejsAnalyzer(config.enable_lexical_source)
+            if config.enable_nodejs else None
+        )
 
     def _get_logical_lines(self, script_content: str):
         lines = script_content.splitlines()
@@ -47,7 +57,18 @@ class YamlAnalyzer:
 
     def _resolve_file_path(self, script_path: str, workflow_path: str):
         workflow_dir = os.path.dirname(os.path.abspath(workflow_path))
-        target = os.path.join(workflow_dir, script_path.strip().strip("'\""))
+        script_path = script_path.strip().strip("'\"")
+        # Workflow nam o .github/workflows/, nhung `python python/x.py` la
+        # relative voi REPO ROOT. Ban cu chi thu workflow_dir nen truot het.
+        bases = [workflow_dir]
+        if os.path.basename(workflow_dir) == "workflows":
+            bases.insert(0, os.path.abspath(
+                os.path.join(workflow_dir, "..", "..")))
+        for base in bases:
+            candidate = os.path.normpath(os.path.join(base, script_path))
+            if os.path.isfile(candidate):
+                return candidate
+        target = os.path.join(workflow_dir, script_path)
         if os.path.isfile(target):
             return target
         scripts_dir = os.path.join(workflow_dir, "scripts", os.path.basename(script_path))
@@ -69,11 +90,25 @@ class YamlAnalyzer:
         jobs = workflow.get("jobs", {}) if isinstance(workflow, dict) else {}
         all_detections = []
 
+        # Workflow-level env: ban cu bo sot hoan toan.
+        workflow_tainted = {}
+        for var, val in (workflow.get("env") or {}).items():
+            sec_match = SECRET_PATTERN.search(str(val))
+            if sec_match:
+                workflow_tainted[var] = {
+                    "Source": sec_match.group(),
+                    "Path": [sec_match.group(), f"workflow.env.{var}"],
+                }
+
         for job_name, job in jobs.items():
-            job_tainted = {}
+            if not isinstance(job, dict):
+                continue
+            job_tainted = dict(workflow_tainted)
+            # File taint song o pham vi JOB: file ton tai qua nhieu step.
+            job_files = FileTaintState()
 
             # 1. Job-level env collection
-            for var, val in job.get("env", {}).items():
+            for var, val in (job.get("env") or {}).items():
                 val_str = str(val)
                 sec_match = SECRET_PATTERN.search(val_str)
                 inp_match = re.search(r"\$\{\{\s*inputs\.[A-Za-z0-9_]+\s*\}\}", val_str)
@@ -89,14 +124,14 @@ class YamlAnalyzer:
                     }
 
             # 2. Steps iteration
-            for s_idx, step in enumerate(job.get("steps", []), start=1):
+            for s_idx, step in enumerate(job.get("steps") or [], start=1):
                 if not isinstance(step, dict):
                     continue
 
                 step_tainted = job_tainted.copy()
 
                 # Step-level env collection & YAML-level env-to-env propagation
-                for var, val in step.get("env", {}).items():
+                for var, val in (step.get("env") or {}).items():
                     val_str = str(val)
                     sec_match = SECRET_PATTERN.search(val_str)
                     inp_match = re.search(r"\$\{\{\s*inputs\.[A-Za-z0-9_]+\s*\}\}", val_str)
@@ -119,8 +154,48 @@ class YamlAnalyzer:
                             "Path": job_tainted[ref_name]["Path"] + [f"step.{s_idx}.env.{var}"]
                         }
 
+                # ==============================================================
+                # RULE-SNK-06 (K_artifact): upload-artifact voi duong dan tainted.
+                # Artifact KHONG duoc GitHub mask, nen secret trong file lo
+                # nguyen van cho bat ky ai co quyen read repo.
+                # ==============================================================
+                uses = step.get("uses")
+                if isinstance(uses, str) and any(
+                    uses.split("@")[0].strip().startswith(a)
+                    for a in ARTIFACT_ACTIONS
+                ):
+                    with_block = step.get("with") or {}
+                    raw_path = str(with_block.get("path", ""))
+                    for pattern in [
+                        p.strip() for p in raw_path.splitlines() if p.strip()
+                    ]:
+                        for path, info in job_files.match(pattern):
+                            s_cat = classify_source(info["Source"])
+                            score, level = calculate_risk(
+                                s_cat, "K_artifact", "untrusted_external"
+                            )
+                            all_detections.append(
+                                DetectionResult(
+                                    source=info["Source"],
+                                    source_category=s_cat,
+                                    sink=uses,
+                                    sink_category="K_artifact",
+                                    destination_type="untrusted_external",
+                                    risk_score=score,
+                                    risk_level=level,
+                                    command=f"uses: {uses}",
+                                    context=f"{job_name}.step_{s_idx}.uses",
+                                    path=info["Path"] + ["upload-artifact"],
+                                    finding_type=FINDING_EXPOSURE,
+                                    note=(
+                                        f"File tainted '{path}' duoc upload. "
+                                        "Artifact khong duoc GitHub mask."
+                                    ),
+                                )
+                            )
+
                 run_script = step.get("run")
-                if not run_script:
+                if not isinstance(run_script, str):
                     continue
 
                 lines = self._get_logical_lines(run_script)
@@ -128,13 +203,22 @@ class YamlAnalyzer:
                 # ==============================================================
                 # CẤP 1: YAML-ONLY CHECK (Chạy khi tắt Bash để làm Ablation)
                 # ==============================================================
-                if self.config.enable_yaml:
+                # CAP 1 chi danh cho ablation. Neu bash_engine dang bat thi
+                # bo qua, neu khong moi dong curl se sinh 2 detection.
+                if self.config.enable_yaml and not self.bash_engine:
                     for line in lines:
                         sink_match = CLI_SINK_PATTERN.search(line) or DNS_SINK_PATTERN.search(line)
                         if not sink_match:
                             continue
 
                         sink_cmd = sink_match.group(1)
+
+                        # Kiem tra vai tro argument truoc. Neu secret chi nam o
+                        # vi tri dich den thi bo qua - day la nguon FP chinh.
+                        flow = evaluate_cli_flow(line, sink_cmd, step_tainted)
+                        if flow is not None and flow["verdict"] != "EXFIL":
+                            continue
+
                         sec_match = SECRET_PATTERN.search(line)
                         inp_match = re.search(r"\$\{\{\s*inputs\.[A-Za-z0-9_]+\s*\}\}", line)
                         env_match = re.search(r"\$\{\{\s*env\.([A-Za-z_][A-Za-z0-9_]*)\s*\}\}", line)
@@ -173,7 +257,7 @@ class YamlAnalyzer:
                                     risk_score=score,
                                     risk_level=level,
                                     command=line,
-                                    context=f"step_{s_idx}.yaml_direct",
+                                    context=f"{job_name}.step_{s_idx}.yaml_direct",
                                     path=full_path,
                                 )
                             )
@@ -182,10 +266,18 @@ class YamlAnalyzer:
                 # CẤP 2: BASH ANALYZER
                 # ==============================================================
                 if self.bash_engine:
+                    exported = {}
                     step_tainted, bash_dets = self.bash_engine.analyze(
-                        lines, step_tainted, f"step_{s_idx}"
+                        lines, step_tainted, f"{job_name}.step_{s_idx}",
+                        file_state=job_files,
+                        step_id=step.get("id"),
+                        exported=exported,
                     )
                     all_detections.extend(bash_dets)
+                    # Taint ghi vao $GITHUB_ENV / $GITHUB_OUTPUT phai song sang
+                    # cac step SAU, nen day len pham vi job.
+                    for name in sorted(exported):
+                        job_tainted[name] = exported[name]
 
                     for line in lines:
                         sh_match = re.search(
@@ -240,14 +332,14 @@ class YamlAnalyzer:
                                         _, py_file_dets = self.python_engine.analyze(
                                             pf.read().splitlines(),
                                             step_tainted,
-                                            f"step_{s_idx}.{os.path.basename(target_py)}",
+                                            f"{job_name}.step_{s_idx}.{os.path.basename(target_py)}",
                                         )
                                         all_detections.extend(py_file_dets)
                         i += 1
 
                     if python_lines:
                         _, py_dets = self.python_engine.analyze(
-                            python_lines, step_tainted, f"step_{s_idx}.python"
+                            python_lines, step_tainted, f"{job_name}.step_{s_idx}.python"
                         )
                         all_detections.extend(py_dets)
 
@@ -279,15 +371,38 @@ class YamlAnalyzer:
                                         _, js_file_dets = self.nodejs_engine.analyze(
                                             jf.read().splitlines(),
                                             step_tainted,
-                                            f"step_{s_idx}.{os.path.basename(target_js)}",
+                                            f"{job_name}.step_{s_idx}.{os.path.basename(target_js)}",
                                         )
                                         all_detections.extend(js_file_dets)
                         j += 1
 
                     if node_lines:
                         _, js_dets = self.nodejs_engine.analyze(
-                            node_lines, step_tainted, f"step_{s_idx}.node"
+                            node_lines, step_tainted, f"{job_name}.step_{s_idx}.node"
                         )
                         all_detections.extend(js_dets)
 
-        return [d.to_dict() for d in all_detections]
+        return self._dedupe(all_detections)
+
+    def _dedupe(self, detections):
+        """Chan detection trung khi nhieu tang cung quet mot dong."""
+        seen = set()
+        out = []
+        for det in detections:
+            data = det.to_dict()
+            key = (
+                data.get("Context"),
+                data.get("Sink"),
+                data.get("Source"),
+                data.get("Command"),
+                data.get("Finding_Type"),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            # Loc theo finding_type + min_risk_level. Che do benchmark chi lay
+            # EXFIL/EXPOSURE nen SUPPLY_CHAIN va INFO khong bi tinh la FP.
+            if not self.config.should_report(det):
+                continue
+            out.append(data)
+        return out

@@ -1,16 +1,30 @@
 import re
 from catalogs import NODEJS_SINK_PATTERN, NODEJS_ENV_PATTERNS, SECRET_PATTERN
 from engine.common import classify_source, classify_destination, calculate_risk
+from engine.common import is_credential_lexical
 from engine.models import DetectionResult
+from engine.arg_roles import (
+    split_statements,
+    call_payload_blob,
+    split_call_args,
+    classify_destination_roles,
+    JS_PAYLOAD_KEYS,
+)
 
 class NodejsAnalyzer:
+    def __init__(self, lexical_env_source=False):
+        """lexical_env_source: bat SRC-04/SRC-05 (khop ten bien voi
+        TOKEN/SECRET/KEY/PASS/...). Tat mac dinh vi no coi CACHE_KEY,
+        SORT_KEY, PRIMARY_KEY la nhay cam."""
+        self.lexical_env_source = lexical_env_source
+
     def analyze(self, lines, tainted_env, context_name="nodejs"):
         tainted = tainted_env.copy()
         detections = []
 
         statements = []
         for l in lines:
-            statements.extend([s.strip() for s in re.split(r";(?=(?:[^'\"]|'[^']*'|\"[^\"]*\")*$)", l) if s.strip()])
+            statements.extend(split_statements(l))
 
         for stmt in statements:
             # 1. Assignment: const/let/var x = ...
@@ -27,7 +41,15 @@ class NodejsAnalyzer:
 
                 if sec_match:
                     tainted[var] = {"Source": sec_match.group(), "Path": [sec_match.group(), f"{context_name}.{var}"]}
-                elif env_match:
+                elif env_match and env_match in tainted:
+                    # RULE T_3: ke thua taint tu bien env da tainted o YAML.
+                    info = tainted[env_match]
+                    tainted[var] = {
+                        "Source": info["Source"],
+                        "Path": info["Path"] + [f"{context_name}.{var}"],
+                    }
+                elif env_match and self.lexical_env_source and is_credential_lexical(env_match):
+                    # SRC-05: ten bien khop lexical qualifier. Tat mac dinh.
                     src = f"process.env.{env_match}"
                     tainted[var] = {"Source": src, "Path": [src, f"{context_name}.{var}"]}
                 else:
@@ -40,9 +62,13 @@ class NodejsAnalyzer:
             sink_match = NODEJS_SINK_PATTERN.search(stmt)
             if sink_match:
                 sink_cmd = sink_match.group(1)
-                direct_sec = SECRET_PATTERN.search(stmt)
+
+                call_text = stmt[sink_match.start():]
+                payload_blob = call_payload_blob(call_text, JS_PAYLOAD_KEYS)
+
+                direct_sec = SECRET_PATTERN.search(payload_blob)
                 culprit_ref = None
-                for ident in re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*\b", stmt):
+                for ident in re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*\b", payload_blob):
                     if ident in tainted:
                         culprit_ref = ident
                         break
@@ -52,7 +78,8 @@ class NodejsAnalyzer:
                     src_val = tainted[culprit_ref]["Source"] if culprit_ref else direct_sec.group()
                     s_cat = classify_source(src_val)
                     k_cat = "K_lib"
-                    d_type = classify_destination(stmt)
+                    positional, _ = split_call_args(call_text)
+                    d_type = classify_destination_roles(positional[:1], tainted)
                     score, level = calculate_risk(s_cat, k_cat, d_type)
 
                     detections.append(DetectionResult(
