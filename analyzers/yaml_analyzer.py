@@ -56,26 +56,52 @@ class YamlAnalyzer:
         return logical
 
     def _resolve_file_path(self, script_path: str, workflow_path: str):
+        """Giai duong dan script THAM CHIEU TRONG workflow.
+
+        Moi ung vien deu duoc suy ra tu vi tri file workflow, KHONG BAO GIO tu
+        thu muc lam viec hien tai. Fallback theo CWD lam ket qua phu thuoc vao
+        noi goi lenh: cung mot file, cung code, chay tu hai thu muc khac nhau
+        ra hai ket qua khac nhau. Voi mot benchmark thi do la loi nghiem trong
+        vi so lieu khong tai lap duoc.
+
+        Thu tu uu tien (repo root truoc, thu muc workflow sau cung):
+
+            1. repo/                <- .github/workflows/ len 2 muc
+            2. bench/               <- workflows/ len 1 muc
+            3. thu muc chua workflow
+
+        Uu tien nay khop ngu nghia GitHub Actions: `run:` chay tai
+        $GITHUB_WORKSPACE (repo root). Neu cung mot duong dan tuong doi ton tai
+        o nhieu base, phai chon cai GitHub thuc su chay.
+        """
         workflow_dir = os.path.dirname(os.path.abspath(workflow_path))
         script_path = script_path.strip().strip("'\"")
-        # Workflow nam o .github/workflows/, nhung `python python/x.py` la
-        # relative voi REPO ROOT. Ban cu chi thu workflow_dir nen truot het.
-        bases = [workflow_dir]
+
+        bases = []
+
+        # Len 2 muc: layout chuan `repo/.github/workflows/`. XET TRUOC TIEN vi
+        # GitHub Actions chay `run:` voi working-directory mac dinh la
+        # $GITHUB_WORKSPACE (repo root), KHONG phai thu muc chua workflow.
+        # `bash scripts/x.sh` vi vay tro toi repo/scripts/x.sh.
         if os.path.basename(workflow_dir) == "workflows":
-            bases.insert(0, os.path.abspath(
-                os.path.join(workflow_dir, "..", "..")))
+            bases.append(os.path.abspath(os.path.join(workflow_dir, "..", "..")))
+
+        # Len 1 muc: layout benchmark `bench/workflows/` canh `bench/scripts/`.
+        bases.append(os.path.abspath(os.path.join(workflow_dir, "..")))
+
+        # Cuoi cung moi la thu muc chua workflow.
+        bases.append(workflow_dir)
+
         for base in bases:
             candidate = os.path.normpath(os.path.join(base, script_path))
             if os.path.isfile(candidate):
                 return candidate
-        target = os.path.join(workflow_dir, script_path)
-        if os.path.isfile(target):
-            return target
-        scripts_dir = os.path.join(workflow_dir, "scripts", os.path.basename(script_path))
-        if os.path.isfile(scripts_dir):
-            return scripts_dir
-        if os.path.isfile(script_path):
-            return os.path.abspath(script_path)
+
+        # KHONG fallback theo os.getcwd(): xem docstring.
+        #
+        # Cung KHONG doan theo ten file (vd tim `scripts/<basename>` khi
+        # workflow chi ghi `bash x.sh`). Doan nhu vay co the chon nham mot file
+        # trung ten o cho khac, tao TP/FN gia ma khong co cach nao biet.
         return None
 
     def analyze(self, file_path: str):

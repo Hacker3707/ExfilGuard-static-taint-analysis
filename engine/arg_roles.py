@@ -588,7 +588,12 @@ def split_call_args(text):
 
 
 def call_payload_blob(text, payload_keys=PY_PAYLOAD_KWARGS):
+    """
+    Tra ve chuoi chi gom cac argument MANG DU LIEU.
 
+    Ban cu quet identifier tren CA statement, nen bien tainted nam o vi tri URL
+    cung bi tinh la exfil. Ham nay loai bo vi tri do.
+    """
     positional, keyword = split_call_args(text)
     blob = []
     for part in keyword:
