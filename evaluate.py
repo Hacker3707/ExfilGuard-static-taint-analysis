@@ -6,6 +6,7 @@ from main import analyze_workflow
 
 POSITIVE_DIR = "testcases/positive"
 NEGATIVE_DIR = "testcases/negative"
+REGRESSION_DIR = "regress_test"
 
 
 # ==============================================================================
@@ -439,6 +440,17 @@ def main():
         evaluate_directory(
             NEGATIVE_DIR,
             "Negative"
+        )
+    )
+
+    # --------------------------------------------------------------------------
+    # Quét TOÀN BỘ Negative
+    # --------------------------------------------------------------------------
+
+    all_results.extend(
+        evaluate_directory(
+            REGRESSION_DIR,
+            "Positive"
         )
     )
 
