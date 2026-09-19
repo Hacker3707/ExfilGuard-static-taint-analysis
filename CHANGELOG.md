@@ -1,6 +1,10 @@
 # CHANGELOG
 
-## [CHƯA release] - 2026-09-08 22:30 UTC
+## [b4e16ce] - 2026-09-09 10:06 UTC
+### Fix Bug
+- _resolve_file_path giả định layout .github/workflows/ nên tính repo root cách hai mức, không xử lý được layout workflows/ cạnh scripts/. Bỏ fallback resolve theo thư mục hiện hành vì nó che lỗi: kết quả phụ thuộc vào nơi chạy lệnh.
+
+## [RELEASED] - 2026-09-08 22:30 UTC
 
 **Commit:** `5279e4d99ec7dbe3e200336076afab8665f36dcf`  
 **Phạm vi kiểm thử:** Chỉ Dataset B + unit test. **Chưa chạy trên Dataset A. Chưa đọc** `data/adjudication.csv` hay `data/ground_truth.csv`.
