@@ -1,5 +1,11 @@
 # CHANGELOG
 
+## [e891def] - 2026-09-19 12:28:29 UTC
+
+### Refactor
+- `catalogs.py`: Tập trung định nghĩa và ánh xạ Source Rule ID và Sink Rule ID theo từng category, giúp catalog trở thành nguồn thống nhất cho Rule ID được sử dụng trong quá trình phân tích và đánh giá.
+- `evaluate.py`: Rút gọn logic xử lý Rule ID bằng cách sử dụng các helper từ `catalogs.py` thay vì duy trì mapping trực tiếp trong evaluator. Evaluator tập trung vào việc chạy benchmark, tổng hợp kết quả và hiển thị detection details.
+
 ## [f14b1bd] - 2026-09-19 11:58:48 UTC
 
 ### Sửa lỗi
