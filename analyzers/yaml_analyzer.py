@@ -89,6 +89,18 @@ class YamlAnalyzer:
         # Len 1 muc: layout benchmark `bench/workflows/` canh `bench/scripts/`.
         bases.append(os.path.abspath(os.path.join(workflow_dir, "..")))
 
+        # Dataset layout:
+        # repo/testcases/positive/workflow.yml
+        # repo/testcases/negative/workflow.yml
+        parent_dir = os.path.dirname(workflow_dir)
+
+        if os.path.basename(parent_dir) == "testcases":
+            bases.append(
+                os.path.abspath(
+                    os.path.join(workflow_dir, "..", "..")
+                )
+            )
+
         # Cuoi cung moi la thu muc chua workflow.
         bases.append(workflow_dir)
 
