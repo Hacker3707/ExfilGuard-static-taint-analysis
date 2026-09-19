@@ -1,11 +1,16 @@
 # CHANGELOG
 
+## [f14b1bd] - 2026-09-19 11:58:48 UTC
+
+### Sửa lỗi
+- `analyzers/yaml_analyzer.py`: Sửa lỗi resolve script path đối với layout `testcases/positive` và `testcases/negative`. Trước đó, các external script được workflow trong `testcases/positive` tham chiếu không được resolve đúng, khiến các test case P10–P22 bị đánh dấu False Negative.
+- P21 vẫn là False Negative do còn thiếu propagation rule cho GitHub Actions step outputs. Workflow truyền `${{ inputs.internal_token }}` qua `$GITHUB_OUTPUT` với tên `staged_val`, sau đó tham chiếu giá trị này bằng `${{ steps.step_source.outputs.staged_val }}` tại DNS sink. Analyzer hiện chưa propagate taint từ giá trị được ghi qua `$GITHUB_OUTPUT` sang expression tương ứng `steps.<step_id>.outputs.<output_name>`.
+
 ## [660802b] - 2026-09-19 08:06:09 UTC
 
 ### Thêm test
 - `regress_test/test_cwd_invariance.sh`: cùng một workflow chạy từ hai thư mục khác
   nhau phải cho output giống hệt.
-- 
 
 ## [b4e16ce] - 2026-09-09 10:06 UTC
 ### Fix Bug
