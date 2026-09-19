@@ -1,5 +1,12 @@
 # CHANGELOG
 
+## [660802b] - 2026-09-19 08:06:09 UTC
+
+### Thêm test
+- `regress_test/test_cwd_invariance.sh`: cùng một workflow chạy từ hai thư mục khác
+  nhau phải cho output giống hệt.
+- 
+
 ## [b4e16ce] - 2026-09-09 10:06 UTC
 ### Fix Bug
 - _resolve_file_path giả định layout .github/workflows/ nên tính repo root cách hai mức, không xử lý được layout workflows/ cạnh scripts/. Bỏ fallback resolve theo thư mục hiện hành vì nó che lỗi: kết quả phụ thuộc vào nơi chạy lệnh.
