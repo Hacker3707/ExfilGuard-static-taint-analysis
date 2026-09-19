@@ -2,43 +2,15 @@
 import os
 import traceback
 from main import analyze_workflow
+from catalogs import get_source_rule_id, get_sink_rule_id
 
+# ==============================================================================
+# DIRECTORY FOR TESTING
+# ==============================================================================
 
 POSITIVE_DIR = "testcases/positive"
 NEGATIVE_DIR = "testcases/negative"
 REGRESSION_DIR = "regress_test"
-
-
-# ==============================================================================
-# RULE ID
-# ==============================================================================
-
-SOURCE_RULES = {
-    "S_ctx": "RULE-SRC-01 (Context Secrets / GitHub Token)",
-    "S_dyn": "RULE-SRC-02 (Cloud IMDS / Dynamic Credentials)",
-    "S_prog": "RULE-SRC-03 (Programmatic Env Variable Access)",
-    "S_env": "RULE-SRC-04 (Workflow Environment Binding)",
-    "S_inp": "RULE-SRC-05 (Untrusted Workflow Trigger Inputs)",
-}
-
-SINK_RULES = {
-    "K_cli": "RULE-SNK-01 (CLI Network Transfer Utility)",
-    "K_dns": "RULE-SNK-02 (DNS Exfiltration Channel)",
-    "K_lib": "RULE-SNK-03 (HTTP/Socket Client Library)",
-    "K_raw": "RULE-SNK-04 (Raw Network Socket Egress)",
-    "K_scm": "RULE-SNK-05 (SCM Push / Insecure Commit)",
-    "K_file": "RULE-SNK-07 (File Transfer / Upload)",
-    "K_artifact": "RULE-SNK-06 (GitHub Actions Artifact Upload)",
-}
-
-
-def get_src_rule_id(cat):
-    return SOURCE_RULES.get(cat, "RULE-SRC-UNKNOWN")
-
-
-def get_snk_rule_id(cat):
-    return SINK_RULES.get(cat, "RULE-SNK-UNKNOWN")
-
 
 # ==============================================================================
 # EVALUATE ONE DIRECTORY
@@ -177,8 +149,8 @@ def evaluate_directory(directory, ground_truth):
                         sink_cat
                     )
 
-                    src_rule = get_src_rule_id(d_src_cat)
-                    snk_rule = get_snk_rule_id(d_snk_cat)
+                    src_rule = get_source_rule_id(d_src_cat)
+                    snk_rule = get_sink_rule_id(d_snk_cat)
 
                     d_source = d.get("Source", "-")
                     d_sink = d.get("Sink", "-")

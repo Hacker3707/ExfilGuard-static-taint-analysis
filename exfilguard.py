@@ -763,38 +763,74 @@ def analyze_python_commands(
 # PYTHON FILE RESOLUTION
 # ==============================================================================
 
-def resolve_python_file(script_path, workflow_path):
-    """
-    Resolve Python file referenced by a GitHub Actions run command.
+def _resolve_file_path(self, script_path: str, workflow_path: str):
+    """Resolve script path relative to the workflow location.
 
-    Supported:
-    - python script.py
-    - python3 script.py
-    - python ./script.py
-    - python scripts/script.py
-
-    The file is resolved relative to the workflow directory.
+    Khong phu thuoc vao current working directory.
     """
 
-    workflow_dir = os.path.dirname(
-        os.path.abspath(workflow_path)
-    )
-
-    # Remove surrounding quotes if present
+    workflow_dir = os.path.dirname(os.path.abspath(workflow_path))
     script_path = script_path.strip().strip("'\"")
 
-    # Resolve relative to workflow directory
-    target_path = os.path.join(
-        workflow_dir,
-        script_path
+    bases = []
+
+    # 1. GitHub Actions:
+    # repo/.github/workflows/workflow.yml
+    if os.path.basename(workflow_dir) == "workflows":
+        bases.append(
+            os.path.abspath(
+                os.path.join(workflow_dir, "..", "..")
+            )
+        )
+
+    # 2. Dataset:
+    # repo/testcases/positive/workflow.yml
+    # repo/testcases/negative/workflow.yml
+    parent_dir = os.path.dirname(workflow_dir)
+
+    if os.path.basename(parent_dir) == "testcases":
+        bases.append(
+            os.path.abspath(
+                os.path.join(workflow_dir, "..", "..")
+            )
+        )
+
+    # 3. Benchmark:
+    # bench/workflows/workflow.yml
+    # Len 1 muc: layout benchmark `bench/workflows/` canh `bench/scripts`.
+    bases.append(
+        os.path.abspath(
+            os.path.join(workflow_dir, "..")
+        )
     )
 
-    if os.path.isfile(target_path):
-        return target_path
+    # Dataset layout:
+    # repo/testcases/positive/workflow.yml
+    # repo/testcases/negative/workflow.yml
+    parent_dir = os.path.dirname(workflow_dir)
 
-    # Fallback: current working directory
-    if os.path.isfile(script_path):
-        return os.path.abspath(script_path)
+    if os.path.basename(parent_dir) == "testcases":
+        bases.append(
+            os.path.abspath(
+                os.path.join(workflow_dir, "..", "..")
+            )
+        )
+
+    # Cuoi cung moi la thu muc chua workflow.
+    bases.append(workflow_dir)
+
+
+    for base in bases:
+        candidate = os.path.normpath(
+            os.path.join(base, script_path)
+        )
+
+        print("DEBUG base     =", base)
+        print("DEBUG candidate =", candidate)
+        print("DEBUG exists   =", os.path.isfile(candidate))
+
+        if os.path.isfile(candidate):
+            return candidate
 
     return None
 
@@ -1033,7 +1069,7 @@ def analyze_workflow(file_path):
 
                         )
 
-                        python_file = resolve_python_file(
+                        python_file = _resolve_file_path(
 
                             script_path,
 
