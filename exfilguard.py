@@ -763,7 +763,7 @@ def analyze_python_commands(
 # PYTHON FILE RESOLUTION
 # ==============================================================================
 
-def _resolve_file_path(self, script_path: str, workflow_path: str):
+def _resolve_file_path(script_path: str, workflow_path: str):
     """Resolve script path relative to the workflow location.
 
     Khong phu thuoc vao current working directory.
@@ -824,10 +824,6 @@ def _resolve_file_path(self, script_path: str, workflow_path: str):
         candidate = os.path.normpath(
             os.path.join(base, script_path)
         )
-
-        print("DEBUG base     =", base)
-        print("DEBUG candidate =", candidate)
-        print("DEBUG exists   =", os.path.isfile(candidate))
 
         if os.path.isfile(candidate):
             return candidate
