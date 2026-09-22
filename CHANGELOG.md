@@ -1,7 +1,6 @@
 # CHANGELOG
 
-## [16f417b](https://github.com/Hacker3707/ExfilGuard-static-taint-analysis/commit/16f417b2f1a8192eccc9e20a2ba73ba6e2533f51) 
-- 2026-09-22 16:53:00 UTC
+## [16f417b](https://github.com/Hacker3707/ExfilGuard-static-taint-analysis/commit/16f417b2f1a8192eccc9e20a2ba73ba6e2533f51) - 2026-09-22 16:53:00 UTC
 
 ### Thêm reproduction package và .gitignore
 - `replication`: Chứa cả datasets, ground truth, scripts, baseline outputs và các file phục vụ tái chạy Table/Figure.
