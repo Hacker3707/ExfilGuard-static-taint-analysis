@@ -1,0 +1,31 @@
+case_id,scenario,label,difficulty,pattern,expected_taint_path,workflow_file,script_file,notes
+B01,S1_Direct_Secret_Curl,exploit,easy,direct_secret_to_curl,secrets.API_KEY -> API_KEY -> curl --data,workflows/B01.yml,,
+B02,S1_Direct_Secret_Curl,exploit,medium,direct_secret_to_curl,secrets.API_KEY -> API_KEY -> curl -H Authorization,workflows/B02.yml,,
+B03,S1_Direct_Secret_Curl,exploit,hard,concatenated_secret_to_curl,secrets.API_KEY -> API_KEY -> prefix+API_KEY -> curl --data,workflows/B03.yml,,
+B04,S1_Direct_Secret_Curl,benign,medium,whitelisted_destination,secrets.API_KEY -> API_KEY -> official-service endpoint (allowed),workflows/B04.yml,,Hard negative: secret is sent to an explicitly whitelisted/legitimate destination; policy must decide whether this is allowed.
+B05,S1_Direct_Secret_Curl,benign,medium,dummy_named_secret,API_KEY=dummy123 (not from secrets.*) -> curl --data,workflows/B05.yml,,Hard negative: variable name looks sensitive but value has no taint source.
+B06,S2_Secret_Variable_Curl,exploit,easy,one_hop_propagation,secrets.API_KEY -> API_KEY -> token -> curl --data,workflows/B06.yml,,
+B07,S2_Secret_Variable_Curl,exploit,medium,three_hop_propagation,secrets.API_KEY -> API_KEY -> first -> second -> third -> curl,workflows/B07.yml,,
+B08,S2_Secret_Variable_Curl,exploit,hard,base64_then_curl,secrets.API_KEY -> API_KEY -> base64 -> encoded -> curl --data,workflows/B08.yml,,Hard exploit: encoded value should remain tainted for conservative taint analysis.
+B09,S2_Secret_Variable_Curl,benign,hard,masked_before_logging,secrets.API_KEY -> API_KEY -> mask command -> log only,workflows/B09.yml,,Hard negative: secret is masked and never sent to a network sink.
+B10,S2_Secret_Variable_Curl,benign,medium,secret_hash_only,secrets.API_KEY -> API_KEY -> sha256 digest -> echo,workflows/B10.yml,,Hard negative: one-way hash is logged; the original secret is not sent.
+B11,S3_Secret_Bash_HTTP,exploit,medium,embedded_bash_http,secrets.API_KEY -> API_KEY -> payload -> curl HTTP,workflows/B11.yml,scripts/s03_01.sh,
+B12,S3_Secret_Bash_HTTP,exploit,hard,bash_base64_http,secrets.API_KEY -> API_KEY -> base64 -> encoded -> curl HTTP,workflows/B12.yml,scripts/s03_02.sh,
+B13,S3_Secret_Bash_HTTP,exploit,hard,bash_multi_hop_http,secrets.API_KEY -> API_KEY -> first -> second -> curl HTTP,workflows/B13.yml,scripts/s03_03.sh,
+B14,S3_Secret_Bash_HTTP,benign,hard,masked_bash_log,secrets.API_KEY -> API_KEY -> add-mask -> echo,workflows/B14.yml,,
+B15,S3_Secret_Bash_HTTP,benign,hard,dummy_bash_http,dummy API_KEY -> curl HTTP; no secrets.* source,workflows/B15.yml,,
+B16,S4_Secret_Python_Requests,exploit,medium,python_requests_post,secrets.API_KEY -> API_KEY -> key -> requests.post(data),workflows/B16.yml,scripts/s04_01.py,
+B17,S4_Secret_Python_Requests,exploit,hard,python_json_propagation,secrets.API_KEY -> API_KEY -> secret -> payload.token -> requests.post(json),workflows/B17.yml,scripts/s04_02.py,
+B18,S4_Secret_Python_Requests,exploit,hard,python_hash_then_http,secrets.API_KEY -> API_KEY -> sha256 digest -> requests.post,workflows/B18.yml,scripts/s04_03.py,"For taint analysis, classify hash as a sanitizer/barrier only if the framework explicitly defines that policy; otherwise retain taint."
+B19,S4_Secret_Python_Requests,benign,hard,python_hash_only,secrets.API_KEY -> API_KEY -> sha256 digest -> print,workflows/B19.yml,scripts/s04_04.py,
+B20,S4_Secret_Python_Requests,benign,medium,python_fixed_http,fixed health URL -> requests.get; no secret source,workflows/B20.yml,scripts/s04_05.py,
+B21,S5_Secret_Node_HTTP,exploit,medium,node_fetch_body,secrets.API_KEY -> API_KEY -> key -> fetch(body),workflows/B21.yml,scripts/s05_01.js,
+B22,S5_Secret_Node_HTTP,exploit,hard,node_concat_http,secrets.API_KEY -> API_KEY -> body JSON -> fetch,workflows/B22.yml,scripts/s05_02.js,
+B23,S5_Secret_Node_HTTP,exploit,hard,node_multihop_http,secrets.API_KEY -> API_KEY -> a -> b -> fetch(body),workflows/B23.yml,scripts/s05_03.js,
+B24,S5_Secret_Node_HTTP,benign,hard,node_dummy_http,dummy API_KEY -> fetch; no secrets.* source,workflows/B24.yml,scripts/s05_04.js,
+B25,S5_Secret_Node_HTTP,benign,medium,node_fixed_http,fixed health URL -> fetch; no secret,workflows/B25.yml,scripts/s05_05.js,
+B26,S6_Secret_DNS_Sink,exploit,medium,nslookup_secret_subdomain,secrets.API_KEY -> API_KEY -> hostname -> nslookup,workflows/B26.yml,scripts/s06_01.sh,
+B27,S6_Secret_DNS_Sink,exploit,hard,dig_secret_subdomain,secrets.API_KEY -> API_KEY -> encoded/concatenated hostname -> dig,workflows/B27.yml,scripts/s06_02.sh,
+B28,S6_Secret_DNS_Sink,exploit,hard,python_dns_sink,secrets.API_KEY -> API_KEY -> hostname -> socket.gethostbyname,workflows/B28.yml,scripts/s06_03.py,
+B29,S6_Secret_DNS_Sink,benign,hard,fixed_dns_lookup,fixed hostname -> nslookup; no secret source,workflows/B29.yml,,
+B30,S6_Secret_DNS_Sink,benign,hard,secret_masked_no_dns,secrets.API_KEY -> mask -> echo; no DNS sink,workflows/B30.yml,,

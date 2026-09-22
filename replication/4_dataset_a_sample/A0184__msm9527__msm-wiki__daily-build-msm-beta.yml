@@ -1,0 +1,1480 @@
+name: 每日构建 MSM（Beta）
+
+on:
+  schedule:
+    # 每天北京时间凌晨 4:30（UTC 时间 20:30）
+    - cron: '30 20 * * *'
+  workflow_dispatch:
+    inputs:
+      force_update:
+        description: '是否强制更新'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: daily-build-beta-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  TZ: Asia/Shanghai
+  GO_VERSION: "1.26.6"
+  REMOTE_VERSION_RETENTION: "3"
+
+jobs:
+  prepare:
+    name: 准备构建信息
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      base_version: ${{ steps.meta.outputs.base_version }}
+      channel: ${{ steps.meta.outputs.channel }}
+      channel_name: ${{ steps.meta.outputs.channel_name }}
+      is_stable: ${{ steps.meta.outputs.is_stable }}
+      is_beta: ${{ steps.meta.outputs.is_beta }}
+      release_notes_path: ${{ steps.meta.outputs.release_notes_path }}
+      latest_marker: ${{ steps.meta.outputs.latest_marker }}
+      history_marker: ${{ steps.meta.outputs.history_marker }}
+      docker_channel_tag: ${{ steps.meta.outputs.docker_channel_tag }}
+      release_docs_url: ${{ steps.meta.outputs.release_docs_url }}
+      install_script_name: ${{ steps.meta.outputs.install_script_name }}
+      install_script_url: ${{ steps.meta.outputs.install_script_url }}
+      commit_sha: ${{ steps.meta.outputs.commit_sha }}
+      commit_sha_short: ${{ steps.meta.outputs.commit_sha_short }}
+      branch: ${{ steps.meta.outputs.branch }}
+      changelog: ${{ steps.meta.outputs.changelog }}
+      commit_message: ${{ steps.meta.outputs.commit_message }}
+      commit_author: ${{ steps.meta.outputs.commit_author }}
+      commit_date: ${{ steps.meta.outputs.commit_date }}
+      build_time: ${{ steps.meta.outputs.build_time }}
+      previous_release_published_at: ${{ steps.meta.outputs.previous_release_published_at }}
+      log_since_epoch: ${{ steps.meta.outputs.log_since_epoch }}
+      log_until_epoch: ${{ steps.meta.outputs.log_until_epoch }}
+      previous_version: ${{ steps.meta.outputs.previous_version }}
+      previous_version_commit: ${{ steps.meta.outputs.previous_version_commit }}
+      commit_count: ${{ steps.meta.outputs.commit_count }}
+      ai_summary: ${{ steps.ai_summary.outputs.summary }}
+      force_update: ${{ steps.meta.outputs.force_update }}
+      skip: ${{ steps.meta.outputs.skip }}
+    steps:
+      - name: Checkout MSM 仓库
+        uses: actions/checkout@v4
+        with:
+          repository: msm9527/msm
+          ref: dev
+          token: ${{ secrets.MSM_REPO_TOKEN }}
+          fetch-depth: 0
+
+      - name: Checkout 当前仓库（msm-wiki）用于发布脚本
+        uses: actions/checkout@v4
+        with:
+          path: msm-wiki
+
+      - name: 读取版本信息
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # 优先从仓库根目录的 .version 文件读取版本号（msm 主仓库的单一真实版本源）
+          if [ -f ".version" ]; then
+            VERSION="$(tr -d '[:space:]' < .version)"
+          else
+            VERSION=""
+          fi
+
+          # 兼容旧版本：如果 .version 缺失，则回退到从源码中解析（避免旧分支直接报错）
+          if [ -z "${VERSION}" ]; then
+            VERSION="$(sed -nE 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' backend/cmd/msm/commands/root.go | head -n 1 || true)"
+          fi
+
+          if [ -z "${VERSION}" ]; then
+            echo "error: 无法从 .version 或 backend/cmd/msm/commands/root.go 获取版本号" >&2
+            exit 1
+          fi
+
+          BRANCH="dev"
+          CHANNEL="beta"
+          CHANNEL_NAME="Beta 版"
+          IS_STABLE="false"
+          IS_BETA="true"
+          DOCKER_CHANNEL_TAG="beta-latest"
+          RELEASE_NOTES_PATH="docs/zh/guide/releases-beta.md"
+          LATEST_MARKER="## 🧪 最新 Beta 版本"
+          HISTORY_MARKER="## 📚 历史 Beta 版本"
+          RELEASE_DOCS_URL="https://doc.msmbox.net/zh/guide/releases-beta.html"
+          INSTALL_SCRIPT_NAME="install_beta.sh"
+          INSTALL_SCRIPT_URL="https://raw.githubusercontent.com/msm9527/msm-wiki/main/install_beta.sh"
+
+          BASE_VERSION="${VERSION}"
+          RELEASE_VERSION="beta-${VERSION}"
+
+          FORCE_UPDATE="${{ inputs.force_update || 'false' }}"
+          COMMIT_SHA="$(git rev-parse HEAD)"
+          COMMIT_SHA_SHORT="$(git rev-parse --short=7 HEAD)"
+
+          # 获取最新提交信息
+          COMMIT_MESSAGE="$(git log -1 --pretty=format:'%s')"
+          COMMIT_AUTHOR="$(git log -1 --pretty=format:'%an')"
+          COMMIT_EPOCH="$(git log -1 --format=%ct HEAD)"
+          COMMIT_DATE="$(date -d "@${COMMIT_EPOCH}" +'%Y-%m-%d %H:%M:%S CST')"
+          BUILD_TIME="$(date +'%Y-%m-%d %H:%M:%S CST')"
+
+          # 优先按“上一版源提交 -> 当前 HEAD”统计提交范围；取不到时回退到发布时间窗口
+          PREVIOUS_VERSION=""
+          PREVIOUS_VERSION_COMMIT=""
+          PREVIOUS_RELEASE_PUBLISHED_AT=""
+          LOG_SINCE_EPOCH=""
+          LOG_UNTIL_EPOCH="${COMMIT_EPOCH}"
+          CURRENT_RELEASE_TIME="$(date -d "@${LOG_UNTIL_EPOCH}" +'%Y-%m-%d %H:%M:%S CST')"
+
+          RELEASES_API="https://api.github.com/repos/msm9527/msm-wiki/releases?per_page=100"
+          RELEASES_JSON="$(curl -fsSL "${RELEASES_API}" 2>/dev/null || echo '[]')"
+
+          if command -v jq >/dev/null 2>&1; then
+            PREVIOUS_RELEASE_JSON="$(echo "${RELEASES_JSON}" | jq -c --arg current_tag "${RELEASE_VERSION}" '[.[] | select(.draft == false and .prerelease == true and (.tag_name | startswith("beta-")) and .tag_name != $current_tag and .published_at != null)] | sort_by(.published_at) | last // {}' || echo '{}')"
+
+            PREVIOUS_RELEASE_PUBLISHED_AT="$(echo "${PREVIOUS_RELEASE_JSON}" | jq -r '.published_at // empty' || true)"
+            PREVIOUS_VERSION_COMMIT="$(echo "${PREVIOUS_RELEASE_JSON}" | jq -r '.body // empty' | grep -Eo 'github\.com/msm9527/msm/commit/[0-9A-Fa-f]{40}' | head -n 1 | sed 's#.*/##' || true)"
+          else
+            echo "warning: jq 不可用，无法按发布时间窗口筛选发布记录" >&2
+          fi
+
+          if [ -n "${PREVIOUS_RELEASE_PUBLISHED_AT}" ]; then
+            LOG_SINCE_EPOCH="$(date -d "${PREVIOUS_RELEASE_PUBLISHED_AT}" +%s 2>/dev/null || true)"
+          fi
+
+          if [ -n "${LOG_SINCE_EPOCH}" ] && [ "${LOG_SINCE_EPOCH}" -ge "${LOG_UNTIL_EPOCH}" ]; then
+            echo "warning: 发布时间窗口异常（since=${LOG_SINCE_EPOCH} >= until=${LOG_UNTIL_EPOCH}），回退为最近 100 条提交"
+            LOG_SINCE_EPOCH=""
+          fi
+
+          LOG_ARGS=()
+          if [ -n "${PREVIOUS_VERSION_COMMIT}" ] && git cat-file -e "${PREVIOUS_VERSION_COMMIT}^{commit}" 2>/dev/null && git merge-base --is-ancestor "${PREVIOUS_VERSION_COMMIT}" HEAD 2>/dev/null; then
+            PREVIOUS_VERSION="${PREVIOUS_RELEASE_PUBLISHED_AT}"
+            LOG_ARGS=( "${PREVIOUS_VERSION_COMMIT}..HEAD" )
+            echo "按上一版源提交统计提交: ${PREVIOUS_VERSION_COMMIT}..HEAD"
+          elif [ -n "${LOG_SINCE_EPOCH}" ]; then
+            PREVIOUS_VERSION="${PREVIOUS_RELEASE_PUBLISHED_AT}"
+            LOG_ARGS=( "--until=@${LOG_UNTIL_EPOCH}" "--since=@${LOG_SINCE_EPOCH}" )
+            echo "按发布时间窗口统计提交: ${PREVIOUS_RELEASE_PUBLISHED_AT} -> ${CURRENT_RELEASE_TIME}"
+          else
+            # 首次发布或未获取到上一版发布时间时，回退到最近 100 条提交
+            LOG_ARGS=( "-100" "--until=@${LOG_UNTIL_EPOCH}" )
+            echo "未找到上一版源提交或发布时间，回退为最近 100 条提交"
+          fi
+
+          CHANGELOG="$(git log "${LOG_ARGS[@]}" --pretty=format:'- [%h](https://github.com/msm9527/msm/commit/%H) %s _%an, %ar_' | sed 's/$/\\n/' | tr -d '\n')"
+          COMMIT_COUNT="$(git log "${LOG_ARGS[@]}" --pretty=format:'%H' | sed '/^$/d' | wc -l | tr -d ' ')"
+
+          echo "version=${RELEASE_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "base_version=${BASE_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "channel=${CHANNEL}" >> "$GITHUB_OUTPUT"
+          echo "channel_name=${CHANNEL_NAME}" >> "$GITHUB_OUTPUT"
+          echo "is_stable=${IS_STABLE}" >> "$GITHUB_OUTPUT"
+          echo "is_beta=${IS_BETA}" >> "$GITHUB_OUTPUT"
+          echo "release_notes_path=${RELEASE_NOTES_PATH}" >> "$GITHUB_OUTPUT"
+          echo "latest_marker=${LATEST_MARKER}" >> "$GITHUB_OUTPUT"
+          echo "history_marker=${HISTORY_MARKER}" >> "$GITHUB_OUTPUT"
+          echo "docker_channel_tag=${DOCKER_CHANNEL_TAG}" >> "$GITHUB_OUTPUT"
+          echo "release_docs_url=${RELEASE_DOCS_URL}" >> "$GITHUB_OUTPUT"
+          echo "install_script_name=${INSTALL_SCRIPT_NAME}" >> "$GITHUB_OUTPUT"
+          echo "install_script_url=${INSTALL_SCRIPT_URL}" >> "$GITHUB_OUTPUT"
+          echo "commit_sha=${COMMIT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "commit_sha_short=${COMMIT_SHA_SHORT}" >> "$GITHUB_OUTPUT"
+          echo "branch=${BRANCH}" >> "$GITHUB_OUTPUT"
+          echo "commit_message=${COMMIT_MESSAGE}" >> "$GITHUB_OUTPUT"
+          echo "commit_author=${COMMIT_AUTHOR}" >> "$GITHUB_OUTPUT"
+          echo "commit_date=${COMMIT_DATE}" >> "$GITHUB_OUTPUT"
+          echo "build_time=${BUILD_TIME}" >> "$GITHUB_OUTPUT"
+          echo "previous_release_published_at=${PREVIOUS_RELEASE_PUBLISHED_AT}" >> "$GITHUB_OUTPUT"
+          echo "log_since_epoch=${LOG_SINCE_EPOCH}" >> "$GITHUB_OUTPUT"
+          echo "log_until_epoch=${LOG_UNTIL_EPOCH}" >> "$GITHUB_OUTPUT"
+          echo "previous_version=${PREVIOUS_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "previous_version_commit=${PREVIOUS_VERSION_COMMIT}" >> "$GITHUB_OUTPUT"
+          echo "commit_count=${COMMIT_COUNT}" >> "$GITHUB_OUTPUT"
+          echo "force_update=${FORCE_UPDATE}" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "changelog<<EOF"
+            echo "${CHANGELOG}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          RELEASE_URL="https://github.com/msm9527/msm-wiki/releases/tag/${RELEASE_VERSION}"
+          if [ "${FORCE_UPDATE}" != "true" ]; then
+            STATUS="$(curl -I -s -o /dev/null -w '%{http_code}' "${RELEASE_URL}")"
+            if [ "${STATUS}" -ge 200 ] && [ "${STATUS}" -lt 400 ]; then
+              echo "检测到版本 ${RELEASE_VERSION} 已存在于 Release 页面 (${RELEASE_URL})，跳过后续任务"
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+          echo "构建通道: ${CHANNEL} (${CHANNEL_NAME})"
+          echo "构建版本: ${RELEASE_VERSION} (源版本: ${BASE_VERSION})"
+          echo "构建分支: ${BRANCH}"
+          echo "提交 SHA: ${COMMIT_SHA}"
+          echo "最新提交: ${COMMIT_MESSAGE}"
+          echo "提交数量: ${COMMIT_COUNT}"
+
+      - name: 使用 AI 生成版本总结
+        if: steps.meta.outputs.skip != 'true'
+        id: ai_summary
+        uses: actions/github-script@v7
+        env:
+          MODELSCOPE_API_KEY: ${{ secrets.MODELSCOPE_API_KEY }}
+        with:
+          script: |
+            const {
+              buildFallbackSummary,
+              buildSummaryPrompt,
+              collectReleaseCommits,
+              requestModelScopeSummary,
+            } = require('./msm-wiki/scripts/ai-release-summary.cjs');
+
+            const previousReleasePublishedAt = '${{ steps.meta.outputs.previous_release_published_at }}';
+            const releaseContext = collectReleaseCommits({
+              previousCommit: '${{ steps.meta.outputs.previous_version_commit }}',
+              logSinceEpoch: '${{ steps.meta.outputs.log_since_epoch }}',
+              logUntilEpoch: '${{ steps.meta.outputs.log_until_epoch }}',
+              currentRef: 'HEAD',
+            });
+            const commits = releaseContext.commits;
+
+            console.log(`提交范围来源: ${releaseContext.source}`);
+            console.log(`git log 参数: ${releaseContext.rangeArgs.join(' ')}`);
+            console.log(`实际获取到 ${commits.length} 个提交记录`);
+
+            if (commits.length === 0) {
+              core.setOutput('summary', '本次发布窗口内无新增提交');
+              return;
+            }
+
+            if (!process.env.MODELSCOPE_API_KEY) {
+              console.log('未配置 MODELSCOPE_API_KEY，使用默认总结');
+              core.setOutput('summary', buildFallbackSummary(commits, previousReleasePublishedAt));
+              return;
+            }
+
+            try {
+              const prompt = buildSummaryPrompt(commits);
+              console.log(`AI prompt 字符数: ${prompt.length}`);
+              const result = await requestModelScopeSummary({
+                apiKey: process.env.MODELSCOPE_API_KEY,
+                prompt,
+                fetchImpl: globalThis.fetch,
+                logger: console,
+              });
+
+              console.log(`模型 ${result.modelName} 调用成功`);
+              console.log('AI 生成的总结:');
+              console.log(result.summary);
+              if (result.usage) {
+                console.log(`\n使用的 tokens: 输入=${result.usage.prompt_tokens}, 输出=${result.usage.completion_tokens}, 总计=${result.usage.total_tokens}`);
+              }
+              core.setOutput('summary', result.summary);
+            } catch (error) {
+              console.error('AI 总结失败:', error.message);
+              core.setOutput('summary', buildFallbackSummary(commits, previousReleasePublishedAt));
+            }
+
+  build:
+    name: 打包编译
+    needs: prepare
+    if: needs.prepare.outputs.skip != 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-amd64
+            runs_on: ubuntu-24.04
+            goos: linux
+            goarch: amd64
+          - target: linux-amd64-v3
+            runs_on: ubuntu-24.04
+            goos: linux
+            goarch: amd64
+            goamd64: "v3"
+          - target: linux-amd64-musl
+            runs_on: ubuntu-24.04
+            goos: linux
+            goarch: amd64
+          - target: linux-amd64-musl-v3
+            runs_on: ubuntu-24.04
+            goos: linux
+            goarch: amd64
+            goamd64: "v3"
+          - target: linux-arm64
+            runs_on: ubuntu-24.04
+            goos: linux
+            goarch: arm64
+          - target: linux-arm64-musl
+            runs_on: ubuntu-24.04
+            goos: linux
+            goarch: arm64
+          - target: linux-armv7
+            runs_on: ubuntu-24.04
+            goos: linux
+            goarch: arm
+            goarm: "7"
+          - target: linux-armv6
+            runs_on: ubuntu-24.04
+            goos: linux
+            goarch: arm
+            goarm: "6"
+          # - target: linux-386
+          #   runs_on: ubuntu-24.04
+          #   goos: linux
+          #   goarch: "386"
+          - target: darwin-amd64
+            runs_on: macos-15-intel
+            goos: darwin
+            goarch: amd64
+          - target: darwin-arm64
+            runs_on: macos-15
+            goos: darwin
+            goarch: arm64
+    runs-on: ${{ matrix.runs_on }}
+    steps:
+      - name: Checkout MSM 仓库
+        uses: actions/checkout@v4
+        with:
+          repository: msm9527/msm
+          ref: ${{ needs.prepare.outputs.branch }}
+          token: ${{ secrets.MSM_REPO_TOKEN }}
+
+      - name: Checkout 当前仓库（msm-wiki）用于派网 APX 模板
+        if: matrix.target == 'linux-amd64' || matrix.target == 'linux-arm64'
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          path: msm-wiki
+
+      - name: 检测派网 APX 构建器
+        if: matrix.target == 'linux-amd64' || matrix.target == 'linux-arm64'
+        id: panabit_builder
+        shell: bash
+        run: |
+          set -euo pipefail
+          BUILDER="msm-wiki/.github/panabit/build-apx.sh"
+          if [ -f "${BUILDER}" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "::warning::派网 APX 构建器缺失，跳过 ${{ matrix.target }} 的 .apx 产物"
+          echo "available=false" >> "$GITHUB_OUTPUT"
+
+      - name: 注入 Beta 版本号到版本文件
+        shell: bash
+        run: |
+          set -euo pipefail
+          BETA_VERSION="${{ needs.prepare.outputs.version }}"
+          ROOT_VERSION_FILE=".version"
+          INTERNAL_VERSION_FILE="backend/internal/version/.version"
+
+          printf "%s\n" "${BETA_VERSION}" > "${ROOT_VERSION_FILE}"
+          mkdir -p "$(dirname "${INTERNAL_VERSION_FILE}")"
+          printf "%s\n" "${BETA_VERSION}" > "${INTERNAL_VERSION_FILE}"
+
+          ROOT_ACTUAL="$(tr -d '[:space:]' < "${ROOT_VERSION_FILE}")"
+          INTERNAL_ACTUAL="$(tr -d '[:space:]' < "${INTERNAL_VERSION_FILE}")"
+
+          if [ "${ROOT_ACTUAL}" != "${BETA_VERSION}" ] || [ "${INTERNAL_ACTUAL}" != "${BETA_VERSION}" ]; then
+            echo "error: 注入 Beta 版本号失败，.version=${ROOT_ACTUAL}, internal=${INTERNAL_ACTUAL}, 期望=${BETA_VERSION}" >&2
+            exit 1
+          fi
+
+          echo "已注入 Beta 版本号: ${BETA_VERSION}"
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
+          cache: true
+          cache-dependency-path: backend/go.sum
+
+      - name: 缓存 Go 构建产物
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+          key: go-build-${{ runner.os }}-${{ matrix.target }}-${{ hashFiles('backend/go.sum') }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: 缓存前端依赖
+        uses: actions/cache@v4
+        with:
+          path: frontend/node_modules
+          key: npm-frontend-${{ runner.os }}-${{ hashFiles('frontend/package-lock.json') }}
+
+      - name: 构建前端并复制到后端（嵌入资源）
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd frontend
+          npm ci --no-audit --no-fund
+          npm run build
+
+          test -d dist
+
+          rm -rf ../backend/cmd/msm/frontend/dist
+          mkdir -p ../backend/cmd/msm/frontend
+          cp -r dist ../backend/cmd/msm/frontend/
+
+      - name: 编译 MSM（发布加固版）
+        shell: bash
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm || '' }}
+          GOAMD64: ${{ matrix.goamd64 || '' }}
+          CGO_ENABLED: ${{ matrix.goos == 'darwin' && '1' || '0' }}
+          MSM_USE_GARBLE: '0'
+          MSM_BUILD_ID: ${{ needs.prepare.outputs.version }}
+          MSM_BUILD_CHANNEL: ${{ needs.prepare.outputs.channel }}
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.prepare.outputs.version }}"
+          mkdir -p dist
+          test -f scripts/build-release-msm.sh
+          test -f scripts/embed-executable-sha256.sh
+          test -f scripts/verify-executable-sha256.sh
+          perl -0pi -e 's/\A#!\/bin\/zsh\n/#!\/usr\/bin\/env bash\n/' \
+            scripts/build-release-msm.sh \
+            scripts/embed-executable-sha256.sh \
+            scripts/verify-executable-sha256.sh
+          chmod +x scripts/build-release-msm.sh scripts/embed-executable-sha256.sh scripts/verify-executable-sha256.sh
+          bash ./scripts/build-release-msm.sh "dist/msm"
+          bash ./scripts/verify-executable-sha256.sh "dist/msm"
+          chmod +x dist/msm
+
+          mkdir -p dist/licenses
+          cp THIRD_PARTY_NOTICES.md dist/THIRD_PARTY_NOTICES.md
+          cp docs/OSS_PROVENANCE.md dist/OSS_PROVENANCE.md
+          cp licenses/CADDY-APACHE-2.0.txt dist/licenses/CADDY-APACHE-2.0.txt
+
+          # 发布包使用合并后的单一 MSM 二进制，并携带开源声明。
+          tar -czf "dist/msm-${VERSION}-${{ matrix.target }}.tar.gz" -C dist \
+            msm \
+            THIRD_PARTY_NOTICES.md \
+            OSS_PROVENANCE.md \
+            licenses/CADDY-APACHE-2.0.txt
+          tar -tzf "dist/msm-${VERSION}-${{ matrix.target }}.tar.gz" | grep -Fx msm >/dev/null
+          if tar -tzf "dist/msm-${VERSION}-${{ matrix.target }}.tar.gz" | grep -Eq '(^|/)msm-edge(\.exe)?$'; then
+            echo "error: 新版发布包不应再包含 msm-edge 可执行文件" >&2
+            exit 1
+          fi
+          # 1.2.6 及更早版本会选择最后一个 msm-* 条目作为升级目标。
+          test "$(tar -tzf "dist/msm-${VERSION}-${{ matrix.target }}.tar.gz" | awk 'BEGIN{selected=""} {base=$0; sub(".*/","",base); if (base=="msm" || base ~ /^msm-/) selected=$0} END{print selected}')" = msm
+          rm -f dist/msm
+
+      - name: 生成派网 APX 安装包
+        if: (matrix.target == 'linux-amd64' || matrix.target == 'linux-arm64') && steps.panabit_builder.outputs.available == 'true'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.prepare.outputs.version }}"
+          INPUT_TARBALL="dist/msm-${VERSION}-${{ matrix.target }}.tar.gz"
+          OUTPUT_APX="dist/msm-${VERSION}-${{ matrix.target }}-panabit.apx"
+
+          bash msm-wiki/.github/panabit/build-apx.sh \
+            "${VERSION}" \
+            "${{ matrix.target }}" \
+            "${INPUT_TARBALL}" \
+            "${OUTPUT_APX}"
+
+      - name: 上传构建产物 - 二进制 (macOS)
+        if: matrix.goos == 'darwin'
+        uses: actions/upload-artifact@v4
+        with:
+          name: msm-${{ needs.prepare.outputs.version }}-${{ matrix.target }}
+          path: dist/msm-${{ needs.prepare.outputs.version }}-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+      - name: 上传构建产物 (Linux)
+        if: matrix.goos != 'darwin'
+        uses: actions/upload-artifact@v4
+        with:
+          name: msm-${{ needs.prepare.outputs.version }}-${{ matrix.target }}
+          path: dist/msm-${{ needs.prepare.outputs.version }}-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+      - name: 上传构建产物 (派网 APX)
+        if: (matrix.target == 'linux-amd64' || matrix.target == 'linux-arm64') && steps.panabit_builder.outputs.available == 'true'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: msm-${{ needs.prepare.outputs.version }}-${{ matrix.target }}-panabit
+          path: dist/msm-${{ needs.prepare.outputs.version }}-${{ matrix.target }}-panabit.apx
+          if-no-files-found: ignore
+
+  release:
+    name: 发布构建产物（${{ needs.prepare.outputs.channel_name }}）
+    needs: [prepare, build]
+    if: needs.prepare.outputs.skip != 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout 当前仓库（msm-wiki）
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 下载构建产物
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: 收集 Release 附件
+        id: release_assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.prepare.outputs.version }}"
+
+          mapfile -t RELEASE_FILES < <(find dist -type f \( -name "msm-${VERSION}-*.tar.gz" -o -name "msm-${VERSION}-*-panabit.apx" \) | sort)
+          if [ "${#RELEASE_FILES[@]}" -eq 0 ]; then
+            echo "error: 没有找到任何可发布附件" >&2
+            exit 1
+          fi
+
+          CHECKSUM_FILE="dist/SHA256SUMS"
+          : > "${CHECKSUM_FILE}"
+          for file in "${RELEASE_FILES[@]}"; do
+            HASH="$(sha256sum "${file}" | awk '{print $1}')"
+            printf '%s  %s\n' "${HASH}" "$(basename "${file}")" >> "${CHECKSUM_FILE}"
+          done
+          RELEASE_FILES+=("${CHECKSUM_FILE}")
+
+          {
+            echo "paths<<EOF"
+            printf '%s\n' "${RELEASE_FILES[@]}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          mapfile -t APX_FILES < <(find dist -type f -name "msm-${VERSION}-*-panabit.apx" | sort)
+          if [ "${#APX_FILES[@]}" -eq 0 ]; then
+            echo "download_note=同一发布页内提供各平台二进制、安装包与 SHA256 校验清单" >> "$GITHUB_OUTPUT"
+            echo "panabit_section=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          SECTION="$(printf '%s\n' \
+            '            ### 🧩 派网应用版本（APX）' \
+            '' \
+            '            <details>' \
+            '            <summary><b>PanaBit / 派网</b></summary>' \
+            '' \
+            '            | 架构 | 文件 | 说明 |' \
+            '            |------|------|------|')"
+
+          for file in "${APX_FILES[@]}"; do
+            base="$(basename "${file}")"
+            arch="**unknown**"
+            desc="派网安装包"
+            case "${base}" in
+              *linux-amd64-panabit.apx)
+                arch="**amd64**"
+                desc="派网 x86_64 安装包"
+                ;;
+              *linux-arm64-panabit.apx)
+                arch="**arm64**"
+                desc="派网 ARM64 安装包"
+                ;;
+            esac
+            SECTION="${SECTION}
+            | ${arch} | [\`${base}\`](https://github.com/msm9527/msm-wiki/releases/download/${VERSION}/${base}) | ${desc} |"
+          done
+
+          SECTION="${SECTION}
+
+            **说明：**
+            1. \`.apx\` 安装后会在派网页面中提供 MSM 控制入口
+            2. 实际管理界面由派网入口页跳转到 MSM 自身 Web 控制台
+            3. 如果派网设备已有服务占用目标端口，请先处理端口冲突
+
+            </details>"
+
+          echo "download_note=同一发布页内提供各平台二进制、安装包、派网 APX 与 SHA256 校验清单" >> "$GITHUB_OUTPUT"
+          {
+            echo "panabit_section<<EOF"
+            printf '%s\n' "${SECTION}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: 上传 SHA256 清单供后续任务使用
+        uses: actions/upload-artifact@v4
+        with:
+          name: msm-${{ needs.prepare.outputs.version }}-checksums
+          path: dist/SHA256SUMS
+          if-no-files-found: error
+
+      - name: 创建/更新版本 tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.prepare.outputs.version }}"
+          SHA="${GITHUB_SHA}"
+          CHANNEL_NAME="${{ needs.prepare.outputs.channel_name }}"
+
+          # 使用 GitHub Git Database API 更新 tag。GITHUB_TOKEN 具备 contents:write，
+          # 但通过 git push 推送包含 workflow 文件的提交会额外要求 workflows 权限。
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${VERSION}" >/dev/null 2>&1; then
+            gh api --method PATCH "repos/${GITHUB_REPOSITORY}/git/refs/tags/${VERSION}" \
+              -f sha="${SHA}" \
+              -F force=true >/dev/null
+          else
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+              -f ref="refs/tags/${VERSION}" \
+              -f sha="${SHA}" >/dev/null
+          fi
+
+          echo "✅ 已通过 GitHub API 创建/更新 ${VERSION} tag（${CHANNEL_NAME}）"
+
+      - name: 创建/更新 GitHub Release
+        id: github_release
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ needs.prepare.outputs.version }}
+          draft: false
+          name: 🚀 MSM ${{ needs.prepare.outputs.version }}（${{ needs.prepare.outputs.channel_name }}）
+          body: |
+            <div align="center">
+
+            # 📦 MSM ${{ needs.prepare.outputs.version }}
+
+            ![Build Status](https://img.shields.io/badge/build-passing-brightgreen)
+            ![Version](https://img.shields.io/badge/version-${{ needs.prepare.outputs.version }}-blue)
+            ![Platform](https://img.shields.io/badge/platform-linux%20%7C%20macos-lightgrey)
+
+            **${{ needs.prepare.outputs.channel_name }}每日自动构建 · 包含最新代码更新**
+
+            </div>
+
+            ---
+
+            ## ✨ 本次更新
+
+            ${{ needs.prepare.outputs.ai_summary }}
+
+            ---
+
+            ## 📋 构建信息
+
+            | 项目 | 内容 |
+            |------|------|
+            | **版本号** | `${{ needs.prepare.outputs.version }}` |
+            | **发布通道** | `${{ needs.prepare.outputs.channel }}` |
+            | **源仓库** | [msm9527/msm](https://github.com/msm9527/msm) |
+            | **构建分支** | `${{ needs.prepare.outputs.branch }}` 🌿 |
+            | **源提交** | [`${{ needs.prepare.outputs.commit_sha_short }}`](https://github.com/msm9527/msm/commit/${{ needs.prepare.outputs.commit_sha }}) |
+            | **构建时间** | ${{ needs.prepare.outputs.build_time }} ⏰ |
+
+            <details>
+            <summary>🎯 最新提交详情</summary>
+
+            **${{ needs.prepare.outputs.commit_message }}**
+
+            - 📅 时间: ${{ needs.prepare.outputs.commit_date }}
+            - 🔗 链接: https://github.com/msm9527/msm/commit/${{ needs.prepare.outputs.commit_sha }}
+
+            </details>
+
+            ---
+
+            ## 💾 下载安装
+
+            ### 🖥️ 命令行版本（CLI）
+
+            <details open>
+            <summary><b>Linux 平台</b></summary>
+
+            | 架构 | 文件 | 说明 |
+            |------|------|------|
+            | **amd64** | [`msm-${{ needs.prepare.outputs.version }}-linux-amd64.tar.gz`](https://github.com/msm9527/msm-wiki/releases/download/${{ needs.prepare.outputs.version }}/msm-${{ needs.prepare.outputs.version }}-linux-amd64.tar.gz) | 标准版本（推荐） |
+            | **amd64-v3** | [`msm-${{ needs.prepare.outputs.version }}-linux-amd64-v3.tar.gz`](https://github.com/msm9527/msm-wiki/releases/download/${{ needs.prepare.outputs.version }}/msm-${{ needs.prepare.outputs.version }}-linux-amd64-v3.tar.gz) | 优化版（需 AVX2） |
+            | **amd64-musl** | [`msm-${{ needs.prepare.outputs.version }}-linux-amd64-musl.tar.gz`](https://github.com/msm9527/msm-wiki/releases/download/${{ needs.prepare.outputs.version }}/msm-${{ needs.prepare.outputs.version }}-linux-amd64-musl.tar.gz) | Alpine Linux |
+            | **amd64-musl-v3** | [`msm-${{ needs.prepare.outputs.version }}-linux-amd64-musl-v3.tar.gz`](https://github.com/msm9527/msm-wiki/releases/download/${{ needs.prepare.outputs.version }}/msm-${{ needs.prepare.outputs.version }}-linux-amd64-musl-v3.tar.gz) | Alpine 优化版 |
+            | **arm64** | [`msm-${{ needs.prepare.outputs.version }}-linux-arm64.tar.gz`](https://github.com/msm9527/msm-wiki/releases/download/${{ needs.prepare.outputs.version }}/msm-${{ needs.prepare.outputs.version }}-linux-arm64.tar.gz) | ARM 64位 |
+            | **arm64-musl** | [`msm-${{ needs.prepare.outputs.version }}-linux-arm64-musl.tar.gz`](https://github.com/msm9527/msm-wiki/releases/download/${{ needs.prepare.outputs.version }}/msm-${{ needs.prepare.outputs.version }}-linux-arm64-musl.tar.gz) | ARM Alpine |
+            | **armv7** | [`msm-${{ needs.prepare.outputs.version }}-linux-armv7.tar.gz`](https://github.com/msm9527/msm-wiki/releases/download/${{ needs.prepare.outputs.version }}/msm-${{ needs.prepare.outputs.version }}-linux-armv7.tar.gz) | ARM 32位 (v7) |
+            | **armv6** | [`msm-${{ needs.prepare.outputs.version }}-linux-armv6.tar.gz`](https://github.com/msm9527/msm-wiki/releases/download/${{ needs.prepare.outputs.version }}/msm-${{ needs.prepare.outputs.version }}-linux-armv6.tar.gz) | ARM 32位 (v6) |
+
+            > **💡 提示：** amd64-v3 版本针对较新的 CPU 进行了优化（需要支持 AVX、AVX2 等指令集），性能更好但兼容性较低。如果不确定，请使用标准的 amd64 版本。
+
+            </details>
+
+            ${{ steps.release_assets.outputs.panabit_section }}
+
+            <details>
+            <summary><b>macOS 平台</b></summary>
+
+            | 架构 | 文件 | 说明 |
+            |------|------|------|
+            | **Intel** | [`msm-${{ needs.prepare.outputs.version }}-darwin-amd64.tar.gz`](https://github.com/msm9527/msm-wiki/releases/download/${{ needs.prepare.outputs.version }}/msm-${{ needs.prepare.outputs.version }}-darwin-amd64.tar.gz) | Intel 芯片 Mac |
+            | **Apple Silicon** | [`msm-${{ needs.prepare.outputs.version }}-darwin-arm64.tar.gz`](https://github.com/msm9527/msm-wiki/releases/download/${{ needs.prepare.outputs.version }}/msm-${{ needs.prepare.outputs.version }}-darwin-arm64.tar.gz) | M1/M2/M3 芯片 |
+
+            </details>
+
+            ### 🖼️ 桌面应用版本（Desktop）
+
+            <details>
+            <summary><b>macOS 桌面应用</b></summary>
+
+            | 架构 | 文件 | 说明 |
+            |------|------|------|
+            | **Intel** | [`msm-desktop-${{ needs.prepare.outputs.version }}-darwin-amd64.dmg`](https://github.com/msm9527/msm-wiki/releases/download/${{ needs.prepare.outputs.version }}/msm-desktop-${{ needs.prepare.outputs.version }}-darwin-amd64.dmg) | Intel 芯片 Mac |
+            | **Apple Silicon** | [`msm-desktop-${{ needs.prepare.outputs.version }}-darwin-arm64.dmg`](https://github.com/msm9527/msm-wiki/releases/download/${{ needs.prepare.outputs.version }}/msm-desktop-${{ needs.prepare.outputs.version }}-darwin-arm64.dmg) | M1/M2/M3 芯片 |
+
+            **安装步骤：**
+            1. 下载对应架构的 DMG 文件
+            2. 双击 DMG 文件，将应用拖入 Applications 文件夹
+            3. 首次打开时，如果遇到"无法验证开发者"提示：
+               - 打开"系统设置" → "隐私与安全性"
+               - 点击"仍要打开"按钮
+            4. 由于应用未经过 Apple 公证，macOS 可能拦截首次打开，或提示"文件已损坏/无法打开"。可执行以下命令解除隔离属性：
+               - /usr/bin/xattr -cr "/Applications/msm-desktop.app"
+               - 该命令仅用于处理 Gatekeeper/隔离属性拦截；发布流程已校验包内后端签名和可执行性。如果执行后仍无法安装服务，请下载最新版本并反馈错误日志。
+
+            </details>
+
+            ---
+
+            ## 🚀 快速安装
+
+            ### 一键安装脚本（推荐）
+
+            ```bash
+            curl -fsSL ${{ needs.prepare.outputs.install_script_url }} | sudo bash
+            ```
+
+            ### 🔐 完整性校验
+
+            - 校验清单：[`SHA256SUMS`](https://github.com/msm9527/msm-wiki/releases/download/${{ needs.prepare.outputs.version }}/SHA256SUMS)
+            - CLI 发布包使用加固版构建，启动时会校验内嵌官方 SHA-256；若二进制被篡改会拒绝运行
+
+            ### 手动安装（以 Linux amd64 为例）
+
+            ```bash
+            # 下载
+            wget https://github.com/msm9527/msm-wiki/releases/download/${{ needs.prepare.outputs.version }}/msm-${{ needs.prepare.outputs.version }}-linux-amd64.tar.gz
+
+            # 解压
+            tar -xzf msm-${{ needs.prepare.outputs.version }}-linux-amd64.tar.gz
+
+            # 安装
+            sudo mv msm /usr/local/bin/msm
+            sudo chmod +x /usr/local/bin/msm
+
+            # 验证
+            msm --version
+            ```
+
+            ### Docker 安装
+
+            ```bash
+            # 拉取镜像
+            docker pull msmbox/msm:${{ needs.prepare.outputs.version }}
+
+            # 运行容器
+            docker run -d \
+              --name msm \
+              -p 7777:7777 \
+              -v /opt/msm:/opt/msm \
+              msmbox/msm:${{ needs.prepare.outputs.version }}
+            ```
+
+            ---
+
+            ## ⚖️ 使用与合规
+
+            MSM 是用于管理用户自有或已获授权设备的自托管管理平台，不提供代理节点、订阅或违法内容。请勿用于未授权访问、侵权或其他违法活动。
+
+            - [合规使用规范](https://doc.msmbox.net/zh/legal/acceptable-use.html)
+            - [隐私与数据安全](https://doc.msmbox.net/zh/legal/privacy-security.html)
+            - [免责声明](https://doc.msmbox.net/zh/legal/disclaimer.html)
+            - [知识产权说明](https://doc.msmbox.net/zh/legal/intellectual-property.html)
+
+            ---
+
+            ## 📚 文档与支持
+
+            - 📖 [完整文档](https://doc.msmbox.net/)
+            - 🚀 [快速开始](https://doc.msmbox.net/zh/guide/install.html)
+            - 📝 [版本发布](${{ needs.prepare.outputs.release_docs_url }})
+            - 💬 [问题反馈](https://github.com/msm9527/msm/issues)
+
+            ---
+
+            <div align="center">
+
+            **🤖 由 GitHub Actions 自动构建**
+
+            [![GitHub](https://img.shields.io/badge/GitHub-msm9527%2Fmsm-blue?logo=github)](https://github.com/msm9527/msm)
+            [![Documentation](https://img.shields.io/badge/docs-msm--wiki-green)](https://doc.msmbox.net/)
+            [![Docker](https://img.shields.io/badge/docker-msmbox%2Fmsm-blue?logo=docker)](https://hub.docker.com/r/msmbox/msm)
+
+            </div>
+          makeLatest: ${{ needs.prepare.outputs.is_stable }}
+          prerelease: ${{ needs.prepare.outputs.is_beta }}
+          allowUpdates: true
+          replacesArtifacts: true
+          artifacts: ${{ steps.release_assets.outputs.paths }}
+
+      - name: 校正 GitHub Release 发布状态
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const releaseId = Number('${{ steps.github_release.outputs.id }}');
+            if (!Number.isInteger(releaseId) || releaseId <= 0) {
+              throw new Error(`无效的 release id: ${{ steps.github_release.outputs.id }}`);
+            }
+
+            const prerelease = '${{ needs.prepare.outputs.is_beta }}' === 'true';
+            const makeLatest = '${{ needs.prepare.outputs.is_stable }}' === 'true' ? 'true' : 'false';
+
+            const { data } = await github.rest.repos.updateRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              release_id: releaseId,
+              draft: false,
+              prerelease,
+              make_latest: makeLatest,
+            });
+
+            core.info(
+              `已校正 release ${data.tag_name}: draft=${data.draft}, prerelease=${data.prerelease}, make_latest=${makeLatest}`
+            );
+
+      - name: 更新 Wiki 版本发布页面
+        uses: actions/github-script@v7
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        with:
+          script: |
+            const updateReleasePage = require('./scripts/update-release-page.cjs');
+
+            updateReleasePage({
+              version: '${{ needs.prepare.outputs.version }}',
+              baseVersion: '${{ needs.prepare.outputs.base_version }}',
+              channel: '${{ needs.prepare.outputs.channel }}',
+              channelName: '${{ needs.prepare.outputs.channel_name }}',
+              aiSummary: ${{ toJSON(needs.prepare.outputs.ai_summary) }},
+              commitSha: '${{ needs.prepare.outputs.commit_sha_short }}',
+              commitShaFull: '${{ needs.prepare.outputs.commit_sha }}',
+              commitMessage: ${{ toJSON(needs.prepare.outputs.commit_message) }},
+              commitAuthor: ${{ toJSON(needs.prepare.outputs.commit_author) }},
+              commitDate: '${{ needs.prepare.outputs.commit_date }}',
+              releaseDownloadNote: ${{ toJSON(steps.release_assets.outputs.download_note) }},
+              latestVersionMarker: '${{ needs.prepare.outputs.latest_marker }}',
+              historyVersionMarker: '${{ needs.prepare.outputs.history_marker }}',
+              releasesPath: '${{ needs.prepare.outputs.release_notes_path }}',
+            });
+
+            console.log('✅ 已更新版本发布页面');
+
+      - name: 提交 Wiki 更新
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add "${{ needs.prepare.outputs.release_notes_path }}"
+
+          if git diff --staged --quiet; then
+            echo "没有需要提交的更改"
+          else
+            git commit -m "自动更新${{ needs.prepare.outputs.channel_name }}发布页面: ${{ needs.prepare.outputs.version }}
+
+            - 添加版本 ${{ needs.prepare.outputs.version }} 的发布信息
+            - AI 生成的更新总结
+            - 构建信息和下载链接
+
+            Co-Authored-By: GitHub Actions <github-actions[bot]@users.noreply.github.com>"
+
+            # 推送前先获取远程状态，处理可能的冲突
+            git fetch origin
+            if ! git push; then
+              echo "推送失败，检测到远程更新，正在同步..."
+              git pull --rebase origin main
+              if ! git push; then
+                echo "❌ 推送仍然失败，可能存在冲突"
+                exit 1
+              fi
+              echo "✅ 已同步远程更改并推送 Wiki 更新"
+            else
+              echo "✅ 已推送 Wiki 更新"
+            fi
+          fi
+
+  docker:
+    name: 构建并推送 Docker 镜像
+    needs: [prepare, release]
+    if: needs.prepare.outputs.skip != 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout 当前仓库
+        uses: actions/checkout@v4
+
+      - name: 下载构建产物
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: 准备各架构二进制文件
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.prepare.outputs.version }}"
+
+          # 创建目录结构 binaries/{platform}/msm
+          mkdir -p binaries/linux/amd64 binaries/linux/arm64 binaries/linux/arm/v7 binaries/linux/arm/v6
+
+          # 解压并复制各架构的二进制文件
+          echo "准备 linux/amd64 二进制..."
+          tar -xzf "dist/msm-${VERSION}-linux-amd64/msm-${VERSION}-linux-amd64.tar.gz" -C binaries/linux/amd64
+
+          echo "准备 linux/arm64 二进制..."
+          tar -xzf "dist/msm-${VERSION}-linux-arm64/msm-${VERSION}-linux-arm64.tar.gz" -C binaries/linux/arm64
+
+          echo "准备 linux/arm/v7 二进制..."
+          tar -xzf "dist/msm-${VERSION}-linux-armv7/msm-${VERSION}-linux-armv7.tar.gz" -C binaries/linux/arm/v7
+
+          echo "准备 linux/arm/v6 二进制..."
+          tar -xzf "dist/msm-${VERSION}-linux-armv6/msm-${VERSION}-linux-armv6.tar.gz" -C binaries/linux/arm/v6
+
+          # 验证文件结构
+          echo "验证二进制文件:"
+          find binaries -name msm -exec ls -lh {} \;
+
+      - name: 设置 Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 登录 Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: 构建并推送多架构 Docker 镜像
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.binary
+          platforms: linux/amd64,linux/arm64,linux/arm/v7,linux/arm/v6
+          push: true
+          tags: msmbox/msm:${{ needs.prepare.outputs.version }},msmbox/msm:${{ needs.prepare.outputs.docker_channel_tag }}
+          labels: |
+            org.opencontainers.image.title=MSM
+            org.opencontainers.image.description=MosDNS Sing-Box Clash Manager
+            org.opencontainers.image.version=${{ needs.prepare.outputs.version }}
+            org.opencontainers.image.source=https://github.com/msm9527/msm
+            org.opencontainers.image.url=https://doc.msmbox.net/
+          provenance: false
+          sbom: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          outputs: type=image,push=true
+
+      - name: 显示镜像信息
+        shell: bash
+        run: |
+          VERSION="${{ needs.prepare.outputs.version }}"
+          CHANNEL_TAG="${{ needs.prepare.outputs.docker_channel_tag }}"
+          echo "✅ Docker 镜像已推送到 Docker Hub"
+          echo ""
+          echo "镜像标签:"
+          echo "  - msmbox/msm:${VERSION}"
+          echo "  - msmbox/msm:${CHANNEL_TAG}"
+          echo ""
+          echo "支持的架构:"
+          echo "  - linux/amd64"
+          echo "  - linux/arm64"
+          echo "  - linux/arm/v7"
+          echo "  - linux/arm/v6"
+          echo ""
+          echo "注意: Docker 镜像使用标准 amd64 版本，amd64-v3 优化版仅作为独立二进制文件提供"
+          echo ""
+
+  upload:
+    name: 上传每日构建到自定义服务器
+    needs: [prepare, release]
+    if: needs.prepare.outputs.skip != 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout 当前仓库（msm-wiki）用于部署脚本
+        uses: actions/checkout@v4
+
+      - name: 下载构建产物
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: 准备上传文件
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.prepare.outputs.version }}"
+          mkdir -p upload/"${VERSION}"
+          find dist -type f -name "msm-${VERSION}-*.tar.gz" -exec cp {} upload/"${VERSION}"/ \;
+          CHECKSUM_FILE="$(find dist -type f -name SHA256SUMS | head -n 1)"
+          if [ -z "${CHECKSUM_FILE}" ]; then
+            echo "error: 未找到 SHA256SUMS" >&2
+            exit 1
+          fi
+          cp "${CHECKSUM_FILE}" upload/"${VERSION}"/
+          cp install_beta_cn.sh upload/install.sh
+          chmod 0755 upload/install.sh
+          printf "%s\n" "${VERSION}" > upload/.version
+          echo "待上传文件列表:"
+          ls -lh upload
+          ls -lh upload/"${VERSION}"
+
+      - name: 安装 sshpass
+        shell: bash
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y sshpass rsync
+
+      - name: 传输到目标服务器
+        shell: bash
+        env:
+          EXTRA_SERVERS: ${{ secrets.DEPLOY_SERVERS }}
+        run: |
+          set -euo pipefail
+
+          VERSION="${{ needs.prepare.outputs.version }}"
+          CHANNEL="${{ needs.prepare.outputs.channel }}"
+          RETENTION_COUNT="${{ env.REMOTE_VERSION_RETENTION }}"
+
+          # 仅使用 DEPLOY_SERVERS 多行配置：host,user,password,target_path[,port]
+          servers=()
+          if [ -n "${EXTRA_SERVERS}" ]; then
+            while IFS= read -r line; do
+              line_trimmed="$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+              [ -z "$line_trimmed" ] && continue
+              servers+=("$line_trimmed")
+            done <<< "${EXTRA_SERVERS}"
+          fi
+
+          if [ ${#servers[@]} -eq 0 ]; then
+            echo "未提供服务器信息（请在 secrets 中设置 DEPLOY_SERVERS，多行 host,user,password,target_path[,port]）"
+            exit 0
+          fi
+
+          echo "即将上传到 ${#servers[@]} 个服务器:"
+          for entry in "${servers[@]}"; do
+            IFS=',' read -r host user pass target port <<< "$entry"
+            safe_host="$(echo "$host" | sed -E 's/^(.{0,3}).*(.)$/\1*******\2/')"
+            echo " - ${safe_host}"
+          done
+
+          for entry in "${servers[@]}"; do
+            IFS=',' read -r host user pass target port <<< "$entry"
+            if [ -z "${host}" ] || [ -z "${user}" ] || [ -z "${pass}" ] || [ -z "${target}" ]; then
+              echo "跳过无效配置"
+              continue
+            fi
+
+            TARGET="${target%/}"
+            if [ "${CHANNEL}" = "beta" ]; then
+              TARGET="${TARGET}/beta"
+            fi
+            TARGET_VERSION="${TARGET}/${VERSION}"
+            SSH_ARGS=(-o StrictHostKeyChecking=no)
+            RSYNC_SSH="ssh -o StrictHostKeyChecking=no"
+            if [ -n "${port}" ]; then
+              SSH_ARGS+=(-p "${port}")
+              printf -v port_quoted '%q' "${port}"
+              RSYNC_SSH+=" -p ${port_quoted}"
+            fi
+
+            printf -v target_quoted '%q' "${TARGET}"
+            printf -v target_version_quoted '%q' "${TARGET_VERSION}"
+            printf -v channel_quoted '%q' "${CHANNEL}"
+            printf -v retention_quoted '%q' "${RETENTION_COUNT}"
+            printf -v version_quoted '%q' "${VERSION}"
+
+            sshpass -p "${pass}" ssh "${SSH_ARGS[@]}" "${user}@${host}" "mkdir -p -- ${target_quoted} ${target_version_quoted}"
+
+            sshpass -p "${pass}" rsync -avz --no-perms --no-owner --no-group -e "${RSYNC_SSH}" --rsync-path="mkdir -p \"${TARGET}\" && rsync" upload/.version "${user}@${host}:${TARGET}/"
+            sshpass -p "${pass}" rsync -avz --no-perms --no-owner --no-group -e "${RSYNC_SSH}" --rsync-path="mkdir -p \"${TARGET_VERSION}\" && rsync" upload/${VERSION}/ "${user}@${host}:${TARGET_VERSION}/"
+
+            sshpass -p "${pass}" ssh "${SSH_ARGS[@]}" "${user}@${host}" \
+              "bash -s -- ${target_quoted} ${channel_quoted} ${retention_quoted} ${version_quoted}" \
+              < .github/scripts/prune-remote-versions.sh
+          done
+
+          echo "✅ 已将 .version 和打包产物上传至所有服务器，每个通道仅保留最近 ${RETENTION_COUNT} 个版本"
+          echo "使用方式:"
+          echo "  docker pull msmbox/msm:${{ needs.prepare.outputs.docker_channel_tag }}"
+          echo "  docker run -d -p 7777:7777 msmbox/msm:${{ needs.prepare.outputs.docker_channel_tag }}"
+
+  desktop:
+    name: 构建 macOS 桌面应用并追加到 Release
+    needs: [prepare, release]
+    runs-on: ${{ matrix.runs_on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: darwin-amd64
+            runs_on: macos-15-intel
+            goos: darwin
+            goarch: amd64
+            rust_target: x86_64-apple-darwin
+            macho_arch: x86_64
+          - target: darwin-arm64
+            runs_on: macos-15
+            goos: darwin
+            goarch: arm64
+            rust_target: aarch64-apple-darwin
+            macho_arch: arm64
+    steps:
+      - name: Checkout MSM 仓库
+        uses: actions/checkout@v4
+        with:
+          repository: msm9527/msm
+          ref: ${{ needs.prepare.outputs.branch }}
+          token: ${{ secrets.MSM_REPO_TOKEN }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: 缓存前端依赖
+        uses: actions/cache@v4
+        with:
+          path: frontend/node_modules
+          key: npm-frontend-desktop-${{ runner.os }}-${{ matrix.target }}-${{ hashFiles('frontend/package-lock.json') }}
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - name: 缓存 Cargo 依赖与构建
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            frontend/src-tauri/target
+          key: cargo-tauri-${{ runner.os }}-${{ matrix.target }}-${{ hashFiles('frontend/src-tauri/Cargo.lock') }}
+
+      - name: 安装前端依赖并构建（Tauri 桌面）
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd frontend
+          npm ci --no-audit --no-fund
+          npm run build
+
+      - name: 下载 macOS CLI 构建产物
+        uses: actions/download-artifact@v4
+        with:
+          name: msm-${{ needs.prepare.outputs.version }}-${{ matrix.target }}
+          path: dist
+
+      - name: 解压 CLI 二进制供 Tauri 使用
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.prepare.outputs.version }}"
+          mkdir -p dist
+          # 解压出合并后的单一 msm 可执行文件。
+          tar -xzf "dist/msm-${VERSION}-${{ matrix.target }}.tar.gz" -C dist
+          ls -l dist
+
+          CLI_ARCHS="$(lipo -archs dist/msm)"
+          if [ "${CLI_ARCHS}" != "${{ matrix.macho_arch }}" ]; then
+            echo "error: CLI 架构不匹配，期望 ${{ matrix.macho_arch }}，实际 ${CLI_ARCHS}" >&2
+            exit 1
+          fi
+          echo "CLI 架构验证通过: ${CLI_ARCHS}"
+
+      - name: 构建 Tauri 桌面应用
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.prepare.outputs.version }}"
+          TAURI_TARGET="${{ matrix.rust_target }}"
+          EXPECTED_ARCH="${{ matrix.macho_arch }}"
+
+          export TAURI_APP_VERSION="${VERSION}"
+          export TAURI_BUILD_VERSION="${VERSION}"
+
+          cd frontend
+
+          WORKSPACE="$PWD"
+          SRC_TAURI_DIR="$WORKSPACE/src-tauri"
+          DIST_ROOT="$WORKSPACE/../dist"
+
+          # 确保目录存在；如存在开发用的内置二进制，先移除。
+          mkdir -p "$SRC_TAURI_DIR"
+          rm -f "$SRC_TAURI_DIR/msm"
+
+          # 复制已解压好的合并后端到 Tauri 资源目录。
+          cp "$DIST_ROOT/msm" "$SRC_TAURI_DIR/msm"
+          chmod +x "$SRC_TAURI_DIR/msm"
+
+          # 复制必要的资源文件（存在才复制）
+          cp about.html dist/ || true
+          cp icon.png dist/ || true
+
+          # 跳过重复的前端构建
+          TAURI_CONF="$SRC_TAURI_DIR/tauri.conf.json"
+          cp "$TAURI_CONF" "$TAURI_CONF.backup"
+          restore_tauri_conf() {
+            if [ -f "$TAURI_CONF.backup" ]; then
+              mv "$TAURI_CONF.backup" "$TAURI_CONF"
+            fi
+            rm -f "$TAURI_CONF.tmp"
+          }
+          trap restore_tauri_conf EXIT
+
+          sed -i.tmp 's/"beforeBuildCommand":[^,]*,/"beforeBuildCommand": "echo Skipping frontend build",/' "$TAURI_CONF"
+
+          # 仅用 Tauri 构建 .app（不打 DMG）：headless CI runner 上 tauri 自带的
+          # bundle_dmg.sh 会调用 Finder AppleScript 给窗口排版并超时失败(-1712)。
+          # Build only the .app with Tauri (no DMG): tauri's bundle_dmg.sh invokes
+          # Finder via AppleScript to style the window, which times out (-1712) on
+          # headless CI runners. We build the DMG ourselves below via hdiutil.
+          npm run tauri build -- --target "$TAURI_TARGET" --bundles app
+
+          # 恢复原始配置
+          restore_tauri_conf
+          trap - EXIT
+
+          BUNDLE_ROOT="$SRC_TAURI_DIR/target/$TAURI_TARGET/release/bundle"
+          APP_PATH=""
+          for candidate in "$BUNDLE_ROOT/macos"/*.app; do
+            if [ -d "$candidate" ]; then
+              APP_PATH="$candidate"
+              break
+            fi
+          done
+
+          if [ -z "$APP_PATH" ]; then
+            echo "error: 未找到 Tauri .app 产物: $BUNDLE_ROOT/macos" >&2
+            exit 1
+          fi
+
+          APP_EXECUTABLE="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP_PATH/Contents/Info.plist")"
+          APP_ARCHS="$(lipo -archs "$APP_PATH/Contents/MacOS/$APP_EXECUTABLE")"
+          if [ "$APP_ARCHS" != "$EXPECTED_ARCH" ]; then
+            echo "error: Tauri App 架构不匹配，期望 ${EXPECTED_ARCH}，实际 ${APP_ARCHS}" >&2
+            exit 1
+          fi
+          echo "Tauri App 架构验证通过: ${APP_ARCHS}"
+
+          BUNDLED_MSM="$APP_PATH/Contents/Resources/msm"
+          if [ ! -x "$BUNDLED_MSM" ]; then
+            echo "error: Tauri App 缺少可执行内置后端: $BUNDLED_MSM" >&2
+            exit 1
+          fi
+          BUNDLED_MSM_ARCHS="$(lipo -archs "$BUNDLED_MSM")"
+          if [ "$BUNDLED_MSM_ARCHS" != "$EXPECTED_ARCH" ]; then
+            echo "error: 内置后端架构不匹配，期望 ${EXPECTED_ARCH}，实际 ${BUNDLED_MSM_ARCHS}" >&2
+            exit 1
+          fi
+          codesign --verify --strict --verbose=4 "$BUNDLED_MSM"
+          "$BUNDLED_MSM" --version >/dev/null
+          echo "内置后端签名和可执行性验证通过: ${BUNDLED_MSM_ARCHS}"
+
+          # 自建无样式 DMG（绕过 tauri 的 Finder 排版步骤）
+          # Build a plain DMG ourselves (bypassing tauri's Finder styling step).
+          mkdir -p "$DIST_ROOT"
+          OUTPUT_DMG="$DIST_ROOT/msm-desktop-${VERSION}-${{ matrix.target }}.dmg"
+
+          DMG_STAGE="$(mktemp -d)"
+          DMG_WORK="$(mktemp -d)"
+          DMG_TEMP="$DMG_WORK/msm-desktop.dmg"
+          cleanup_dmg_files() {
+            rm -rf "$DMG_STAGE" "$DMG_WORK"
+          }
+          trap cleanup_dmg_files EXIT
+
+          cp -R "$APP_PATH" "$DMG_STAGE/"
+          ln -s /Applications "$DMG_STAGE/Applications"
+
+          VOL_NAME="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleName' "$APP_PATH/Contents/Info.plist" 2>/dev/null || echo "msm-desktop")"
+          DMG_CREATED="false"
+          for attempt in 1 2 3; do
+            if hdiutil create \
+              -volname "$VOL_NAME" \
+              -srcfolder "$DMG_STAGE" \
+              -fs HFS+ \
+              -format UDZO \
+              -ov \
+              "$DMG_TEMP"; then
+              DMG_CREATED="true"
+              break
+            fi
+            rm -f "$DMG_TEMP"
+            if [ "$attempt" -lt 3 ]; then
+              echo "hdiutil create 第 ${attempt} 次失败，等待后重试"
+              sleep "$attempt"
+            fi
+          done
+          if [ "$DMG_CREATED" != "true" ]; then
+            echo "error: hdiutil create 重试 3 次仍失败" >&2
+            exit 1
+          fi
+          rm -f "$OUTPUT_DMG"
+          mv "$DMG_TEMP" "$OUTPUT_DMG"
+
+          MOUNT_DIR="$(mktemp -d)"
+          cleanup_dmg_mount() {
+            hdiutil detach "$MOUNT_DIR" >/dev/null 2>&1 || true
+            rmdir "$MOUNT_DIR" >/dev/null 2>&1 || true
+            cleanup_dmg_files
+          }
+          trap cleanup_dmg_mount EXIT
+
+          hdiutil attach -nobrowse -readonly -mountpoint "$MOUNT_DIR" "$OUTPUT_DMG" >/dev/null
+          APP_IN_DMG=""
+          for candidate in "$MOUNT_DIR"/*.app; do
+            if [ -d "$candidate" ]; then
+              APP_IN_DMG="$candidate"
+              break
+            fi
+          done
+
+          if [ -z "$APP_IN_DMG" ]; then
+            echo "error: DMG 中未找到 .app: $OUTPUT_DMG" >&2
+            exit 1
+          fi
+
+          DMG_APP_EXECUTABLE="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP_IN_DMG/Contents/Info.plist")"
+          DMG_APP_ARCHS="$(lipo -archs "$APP_IN_DMG/Contents/MacOS/$DMG_APP_EXECUTABLE")"
+          if [ "$DMG_APP_ARCHS" != "$EXPECTED_ARCH" ]; then
+            echo "error: DMG App 架构不匹配，期望 ${EXPECTED_ARCH}，实际 ${DMG_APP_ARCHS}" >&2
+            exit 1
+          fi
+          echo "DMG 架构验证通过: ${DMG_APP_ARCHS}"
+
+          DMG_BUNDLED_MSM="$APP_IN_DMG/Contents/Resources/msm"
+          if [ ! -x "$DMG_BUNDLED_MSM" ]; then
+            echo "error: DMG 中缺少可执行内置后端: $DMG_BUNDLED_MSM" >&2
+            exit 1
+          fi
+          DMG_BUNDLED_MSM_ARCHS="$(lipo -archs "$DMG_BUNDLED_MSM")"
+          if [ "$DMG_BUNDLED_MSM_ARCHS" != "$EXPECTED_ARCH" ]; then
+            echo "error: DMG 内置后端架构不匹配，期望 ${EXPECTED_ARCH}，实际 ${DMG_BUNDLED_MSM_ARCHS}" >&2
+            exit 1
+          fi
+          codesign --verify --strict --verbose=4 "$DMG_BUNDLED_MSM"
+          "$DMG_BUNDLED_MSM" --version >/dev/null
+          echo "DMG 内置后端签名和可执行性验证通过: ${DMG_BUNDLED_MSM_ARCHS}"
+
+          cleanup_dmg_mount
+          trap - EXIT
+
+      - name: 上传桌面应用 DMG 产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: msm-desktop-${{ needs.prepare.outputs.version }}-${{ matrix.target }}
+          path: dist/msm-desktop-${{ needs.prepare.outputs.version }}-${{ matrix.target }}.dmg
+          if-no-files-found: ignore
+
+      - name: 将 DMG 附加到已有 Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: sh
+        run: |
+          set -eu
+          gh release upload "${{ needs.prepare.outputs.version }}" \
+            "dist/msm-desktop-${{ needs.prepare.outputs.version }}-${{ matrix.target }}.dmg" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --clobber
+
+  pages:
+    name: 构建并发布 Wiki 到 GitHub Pages
+    needs: [prepare, release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+    steps:
+      - name: Checkout Wiki 仓库
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: 缓存文档依赖
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: npm-docs-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v4
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run Wiki regression tests
+        run: npm test
+
+      - name: Build with VitePress
+        run: npm run docs:build
+
+      - name: Set Pages artifact name
+        id: pages_artifact
+        run: echo "name=github-pages-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/.vitepress/dist
+          name: ${{ steps.pages_artifact.outputs.name }}
+
+      - name: Deploy to GitHub Pages (attempt 1)
+        id: deployment
+        uses: actions/deploy-pages@v4
+        with:
+          artifact_name: ${{ steps.pages_artifact.outputs.name }}
+        continue-on-error: true
+
+      - name: Wait before retrying Pages deployment
+        if: steps.deployment.outcome == 'failure'
+        run: sleep 15
+
+      - name: Deploy to GitHub Pages (attempt 2)
+        if: steps.deployment.outcome == 'failure'
+        id: deployment_retry
+        uses: actions/deploy-pages@v4
+        with:
+          artifact_name: ${{ steps.pages_artifact.outputs.name }}

@@ -1,0 +1,75 @@
+name: Backup
+on:
+  workflow_dispatch:
+  schedule:
+    # Backup our Postgres DB nightly at 2AM AEST (4PM UTC)
+    - cron: "0 16 * * *"
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Checkout transcrypt
+      uses: actions/checkout@v4
+      with:
+        repository: elasticdog/transcrypt
+        path: transcrypt
+
+    - name: Initialise transcrypt
+      run: ./transcrypt/transcrypt -c aes-256-cbc -p '${{ secrets.TRANSCRYPT_PASSWORD }}' --yes
+
+    - name: Run backup script
+      run: ./infra/backup.sh
+      shell: bash
+      env:
+        AWS_ACCESS_KEY_ID: ${{ vars.AWS_BACKUP_USER_ACCESS_KEY }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_BACKUP_USER_SECRET_ACCESS_KEY }}
+        CLERK_PRIVATE_SSH_KEY: ${{ secrets.CLERK_PRIVATE_SSH_KEY }}
+        COMPOSE_SUFFIX: prod
+        S3_BUCKET: s3://anika-database-backups
+        BACKUP_PASSPHRASE: ${{ secrets.BACKUP_PASSPHRASE }}
+
+    # GitHub only emails the workflow file's last committer about failed
+    # scheduled runs, so without this a failed backup goes unnoticed until
+    # the monthly restore check flags a stale dump.
+    - name: Alert Slack on failure
+      if: failure()
+      shell: bash
+      run: |
+        curl --fail --silent --show-error --request POST \
+            --header 'Content-Type: application/json' \
+            --data @- "$SLACK_WEBHOOK_URL" << EOF
+        {
+            "text": "Nightly database backup FAILED - please investigate.",
+            "blocks": [
+                {
+                    "type": "header",
+                    "text": {
+                        "type": "plain_text",
+                        "text": ":x: Nightly database backup",
+                        "emoji": true
+                    }
+                },
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": "*FAILED* - tonight's backup did not complete, so the latest backup is a day older than it should be. Please investigate."
+                    }
+                },
+                {
+                    "type": "context",
+                    "elements": [
+                        {
+                            "type": "mrkdwn",
+                            "text": "$GITHUB_REPOSITORY - <$RUN_URL|Workflow run>"
+                        }
+                    ]
+                }
+            ]
+        }
+        EOF
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.BACKUP_ALERTS_SLACK_WEBHOOK_URL }}
+        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

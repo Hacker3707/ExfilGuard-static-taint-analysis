@@ -1,0 +1,100 @@
+name: Upload to Launchpad PPA
+
+# Called by release.yaml at the end of a release, exactly like pypi-publish and
+# pacman-repo. It used to trigger on `push: tags`, but the release tag is
+# created by softprops/action-gh-release through the GitHub API (release.yaml
+# itself runs on workflow_dispatch as often as on a tag push) — an API-created
+# tag raises no `push` event, so this job silently never ran for any release
+# cut that way. v1.4.15 shipped everywhere except the PPA for exactly this
+# reason (issue #226). Being a reusable workflow_call, like the other
+# channels, removes the dependency on how the tag came to exist.
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: 'Release tag to build (e.g. v1.2.14)'
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to build (e.g. v1.2.14); blank = current ref'
+        required: false
+        type: string
+
+jobs:
+  ppa-upload:
+    runs-on: ubuntu-24.04
+    if: "!contains(inputs.tag || github.ref_name, 'b')"
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    strategy:
+      fail-fast: false
+      matrix:
+        # Only series Launchpad still accepts uploads for. Once Ubuntu retires
+        # one it goes active=false there and every dput is rejected by mail —
+        # while this job still reports success, because dput only ever proves
+        # the file left the runner. questing (25.10) went that way in July 2026
+        # and sat in this matrix for fifteen releases, uploading into a void,
+        # with the PPA quietly serving 1.2.8 to anyone still on it. Check
+        # https://api.launchpad.net/1.0/ubuntu/<series> before adding one back.
+        series: [noble, resolute]
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential devscripts debhelper python3-pip python3-venv dpkg-dev
+
+      - name: Install uv and build wheels
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          export PATH="$HOME/.cargo/bin:$PATH"
+          python3 --version | awk '{split($2,v,"."); print v[1]"."v[2]}' > .python-version
+          mkdir -p debian/wheels
+          uv build --wheel --out-dir debian/wheels/
+          pip3 download --no-deps --dest=debian/wheels dbus-next
+
+      - name: Patch changelog for target series
+        run: |
+          VERSION=$(python3 -c "
+          import tomllib
+          with open('pyproject.toml', 'rb') as f:
+              print(tomllib.load(f)['project']['version'])
+          ")
+          SERIES="${{ matrix.series }}"
+          # Replace the entire first line to avoid basic-regex pitfall where
+          # (.*) matches literal parens only, leaving the old series in place.
+          sed -i "1s|.*|arctis-sound-manager (${VERSION}-1~${SERIES}1) ${SERIES}; urgency=medium|" debian/changelog
+
+      - name: Import GPG key
+        run: |
+          echo "${{ secrets.GPG_PRIVATE_KEY }}" | gpg --batch --import
+          GPG_KEY_ID=$(gpg --list-secret-keys --keyid-format long | grep sec | head -1 | awk '{print $2}' | cut -d/ -f2)
+          echo "GPG_KEY_ID=$GPG_KEY_ID" >> $GITHUB_ENV
+
+      - name: Build source package
+        run: |
+          # Use dpkg-buildpackage directly instead of debuild:
+          # debuild injects --rules-target before extra args, turning
+          # "-- --no-pre-clean" into "--rules-target --no-pre-clean" which
+          # calls debian/rules with --no-pre-clean as a make target (fails).
+          # dpkg-buildpackage -S --no-pre-clean skips debian/rules clean so
+          # debian/wheels/ is still present when the source is packaged.
+          dpkg-buildpackage -S -sa -d --no-pre-clean -k"$GPG_KEY_ID"
+
+      - name: Configure dput (passive FTP — active mode fails on GitHub Actions runners)
+        run: |
+          printf '%s\n' \
+            '[DEFAULT]' \
+            'default_host_main = notspecified' \
+            'passive_ftp = 1' \
+            > ~/.dput.cf
+
+      - name: Upload to PPA
+        run: |
+          dput ppa:loteran/arctis-sound-manager ../arctis-sound-manager_*.changes

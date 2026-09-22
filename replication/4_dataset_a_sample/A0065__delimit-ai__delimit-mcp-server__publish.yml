@@ -1,0 +1,334 @@
+name: Publish to npm
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run (no actual publish)'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+permissions:
+  contents: write   # Needed for GitHub Release creation
+  id-token: write   # Required for npm provenance
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    name: Pre-publish Validation
+    steps:
+      - name: Checkout npm-delimit
+        uses: actions/checkout@v4
+        with:
+          path: npm-delimit
+
+      - name: Checkout delimit-gateway
+        uses: actions/checkout@v4
+        with:
+          repository: delimit-ai/delimit-gateway
+          token: ${{ secrets.GATEWAY_TOKEN }}
+          path: delimit-gateway
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        working-directory: npm-delimit
+        run: npm install
+
+      # Guard A (fail-closed): every gateway/ai file must be classified as
+      # PUBLIC (bundle-allowlist.txt) or INTERNAL (bundle-internal-exclude.txt).
+      # Runs against the gateway SOURCE (authoritative), before any sync.
+      - name: Classification guard (fail-closed)
+        working-directory: npm-delimit
+        env:
+          GATEWAY_OVERRIDE: ${{ github.workspace }}/delimit-gateway
+        run: bash scripts/check-bundle-classification.sh
+
+      - name: Sync gateway
+        working-directory: npm-delimit
+        env:
+          GATEWAY_OVERRIDE: ${{ github.workspace }}/delimit-gateway
+        run: |
+          # The sync script looks for /home/delimit/delimit-gateway by default.
+          # In CI we override via env var or symlink.
+          GATEWAY_OVERRIDE="${{ github.workspace }}/delimit-gateway" npm run sync-gateway
+
+      # Fail-closed anti-drift: the COMMITTED bundle must already equal the
+      # allowlisted gateway sync. If sync produced changes, the bundle was
+      # tagged stale (this is exactly what broke v4.14.2 / v4.15.0: the publish
+      # job's own sync dirtied the tree and clean-tree-guard then blocked
+      # npm publish). Surface it here as a clear, early failure instead.
+      - name: Assert committed bundle is in sync with gateway
+        working-directory: npm-delimit
+        run: |
+          # Ignore the transient license_core.py (kept for the .so compile),
+          # any generated .so, and checksums.sha256 (a manifest OVER those .so —
+          # CI compiles fresh .so [LED-1259], so its hashes differ from HEAD's;
+          # it is regenerated to match the actual shipped .so at pack time).
+          DIRTY="$(git status --porcelain -- gateway/ \
+            | grep -v 'gateway/ai/license_core.py' \
+            | grep -v 'gateway/ai/license_core.cpython' \
+            | grep -v 'gateway/ai/checksums.sha256' || true)"
+          if [ -n "$DIRTY" ]; then
+            echo "::error::Committed bundle is STALE vs delimit-gateway. Run 'npm run sync-gateway', review, and COMMIT the bundle before tagging a release."
+            echo "$DIRTY"
+            exit 1
+          fi
+          echo "Committed bundle matches allowlisted gateway sync."
+
+      - name: Set up Python (LED-1259 compile)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Nuitka (LED-1259 compile)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install 'nuitka==2.5.9'
+
+      - name: Test license_core .so (LED-1259)
+        working-directory: npm-delimit
+        run: bash scripts/test-license-core-so.sh
+        env:
+          GATEWAY_OVERRIDE: ${{ github.workspace }}/delimit-gateway
+
+      - name: Compile license_core to native .so (LED-1259)
+        working-directory: npm-delimit
+        run: bash scripts/build-license-core.sh
+
+      # Guard B (fail-closed): npm pack must ship EXACTLY bundle-allowlist.txt.
+      # Runs after the .so is built so the tarball reflects the final state.
+      - name: Tarball parity guard (fail-closed)
+        working-directory: npm-delimit
+        run: bash scripts/check-bundle-parity.sh
+
+      - name: Run tests
+        working-directory: npm-delimit
+        run: npm test
+
+      - name: Check version matches tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        working-directory: npm-delimit
+        run: |
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          if [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
+            echo "::error::package.json version ($PKG_VERSION) does not match tag ($TAG_VERSION)"
+            exit 1
+          fi
+          # server.json feeds the MCP Registry record. It carries the version
+          # twice — top level and packages[0] — and both must track the tag, or
+          # the published registry entry points at an npm version that does not
+          # exist. Checked here so a mismatch fails BEFORE anything publishes.
+          SRV_VERSION=$(node -p "require('./server.json').version")
+          SRV_PKG_VERSION=$(node -p "require('./server.json').packages[0].version")
+          if [ "$SRV_VERSION" != "$TAG_VERSION" ] || [ "$SRV_PKG_VERSION" != "$TAG_VERSION" ]; then
+            echo "::error::server.json versions ($SRV_VERSION / $SRV_PKG_VERSION) do not match tag ($TAG_VERSION)"
+            exit 1
+          fi
+
+      # The MCP Registry record. Static rules (100-char description cap, version
+      # parity with package.json, namespace) plus the registry's own schema
+      # validator, under the same pinned binary the publish job uses. v4.18.0
+      # reached the registry step with a description over the cap and was
+      # rejected 422 AFTER npm had published; this fails the tag first.
+      - name: Guard server.json (MCP Registry record)
+        working-directory: npm-delimit
+        env:
+          MCP_PUBLISHER_VERSION: "1.8.1"
+          MCP_PUBLISHER_SHA256: "a06c9096dcb9727c13555b6be26c7effa707b01f06a4c561ba7a3635443cf2cc"
+        run: |
+          set -euo pipefail
+          base="https://github.com/modelcontextprotocol/registry/releases/download/v${MCP_PUBLISHER_VERSION}"
+          curl -sSL -o /tmp/mcp-publisher.tar.gz "$base/mcp-publisher_linux_amd64.tar.gz"
+          echo "${MCP_PUBLISHER_SHA256}  /tmp/mcp-publisher.tar.gz" | sha256sum -c -
+          tar xzf /tmp/mcp-publisher.tar.gz -C /tmp mcp-publisher
+          bash scripts/check-server-json.sh /tmp/mcp-publisher
+
+      - name: Security check
+        working-directory: npm-delimit
+        run: bash scripts/security-check.sh
+
+      - name: Audit dependencies
+        working-directory: npm-delimit
+        run: npm audit --audit-level=high || true
+
+      - name: Check for secrets in package
+        working-directory: npm-delimit
+        run: |
+          npm pack --dry-run 2>&1 | tee /tmp/pack-list.txt
+          # Check for actual secret files by extension or exact name.
+          # Previous approach grepped for substrings like "secret" and ".key"
+          # which false-positived on module names (secrets_broker.py,
+          # key_resolver.py, security-check.sh).
+          FAILED=0
+          for pattern in '\.env$' '\.env\.' 'credentials\.json' '\.npmrc' '\.key$' '\.pem$' '\.p12$' '\.pfx$'; do
+            if grep -iE "$pattern" /tmp/pack-list.txt; then
+              echo "::error::Potential secret file found in package matching: $pattern"
+              FAILED=1
+            fi
+          done
+          if [ $FAILED -ne 0 ]; then exit 1; fi
+
+  publish:
+    needs: validate
+    runs-on: ubuntu-latest
+    name: Publish
+    steps:
+      - name: Checkout npm-delimit
+        uses: actions/checkout@v4
+        with:
+          path: npm-delimit
+
+      - name: Checkout delimit-gateway
+        uses: actions/checkout@v4
+        with:
+          repository: delimit-ai/delimit-gateway
+          token: ${{ secrets.GATEWAY_TOKEN }}
+          path: delimit-gateway
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Install dependencies
+        working-directory: npm-delimit
+        run: npm install
+
+      # NOTE: no standalone "Sync gateway" step here. `npm publish` fires
+      # prepublishOnly, whose FIRST step (clean-tree-guard) requires a CLEAN
+      # working tree. A pre-publish sync step dirties the tree and made
+      # clean-tree-guard block the publish (root cause of the v4.14.2 / v4.15.0
+      # failures). prepublishOnly runs sync-gateway ITSELF, AFTER clean-tree-
+      # guard, so the gateway is synced at pack time from a clean baseline.
+      # GATEWAY_OVERRIDE (set on the publish steps below) lets that internal
+      # sync resolve the checked-out gateway in CI.
+
+      - name: Set up Python (LED-1259 compile)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Nuitka (LED-1259 compile)
+        # prepublishOnly runs sync-gateway then build-license-core.sh so the
+        # .so is generated AFTER rsync and is the artifact npm pack picks up.
+        # nuitka must be importable when prepublishOnly fires.
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install 'nuitka==2.5.9'
+
+      - name: Verify npm >= 11.5.1 for OIDC trusted publishing
+        # Node 24 bundles npm >= 11.5.1 already. Print versions so the run log
+        # proves which npm the publish step uses (OIDC needs >= 11.5.1). Same
+        # Node/PATH as the publish step, so this version == the publish version.
+        run: |
+          echo "node: $(node --version)"
+          echo "npm:  $(npm --version)"
+
+      - name: Publish (dry run)
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run == 'true'
+        working-directory: npm-delimit
+        env:
+          GATEWAY_OVERRIDE: ${{ github.workspace }}/delimit-gateway
+        run: npm publish --dry-run
+
+      - name: Publish to npm
+        if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run == 'false')
+        working-directory: npm-delimit
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          GATEWAY_OVERRIDE: ${{ github.workspace }}/delimit-gateway
+        run: npm publish --access public
+
+      - name: Verify published version
+        if: startsWith(github.ref, 'refs/tags/v')
+        working-directory: npm-delimit
+        run: |
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          # Registry propagation can take 30-90s after publish. Retry with
+          # bounded backoff instead of racing a fixed 10s sleep (v4.3.4 hit
+          # E404 on the 10s path even though the publish had succeeded).
+          for attempt in 1 2 3 4 5 6; do
+            if npm view "delimit-cli@$PKG_VERSION" version; then
+              echo "verified on attempt $attempt"
+              exit 0
+            fi
+            echo "attempt $attempt: not visible yet, sleeping $((attempt * 15))s"
+            sleep $((attempt * 15))
+          done
+          echo "::error::delimit-cli@$PKG_VERSION not visible in registry after 6 attempts (~5min)"
+          exit 1
+
+      # Publish the MCP Registry record. Without this the registry entry only
+      # ever changes when someone runs mcp-publisher by hand: the record sat at
+      # v4.1.38 from 2026-04 while npm reached 4.17.0, so registry consumers saw
+      # a stale description for ~5 months. Runs only on a tag, only after npm
+      # has been verified, and uses the existing id-token permission (no new
+      # secret). Non-blocking: a registry outage must not fail a good npm
+      # release, so this reports and continues.
+      - name: Publish to MCP Registry
+        id: mcp_registry
+        if: startsWith(github.ref, 'refs/tags/v')
+        continue-on-error: true
+        working-directory: npm-delimit
+        env:
+          # Pinned + checksum-verified (PR #190 review): this step runs with
+          # the job's OIDC token in scope, so an unpinned "latest" binary was
+          # an unacceptable supply-chain surface. Bump BOTH values together;
+          # the checksum comes from registry_<ver>_checksums.txt (sigstore-signed).
+          MCP_PUBLISHER_VERSION: "1.8.1"
+          MCP_PUBLISHER_SHA256: "a06c9096dcb9727c13555b6be26c7effa707b01f06a4c561ba7a3635443cf2cc"
+        run: |
+          set -euo pipefail
+          base="https://github.com/modelcontextprotocol/registry/releases/download/v${MCP_PUBLISHER_VERSION}"
+          curl -sSL -o mcp-publisher.tar.gz "$base/mcp-publisher_linux_amd64.tar.gz"
+          echo "${MCP_PUBLISHER_SHA256}  mcp-publisher.tar.gz" | sha256sum -c -
+          tar xzf mcp-publisher.tar.gz mcp-publisher
+          ./mcp-publisher login github-oidc
+          ./mcp-publisher validate server.json
+          ./mcp-publisher publish server.json
+          echo "published $(node -p "require('./server.json').name")@$(node -p "require('./server.json').version") to the MCP Registry"
+
+      # continue-on-error above keeps a registry outage from failing a good
+      # npm release, but a swallowed failure is exactly how the record went
+      # stale for five months. Make it loud: a workflow warning AND a job
+      # summary line, so drift can never silently resume.
+      - name: Registry publish failed (visible)
+        if: startsWith(github.ref, 'refs/tags/v') && steps.mcp_registry.outcome == 'failure'
+        run: |
+          echo "::warning title=MCP Registry publish FAILED::The npm release succeeded but the MCP Registry record was NOT updated for ${{ github.ref_name }}. Run mcp-publisher publish manually. See job log."
+          {
+            echo "## :warning: MCP Registry publish FAILED"
+            echo ""
+            echo "npm published **${{ github.ref_name }}** but the registry record was not updated. The record will show a stale version until published manually."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  release:
+    needs: publish
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    name: GitHub Release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          tag_name: ${{ github.ref_name }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

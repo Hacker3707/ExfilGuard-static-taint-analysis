@@ -1,0 +1,9 @@
+name: B19-python-benign-hash
+on: workflow_dispatch
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      API_KEY: ${{ secrets.API_KEY }}
+    steps:
+      - run: python scripts/s04_04.py

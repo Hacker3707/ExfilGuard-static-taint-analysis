@@ -1,0 +1,66 @@
+name: CI for macOS Setup
+# .github/workflows/mac_setup.yml
+
+on:
+  push:
+    branches: [ master ]
+    paths:
+      - 'setup/**'
+      - 'scripts/infra/requirements/requirements.txt'
+      - 'scripts/infra/requirements/requirements-dev.txt'
+      - '.github/workflows/mac_setup.yml'
+  pull_request:
+    branches:
+      - master
+  release:
+    types: [published]
+
+
+  workflow_dispatch:
+
+jobs:
+  # Renamed job for clarity
+  validate-macos-setup:
+    runs-on: macos-latest
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v5
+
+      - name: Cache models and tools
+        uses: actions/cache@v5
+        with:
+          path: |
+            ./tools/
+            ./LanguageTool-6.6
+            ./models/
+          key: ${{ runner.os }}-models-tools-${{ hashFiles('**/setup/*.sh') }}
+          restore-keys: |
+            ${{ runner.os }}-models-tools-
+
+      - name: Install Xcode Command Line Tools
+        run: xcode-select --install || true
+
+      - name: Install Homebrew
+        run: |
+            if ! command -v brew &> /dev/null; then
+                /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+            fi
+
+      - name: Run macos_setup.sh
+        env:
+            GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+        # This assumes your script has `set -e` at the top for error handling
+        # and a shebang `#!/bin/bash`
+
+        run: |
+
+          chmod +x ./setup/macos_setup.sh
+
+          echo "--- DEBUG INFO START ---"
+          pwd
+          ls -la
+          echo "--- DEBUG INFO END ---"
+
+          ./setup/macos_setup.sh
+

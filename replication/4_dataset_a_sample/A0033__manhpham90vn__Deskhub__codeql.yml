@@ -1,0 +1,90 @@
+name: codeql
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '17 4 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: ${{ matrix.language }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { language: c-cpp,       os: ubuntu-latest, build-mode: manual }
+          - { language: java-kotlin, os: ubuntu-latest, build-mode: manual }
+          - { language: swift,       os: macos-15,      build-mode: manual }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Ninja
+        if: matrix.language == 'c-cpp'
+        run: scripts/apt-install.sh ninja-build
+
+      - uses: ./.github/actions/android-sdk
+        if: matrix.language == 'java-kotlin'
+        with:
+          gradle: 'true'
+
+      - uses: ./.github/actions/third-party
+        if: matrix.language == 'c-cpp'
+        with:
+          cache-key: host-ubuntu-latest
+
+      - uses: ./.github/actions/third-party
+        if: matrix.language == 'java-kotlin'
+        with:
+          targets: android
+          cache-key: android
+
+      - uses: ./.github/actions/third-party
+        if: matrix.language == 'swift'
+        with:
+          targets: aarch64-apple-darwin x86_64-apple-darwin
+          cache-key: macos
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix['build-mode'] }}
+
+      - name: Build core + platform + tests
+        if: matrix.language == 'c-cpp'
+        run: |
+          cmake --preset x64-debug -DDESKHUB_LINUX_APP=OFF
+          cmake --build --preset x64-debug \
+            --target core_tests platform_tests integration_tests
+
+      - name: Build the Android app
+        if: matrix.language == 'java-kotlin'
+        run: make build-android
+
+      - name: Build the macOS app
+        if: matrix.language == 'swift'
+        run: >
+          make build-macos MACOS_SIGN=adhoc
+          MACOS_XCARGS="ARCHS=arm64 ONLY_ACTIVE_ARCH=YES
+          SWIFT_WHOLE_MODULE_OPTIMIZATION=NO COMPILER_INDEX_STORE_ENABLE=NO"
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
+        with:
+          category: /language:${{ matrix.language }}

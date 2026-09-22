@@ -1,0 +1,1936 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+
+# Least-privilege GITHUB_TOKEN for every job in this workflow. No job writes to
+# the GitHub API (no artifacts, no `gh`, no comments); the submodule checkout
+# authenticates with OWLETTO_WEB_DEPLOY_KEY, not the token.
+permissions:
+  contents: read
+
+# Auto-cancel superseded PR runs. PR revisions are obsolete after a force-push
+# or rebase, so keeping them alive only makes newer required checks wait.
+#
+# CI_LINUX_RUNNER is an optional repository variable used for runner A/B tests.
+# Leaving it unset preserves GitHub-hosted execution; setting it changes only
+# the machine behind these jobs, not their names, events, secrets, or checks.
+# CI_K8S_RUNNER (e.g. "k8s-ci", an ARC self-hosted runner group) opts into the
+# self-hosted Kubernetes backend, gated to real pull_requests by a trusted
+# author (TRUSTED_AUTHORS, whitespace-separated). Pushes, workflow_dispatch,
+# and the `make pr-full` Depot gate are never routed to it.
+#
+# Pull requests share a per-ref group and cancel obsolete revisions. EVERY OTHER
+# execution gets its own run-id group, so it neither cancels nor is cancelled.
+#
+# Main pushes used to share the group too, because `github.ref` is
+# `refs/heads/main` for every merge — so each merge killed the previous merge's
+# full-graph run. Measured over 40 consecutive main runs: 15 cancelled, 23
+# green, 2 failed. About a third of merged commits never completed a
+# validation, the release commit for 15.3.1 among them, and the PR check that
+# preceded each one only ever validated the PR head rather than what landed.
+#
+# Setting `cancel-in-progress: false` would NOT have been enough: a concurrency
+# group holds only one PENDING run, so a third merge still evicts the second
+# before it starts. Only a distinct group per run removes the contention.
+#
+# The tradeoff, which was the original reason for cancelling: main runs no
+# longer yield, so they hold slots in the same 20-slot hosted pool that
+# required PR checks draw from. That is accepted deliberately — a merged commit
+# nobody validated is worse than a PR check that waits — but if the pool starts
+# starving, revisit here rather than reinstating blanket cancellation.
+#
+# The run-id group is also load-bearing for `depot ci run`, which `make pr-full`
+# uses to execute this file against a local staged tree. That path supplies no
+# ref, so `github.ref` expanded empty and every local dispatch in the org
+# collapsed into one group literally named `ci-`; the newest gate anywhere
+# killed whatever was running — a different branch, worktree, or person — and
+# the victim saw only "Cancelled due to the workflow concurrency policy", which
+# names THIS block rather than any Depot-side limit. Two dispatchers that each
+# retry on cancellation then deadlock, neither ever attesting.
+concurrency:
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # Resolve the Linux runner backend from the PR author. Trusted authors
+  # (TRUSTED_AUTHORS) may use the self-hosted Kubernetes runner when
+  # CI_K8S_RUNNER is set; every other event and author resolves to
+  # CI_LINUX_RUNNER (the A/B override) or GitHub-hosted ubuntu-24.04, so the
+  # `make pr-full` Depot gate never depends on a self-hosted runner.
+  check-author:
+    name: Resolve CI backend
+    runs-on: ubuntu-24.04
+    outputs:
+      runner: ${{ steps.route.outputs.runner }}
+    env:
+      AUTHOR: ${{ github.event.pull_request.user.login }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      ACTOR: ${{ github.actor }}
+      TRUSTED: ${{ vars.TRUSTED_AUTHORS || 'buremba' }}
+      LINUX: ${{ vars.CI_LINUX_RUNNER || 'ubuntu-24.04' }}
+      K8S: ${{ vars.CI_K8S_RUNNER }}
+    steps:
+      - name: Route runner backend
+        id: route
+        run: |
+          author="${AUTHOR:-$ACTOR}"
+          if [ -n "$K8S" ] && [ -n "$PR_NUMBER" ] && [ -n "$author" ] \
+            && echo "$TRUSTED" | tr '[:space:]' '\n' | grep -qxF "$author"; then
+            echo "runner=$K8S" >> "$GITHUB_OUTPUT"
+          else
+            echo "runner=$LINUX" >> "$GITHUB_OUTPUT"
+          fi
+
+  # Decide which package/frontend suites must run. Same git-diff pattern as
+  # optional-smoke-filter: a PR touching only workflows/docs skips the heavy
+  # suites (they report "skipped", which satisfies branch protection), while
+  # any runtime change runs everything. On push/main (no base SHA) all run.
+  paths:
+    runs-on: ubuntu-24.04
+    outputs:
+      packages: ${{ steps.filter.outputs.packages }}
+      frontend: ${{ steps.filter.outputs.frontend }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Need the PR base commit so we can diff against it. The default
+          # fetch-depth=1 only has HEAD.
+          fetch-depth: 0
+
+      - name: Decide which test suites to run
+        id: filter
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          if [ -z "${BASE_SHA:-}" ]; then
+            echo "packages=true" >> "$GITHUB_OUTPUT"
+            echo "frontend=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          changed=$(git diff --name-only "$BASE_SHA"...HEAD)
+          if echo "$changed" | grep -E '^(packages/|examples/|bun\.lock$|package\.json$|tsconfig\.json$|bunfig\.toml$|Makefile$|patches/|docker/|db/|scripts/|config/|\.github/workflows/ci\.yml$|\.github/actions/|\.gitmodules$)' >/dev/null; then
+            echo "packages=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "packages=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No runtime/test paths changed - skipping package suites."
+          fi
+          if echo "$changed" | grep -E '^(packages/owletto($|/)|\.gitmodules$|\.github/actions/setup-submodule/)' >/dev/null; then
+            echo "frontend=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "frontend=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No frontend paths changed - skipping frontend."
+          fi
+
+  # Fast unit tests — no Postgres, no submodule needed for most.
+  # Splits from `integration` so a unit failure surfaces in <2 min instead of
+  # waiting behind DB setup. Worker tests run under bun (full suite, not the
+  # cherry-picked subset that used to live here).
+  unit:
+    needs: [check-author, paths]
+    if: needs.paths.outputs.packages == 'true'
+    runs-on: ${{ needs.check-author.outputs.runner }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/setup-submodule
+        with:
+          deploy-key: ${{ secrets.OWLETTO_WEB_DEPLOY_KEY }}
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.5
+
+      # Node 22 — the node-version-guard test spawns the real `node` on PATH and
+      # asserts the CLI gate lets a supported Node through. The runner's default
+      # Node major (20) is below Lobu's floor of 22, so without this the guard
+      # fires and the "real runtime, >=22" case fails. Matches every other job.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+
+      # Cache the .deb so the steady-state install touches no apt mirror at all.
+      # The mirror stall this avoids is a HANG, not an error, so no retry policy
+      # can bound it — only not needing the network can.
+      #
+      # ImageOS is in the key because runner.os/runner.arch are Linux/X64 on
+      # EVERY Ubuntu image: without it a .deb cached on 24.04 would be restored
+      # onto whatever image comes next. A stale .deb degrades safely (dpkg
+      # fails, the script falls through to apt) but it would spend the runtime
+      # this cache exists to save, on exactly the runs where the image just
+      # changed.
+      - name: Cache bubblewrap package
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/lobu-bwrap
+          key: bwrap-deb-${{ runner.os }}-${{ runner.arch }}-${{ env.ImageOS }}-v1
+
+      - name: Install bubblewrap (for embedded exec-sandbox tests)
+        # The ONLY job that requires bwrap: the worker exec-sandbox escape
+        # matrix here (LOBU_REQUIRE_EXEC_SANDBOX=1) hard-fails without it, and
+        # this is the only Linux isolation verification path. The SDK
+        # lifecycle/transcript gates dropped their installs - their workers
+        # probe the strategy and fall back to kind:"none" (pass-through).
+        # Ubuntu 24.04 (ubuntu-latest) blocks unprivileged user namespaces via
+        # AppArmor by default; bwrap needs them, so flip the sysctl. See
+        # https://ubuntu.com/blog/ubuntu-23-10-restricted-unprivileged-user-namespaces
+        run: bash scripts/install-bubblewrap.sh probe
+
+      - name: Compute cache keys
+        id: cache-keys
+        shell: bash
+        run: |
+          PKG_TREE=$(git rev-parse HEAD:packages 2>/dev/null || echo no-tree)
+          ROOT=$( { git hash-object tsconfig.json bunfig.toml Makefile package.json scripts/build-packages.mjs 2>/dev/null; git rev-parse HEAD:patches HEAD:config HEAD:db HEAD:skills 2>/dev/null; } | git hash-object --stdin || echo no-root)
+          LOCK=$(git hash-object bun.lock 2>/dev/null || echo no-lock)
+          echo "bun-key=bun-$LOCK" >> "$GITHUB_OUTPUT"
+          echo "dist-key=dist-unit-$PKG_TREE-$LOCK-$ROOT" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@v6
+        id: bun-cache
+        with:
+          path: node_modules
+          key: ${{ steps.cache-keys.outputs.bun-key }}
+
+      - uses: actions/cache@v6
+        id: dist-cache
+        with:
+          path: packages/*/dist
+          key: ${{ steps.cache-keys.outputs.dist-key }}
+      - name: Install dependencies
+        run: bun install
+
+      - name: Connector runtime deps tripwire
+        # Catches "added a dep to the compiler's external list but forgot to
+        # install it in the worker runtime image" before it ships.
+        run: node scripts/check-connector-runtime-deps.mjs
+
+      - name: Build package graph for unit-test runtime resolution
+        if: steps.dist-cache.outputs.cache-hit != 'true'
+        # connector-worker integration tests import from its compiled `dist/`
+        # (subprocess-mode tests spawn the built executor); build it here
+        # so those run. embeddings must build before connector-worker —
+        # connector-worker's src/embeddings.ts imports from @lobu/embeddings
+        # and resolves it via the workspace symlink → dist.
+        # cli must build too: the cli-ux unit test spawns `packages/cli/bin/lobu.js`,
+        # whose shim resolves `../dist/index.js` at runtime. The cli's build
+        # script vendors @lobu/pgvector-embedded's dist+prebuilt into its
+        # tarball, so pgvector-embedded must build first.
+        # Reuse the dependency-layered builder so independent packages build in
+        # parallel and new workspace packages cannot drift from an inline list.
+        # Server/Owletto application bundles are not used by the unit suites;
+        # the CLI distribution remains included for cli-ux runtime tests.
+        run: node scripts/build-packages.mjs --skip-applications
+
+      # bunfig.toml routes every `bun test --coverage` run to ./coverage/lcov.info
+      # (bun 1.3.x ignores --coverage-dir when bunfig sets coverageDir), so each
+      # step moves its report to a unique name before the next step overwrites it.
+      #
+      # Every `bun test` in this file passes `--timeout 30000`, matching the value
+      # the gateway lanes already use. bun's default is 5000ms and it IGNORES a
+      # `timeout` key in bunfig.toml — the CLI flag is the only thing that works,
+      # so this cannot be hoisted into config. Runners here have been measured
+      # ~100x slower than a dev machine (a suite that takes 45ms locally has
+      # exceeded 5000ms in CI), and a test that trips the ceiling does not fail
+      # alone: bun does not abort the timed-out body, so it keeps running and can
+      # take unrelated tests in the same file down with it. Keep the flag on new
+      # `bun test` steps.
+      - name: core / cli (bun:test)
+        run: |
+          bun test packages/core packages/cli --coverage --timeout 30000
+          mv coverage/lcov.info coverage/core-cli.lcov.info
+
+      # Repo tooling guards (merge integrity, release ordering, migration
+      # checks, naming gates, the sandbox credential reader). These live in
+      # scripts/__tests__ and matched no `bun test` path above, so the whole
+      # tree ran only on a developer's machine — green locally and unverified
+      # here. `scripts/` is already in the paths filter, so this step runs
+      # whenever the tooling it covers changes.
+      - name: repo scripts (bun:test)
+        run: |
+          bun test scripts --coverage --timeout 30000
+          mv coverage/lcov.info coverage/scripts.lcov.info
+
+      - name: native plugin packages (bun:test)
+        run: |
+          bun test packages/plugin-api packages/plugin-host packages/plugin-toolkit packages/plugin-memory packages/plugin-conversations packages/plugin-media packages/plugin-mcp --coverage --timeout 30000
+          mv coverage/lcov.info coverage/plugin-runtime.lcov.info
+
+      - name: worker (bun:test, full suite)
+        # The previous CI cherry-picked 8 of 18 files because pi-coding-agent
+        # was thought to fail under bun on Linux. Locally the full suite
+        # passes; if Linux turns out different we'll narrow this back down,
+        # but we own the WASM concern via run-script-runtime.test.ts under
+        # Node + isolated-vm in the integration job below.
+        #
+        # LOBU_REQUIRE_EXEC_SANDBOX turns a missing/non-functional bwrap into a
+        # test failure. Without it the exec-sandbox escape matrix `describe.skip`s
+        # itself and the job still goes green — the one place we verify the
+        # sandbox actually contains a hostile command would vanish unnoticed.
+        env:
+          LOBU_REQUIRE_EXEC_SANDBOX: "1"
+        run: |
+          bun test packages/agent-worker --coverage --timeout 30000
+          mv coverage/lcov.info coverage/agent-worker.lcov.info
+
+      - name: server (bun:test units)
+        # The gateway code that used to live in packages/gateway is now under
+        # src/gateway/. Its bun:test suites run in the integration job below
+        # (the gateway loop covers src/gateway/infrastructure/queue too, so it
+        # is intentionally NOT repeated here — see #1238). Here we only run the
+        # pure-unit subdirectories that don't touch Postgres.
+        run: |
+          bun test packages/server/src/__tests__/unit --coverage --timeout 30000
+          mv coverage/lcov.info coverage/server-units.lcov.info
+          bun test packages/server/src/auth/__tests__/system-provider-resolution.test.ts --coverage --timeout 30000
+          mv coverage/lcov.info coverage/server-units-auth.lcov.info
+          # Pure-unit bun:test files that live outside src/__tests__/unit: the
+          # device-pin tombstone helpers and the activity-feed collapse logic.
+          # No Postgres needed (DB imports in the module graph are lazy), so they
+          # run here rather than in the integration job.
+          bun test packages/server/src/utils/__tests__/device-pin-tombstones.test.ts packages/server/src/tools/admin/manage_operations/__tests__/activity-feed-collapse.test.ts --coverage --timeout 30000
+          mv coverage/lcov.info coverage/server-units-activity.lcov.info
+          # Connector-compiler and catalog-build bun:test suites: pure source-text,
+          # AST-level compilation, and bounded manifest generation checks (no
+          # Postgres), so they run in the pure-unit job rather than integration.
+          bun test packages/server/src/utils/__tests__/catalog-connectors-compile.test.ts packages/server/src/utils/__tests__/compiler-core.test.ts packages/server/src/utils/__tests__/build-catalog-manifests-exit.test.ts --coverage --timeout 30000
+          mv coverage/lcov.info coverage/server-units-compiler.lcov.info
+
+      - name: connector-worker (bun:test)
+        run: |
+          bun test packages/connector-worker --coverage --timeout 30000
+          mv coverage/lcov.info coverage/connector-worker.lcov.info
+
+      - name: client / promptfoo-provider (bun:test)
+        # Previously unrun in CI: the client SSE/auth suite and the
+        # promptfoo-provider tests (which had no `test` script wired anywhere).
+        # Neither needs Postgres.
+        run: |
+          bun test packages/client packages/promptfoo-provider --coverage --timeout 30000
+          mv coverage/lcov.info coverage/client-promptfoo.lcov.info
+
+      - name: connector-sdk (bun:test)
+        # Checkpoint/watermark + url-guards moved here from bundled scraper-utils.
+        run: |
+          bun test packages/connector-sdk --coverage --timeout 30000
+          mv coverage/lcov.info coverage/connector-sdk.lcov.info
+
+      - name: connectors (bun:test)
+        run: |
+          bun test packages/connectors --coverage --timeout 30000
+          mv coverage/lcov.info coverage/connectors.lcov.info
+
+      - name: embeddings (bun:test)
+        # Previously unrun in CI: the embeddings HTTP suite and the
+        # orphan-reap subprocess regression (forks the real server under
+        # Node via tsx; binds ports 18951-18953). No Postgres needed.
+        # Bounded: if the orphan regression reappears the most likely
+        # symptom is this step hanging on an open child handle.
+        timeout-minutes: 5
+        run: |
+          bun test packages/embeddings --coverage --timeout 30000
+          mv coverage/lcov.info coverage/embeddings.lcov.info
+
+      - name: example connectors (bun:test)
+        # Unbundled connectors live under examples/; mock @lobu/connector-sdk
+        # so heavyweight connector dependencies never load in CI.
+        run: |
+          bun test examples/personal-agent --timeout 30000
+          bun test examples/brand-intelligence --timeout 30000
+          bun test examples/lobu-team --timeout 30000
+
+      - name: Upload coverage
+        if: always()
+        uses: codecov/codecov-action@v7
+        with:
+          files: coverage/core-cli.lcov.info,coverage/scripts.lcov.info,coverage/plugin-runtime.lcov.info,coverage/agent-worker.lcov.info,coverage/server-units.lcov.info,coverage/server-units-auth.lcov.info,coverage/server-units-activity.lcov.info,coverage/server-units-compiler.lcov.info,coverage/connector-worker.lcov.info,coverage/client-promptfoo.lcov.info,coverage/connector-sdk.lcov.info,coverage/connectors.lcov.info,coverage/embeddings.lcov.info
+          flags: unit
+          fail_ci_if_error: false
+
+  # Build the SDK/CLI distribution immediately, then fan its immutable output
+  # into three independent smoke jobs. The old job waited for the entire merge
+  # graph and ran these smokes serially, adding a second critical path after
+  # required checks were already green.
+  sdk-cli-build:
+    runs-on: ${{ vars.CI_LINUX_RUNNER || 'ubuntu-24.04' }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-submodule
+        with:
+          deploy-key: ${{ secrets.OWLETTO_WEB_DEPLOY_KEY }}
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.5
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+      - name: Compute cache keys
+        id: cache-keys
+        shell: bash
+        run: |
+          PKG_TREE=$(git rev-parse HEAD:packages 2>/dev/null || echo no-tree)
+          ROOT=$( { git hash-object tsconfig.json bunfig.toml Makefile package.json scripts/build-packages.mjs 2>/dev/null; git rev-parse HEAD:patches HEAD:config HEAD:db HEAD:skills 2>/dev/null; } | git hash-object --stdin || echo no-root)
+          LOCK=$(git hash-object bun.lock 2>/dev/null || echo no-lock)
+          echo "bun-key=bun-$LOCK" >> "$GITHUB_OUTPUT"
+          echo "dist-key=dist-sdk-cli-build-$PKG_TREE-$LOCK-$ROOT" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@v6
+        id: bun-cache
+        with:
+          path: node_modules
+          key: ${{ steps.cache-keys.outputs.bun-key }}
+
+      - uses: actions/cache@v6
+        id: dist-cache
+        with:
+          path: packages/*/dist
+          key: ${{ steps.cache-keys.outputs.dist-key }}
+      - name: Install dependencies
+        run: bun install
+      - name: Build all packages (CLI + server bundle + sdk + pgvector-embedded)
+        if: steps.dist-cache.outputs.cache-hit != 'true'
+        run: make build-packages
+      - name: Package built distributions
+        run: tar -czf "$RUNNER_TEMP/sdk-cli-distributions.tgz" packages/*/dist
+      - name: Upload built distributions
+        uses: actions/upload-artifact@v7
+        with:
+          name: sdk-cli-distributions
+          path: ${{ runner.temp }}/sdk-cli-distributions.tgz
+          if-no-files-found: error
+          retention-days: 1
+
+  # Preserve the old non-blocking full knip report without holding the SDK
+  # artifact fan-out. It remains behind the required merge graph so GitHub's
+  # finite hosted-runner pool gives merge-critical work priority.
+  dead-code-report:
+    needs: [unit, frontend, integration, format-lint, typecheck, migrations]
+    runs-on: ${{ vars.CI_LINUX_RUNNER || 'ubuntu-24.04' }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-submodule
+        with:
+          deploy-key: ${{ secrets.OWLETTO_WEB_DEPLOY_KEY }}
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.5
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+      - name: Compute cache keys
+        id: cache-keys
+        shell: bash
+        run: |
+          LOCK=$(git hash-object bun.lock 2>/dev/null || echo no-lock)
+          echo "bun-key=bun-$LOCK" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@v6
+        id: bun-cache
+        with:
+          path: node_modules
+          key: ${{ steps.cache-keys.outputs.bun-key }}
+      - name: Install dependencies
+        run: bun install
+      - name: Dead-code report (knip full, non-blocking)
+        continue-on-error: true
+        run: bun run knip
+
+  sdk-lifecycle-e2e:
+    needs: sdk-cli-build
+    runs-on: ${{ vars.CI_LINUX_RUNNER || 'ubuntu-24.04' }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-submodule
+        with:
+          deploy-key: ${{ secrets.OWLETTO_WEB_DEPLOY_KEY }}
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.5
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+      - name: Compute cache keys
+        id: cache-keys
+        shell: bash
+        run: |
+          LOCK=$(git hash-object bun.lock 2>/dev/null || echo no-lock)
+          echo "bun-key=bun-$LOCK" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@v6
+        id: bun-cache
+        with:
+          path: node_modules
+          key: ${{ steps.cache-keys.outputs.bun-key }}
+      - name: Install dependencies
+        run: bun install
+      # No bwrap: the worker probes the backend and falls back to kind:"none"
+      # — shell/transcript gates still pass, but contributed-CLI registration
+      # is dropped with it, so isolation + binaries stay covered by unit's
+      # escape matrix (LOBU_REQUIRE_EXEC_SANDBOX=1), the only job with bwrap.
+      - name: Download built distributions
+        uses: actions/download-artifact@v8
+        with:
+          name: sdk-cli-distributions
+          path: ${{ runner.temp }}/sdk-cli-distributions
+      - name: Restore built distributions
+        run: tar -xzf "$RUNNER_TEMP/sdk-cli-distributions/sdk-cli-distributions.tgz"
+      - name: SDK lifecycle e2e (apply + prune + real worker turn)
+        run: bash scripts/sdk-e2e.sh
+
+      # Measurement only. Reuse this already-running main-push job instead of
+      # allocating another hosted runner to inspect the same Ubuntu host.
+      - name: Report available exec-sandbox backends
+        if: github.event_name == 'push'
+        continue-on-error: true
+        run: |
+          {
+            echo "### exec-sandbox backend probe"
+            echo ""
+            if command -v bwrap >/dev/null 2>&1; then
+              if bwrap --unshare-user --unshare-pid \
+                   --ro-bind /usr /usr \
+                   --ro-bind-try /lib /lib \
+                   --ro-bind-try /lib64 /lib64 \
+                   --ro-bind-try /bin /bin \
+                   --proc /proc --dev /dev -- /usr/bin/true >/tmp/bwrap.err 2>&1; then
+                echo "- bwrap: **isolation works**"
+              else
+                echo "- bwrap: present but refused — \`$(head -c 200 /tmp/bwrap.err)\`"
+              fi
+            else
+              echo "- bwrap: not installed"
+            fi
+            if command -v systemd-run >/dev/null 2>&1; then
+              if systemd-run --user --scope --quiet /bin/true >/tmp/sdr.err 2>&1; then
+                echo "- systemd-run --user: **works** (viable alternative backend)"
+              else
+                echo "- systemd-run --user: present but failed — \`$(head -c 200 /tmp/sdr.err)\`"
+              fi
+            else
+              echo "- systemd-run: not installed"
+            fi
+            echo ""
+            echo "kernel.unprivileged_userns_clone=$(sysctl -n kernel.unprivileged_userns_clone 2>/dev/null || echo 'unset')"
+            echo "kernel.apparmor_restrict_unprivileged_userns=$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo 'unset')"
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat "$GITHUB_STEP_SUMMARY"
+
+  sdk-error-taxonomy-e2e:
+    needs: sdk-cli-build
+    runs-on: ${{ vars.CI_LINUX_RUNNER || 'ubuntu-24.04' }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-submodule
+        with:
+          deploy-key: ${{ secrets.OWLETTO_WEB_DEPLOY_KEY }}
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.5
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+      - name: Compute cache keys
+        id: cache-keys
+        shell: bash
+        run: |
+          LOCK=$(git hash-object bun.lock 2>/dev/null || echo no-lock)
+          echo "bun-key=bun-$LOCK" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@v6
+        id: bun-cache
+        with:
+          path: node_modules
+          key: ${{ steps.cache-keys.outputs.bun-key }}
+      - name: Install dependencies
+        run: bun install
+      # No bwrap: the worker probes the backend and falls back to kind:"none"
+      # — shell/transcript gates still pass, but contributed-CLI registration
+      # is dropped with it, so isolation + binaries stay covered by unit's
+      # escape matrix (LOBU_REQUIRE_EXEC_SANDBOX=1), the only job with bwrap.
+      - name: Download built distributions
+        uses: actions/download-artifact@v8
+        with:
+          name: sdk-cli-distributions
+          path: ${{ runner.temp }}/sdk-cli-distributions
+      - name: Restore built distributions
+        run: tar -xzf "$RUNNER_TEMP/sdk-cli-distributions/sdk-cli-distributions.tgz"
+      - name: Error-taxonomy e2e (provider 429 → verbatim relay)
+        run: bash scripts/sdk-e2e-error.sh
+
+  cli-command-smoke:
+    needs: sdk-cli-build
+    runs-on: ${{ vars.CI_LINUX_RUNNER || 'ubuntu-24.04' }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-submodule
+        with:
+          deploy-key: ${{ secrets.OWLETTO_WEB_DEPLOY_KEY }}
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.5
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+      - name: Compute cache keys
+        id: cache-keys
+        shell: bash
+        run: |
+          LOCK=$(git hash-object bun.lock 2>/dev/null || echo no-lock)
+          echo "bun-key=bun-$LOCK" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@v6
+        id: bun-cache
+        with:
+          path: node_modules
+          key: ${{ steps.cache-keys.outputs.bun-key }}
+      - name: Install dependencies
+        run: bun install
+      # No bwrap: the worker probes the backend and falls back to kind:"none"
+      # — shell/transcript gates still pass, but contributed-CLI registration
+      # is dropped with it, so isolation + binaries stay covered by unit's
+      # escape matrix (LOBU_REQUIRE_EXEC_SANDBOX=1), the only job with bwrap.
+      - name: Download built distributions
+        uses: actions/download-artifact@v8
+        with:
+          name: sdk-cli-distributions
+          path: ${{ runner.temp }}/sdk-cli-distributions
+      - name: Restore built distributions
+        run: tar -xzf "$RUNNER_TEMP/sdk-cli-distributions/sdk-cli-distributions.tgz"
+      - name: CLI command-coverage smoke (every command runs)
+        env:
+          GW_PORT: "8797"
+          MOCK_PORT: "11438"
+        run: bash scripts/cli-smoke.sh
+
+  # Preserve the historical aggregate check name while making each failure
+  # independently retryable and visible.
+  sdk-cli-e2e:
+    if: always()
+    # `sdk-cli-build` is in `needs` on purpose: the three smokes `needs` it, so
+    # when it fails they report `skipped`, and a fan-in that accepted `skipped`
+    # turned a broken build into a green required check. None of these jobs
+    # has a paths filter, so every result must be an actual success.
+    needs: [sdk-cli-build, sdk-lifecycle-e2e, sdk-error-taxonomy-e2e, cli-command-smoke]
+    runs-on: ubuntu-slim
+    steps:
+      - name: Require every deep smoke
+        env:
+          BUILD_RESULT: ${{ needs.sdk-cli-build.result }}
+          SDK_RESULT: ${{ needs.sdk-lifecycle-e2e.result }}
+          ERROR_TAXONOMY_RESULT: ${{ needs.sdk-error-taxonomy-e2e.result }}
+          CLI_RESULT: ${{ needs.cli-command-smoke.result }}
+        run: |
+          echo "SDK/CLI build: $BUILD_RESULT"
+          echo "SDK lifecycle: $SDK_RESULT"
+          echo "Error taxonomy: $ERROR_TAXONOMY_RESULT"
+          echo "CLI surface: $CLI_RESULT"
+          for r in "$BUILD_RESULT" "$SDK_RESULT" "$ERROR_TAXONOMY_RESULT" "$CLI_RESULT"; do
+            if [ "$r" != success ]; then
+              echo "job result \"$r\" is not success (skipped means an upstream job failed)"
+              exit 1
+            fi
+          done
+
+  # Frontend: vitest (jsdom) + prod SPA build + Chromium cold-boot smoke.
+  # The boot smoke is the SPA equivalent of connector-parity-smoke: unit tests
+  # run in Node (where `process` exists) and cannot catch "CI green, browser
+  # white-screen" packaging bugs. Build uses the same `bun run build` path as
+  # docker/app/Dockerfile. Forks without the deploy key get a stub and skip.
+  frontend:
+    needs: [check-author, paths]
+    if: needs.paths.outputs.frontend == 'true' || needs.paths.outputs.packages == 'true'
+    runs-on: ${{ needs.check-author.outputs.runner }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+
+      - id: submodule
+        uses: ./.github/actions/setup-submodule
+        with:
+          deploy-key: ${{ secrets.OWLETTO_WEB_DEPLOY_KEY }}
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.5
+
+      # Vitest runs under Node and clipboard-action tests rely on Node's global
+      # Navigator API. Do not inherit the runner image's unpinned Node version.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+
+      - name: Compute cache keys
+        id: cache-keys
+        shell: bash
+        run: |
+          PKG_TREE=$(git rev-parse HEAD:packages 2>/dev/null || echo no-tree)
+          ROOT=$( { git hash-object tsconfig.json bunfig.toml Makefile package.json scripts/build-packages.mjs 2>/dev/null; git rev-parse HEAD:patches HEAD:config HEAD:db HEAD:skills 2>/dev/null; } | git hash-object --stdin || echo no-root)
+          LOCK=$(git hash-object bun.lock 2>/dev/null || echo no-lock)
+          echo "bun-key=bun-$LOCK" >> "$GITHUB_OUTPUT"
+          echo "dist-key=dist-frontend-$PKG_TREE-$LOCK-$ROOT" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@v6
+        id: bun-cache
+        with:
+          path: node_modules
+          key: ${{ steps.cache-keys.outputs.bun-key }}
+
+      - uses: actions/cache@v6
+        id: dist-cache
+        with:
+          path: packages/*/dist
+          key: ${{ steps.cache-keys.outputs.dist-key }}
+      - name: Install dependencies
+        if: steps.submodule.outputs.stubbed != 'true'
+        run: bun install
+
+      - name: Build core + connector-sdk (owletto imports their compiled dist)
+        # connector-sdk imports @lobu/core; resolving the type-only barrel
+        # import needs core/dist on disk first. core/reserved subpath is what
+        # the SPA imports at runtime — must be on disk for the prod build.
+        if: steps.submodule.outputs.stubbed != 'true' && steps.dist-cache.outputs.cache-hit != 'true'
+        run: |
+          cd packages/core && bun run build && cd ../..
+          cd packages/connector-sdk && bun run build && cd ../..
+
+      - name: owletto tests (vitest)
+        if: steps.submodule.outputs.stubbed != 'true'
+        run: cd packages/owletto && ../../node_modules/.bin/vitest run
+
+      - name: SPA prod build (barrel ban + vite + bundle tripwire)
+        # Same command docker/app uses. Fails on runtime `@lobu/core` barrel
+        # imports, untransformed CJS, Node contamination markers, entry bloat.
+        if: steps.submodule.outputs.stubbed != 'true'
+        run: cd packages/owletto && bun run build
+
+      - name: SPA cold-boot smoke (Chrome)
+        # Loads dist/ in a real browser; fails on pageerror (e.g. process is
+        # not defined). Network API failures are ignored — no backend here. The
+        # Ubuntu runner image already includes Google Chrome; the smoke locates
+        # /usr/bin/google-chrome-stable itself and refuses snap Chromium.
+        if: steps.submodule.outputs.stubbed != 'true'
+        run: cd packages/owletto && bun run smoke:boot
+
+  # Backend integration tests need a real Postgres + pgvector. The Vitest
+  # files share a module graph and database within one process, so each shard
+  # remains single-forked; the shards themselves get isolated runners and
+  # databases. This preserves the hermeticity constraints in vitest.config.ts
+  # while removing the old 5-7 minute serial Vitest step from CI's critical
+  # path. `integration` below remains the stable required check and fails
+  # closed unless every shard and Bun/Postgres suite succeeds.
+  server-integration-vitest:
+    name: integration-vitest (${{ matrix.shard }}/3)
+    needs: [check-author, paths]
+    if: needs.paths.outputs.packages == 'true'
+    runs-on: ${{ needs.check-author.outputs.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    services:
+      postgres:
+        image: pgvector/pgvector:pg18
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: lobu_test
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5433/lobu_test
+      # The integration suite runs all 70+ test files in a single forked
+      # process (vitest.config.ts: pool:'forks', singleFork:true). With the
+      # production default of `DB_POOL_MAX=20` plus the test pool's `max:5`
+      # the suite has ~26 sockets to play with — fine on its own, but
+      # `idle_timeout:0` in db/client.ts keeps every connection forever, so
+      # any transient burst across 750+ tests accumulates and the singleton
+      # pgvector image (max_connections=100) starts rejecting with
+      # "sorry, too many clients already" deep into the run.
+      # Capping the app pool to 5 keeps the worst-case socket count at
+      # 5 (app) + 5 (test) + 3 (advisory-lock pool, db/client.ts getLockDb)
+      # + 1 (LISTEN) = 14, well below the CI budget.
+      DB_POOL_MAX: '5'
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/setup-submodule
+        with:
+          deploy-key: ${{ secrets.OWLETTO_WEB_DEPLOY_KEY }}
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.5
+
+      # Pin Node 22 so isolated-vm's abi127 prebuild loads. Without this the
+      # sandbox runtime test segfaults on the runner's default Node major.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+
+      - name: Compute cache keys
+        id: cache-keys
+        shell: bash
+        run: |
+          PKG_TREE=$(git rev-parse HEAD:packages 2>/dev/null || echo no-tree)
+          ROOT=$( { git hash-object tsconfig.json bunfig.toml Makefile package.json scripts/build-packages.mjs 2>/dev/null; git rev-parse HEAD:patches HEAD:config HEAD:db HEAD:skills 2>/dev/null; } | git hash-object --stdin || echo no-root)
+          LOCK=$(git hash-object bun.lock 2>/dev/null || echo no-lock)
+          echo "bun-key=bun-$LOCK" >> "$GITHUB_OUTPUT"
+          echo "dist-key=dist-integration-$PKG_TREE-$LOCK-$ROOT" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@v6
+        id: bun-cache
+        with:
+          path: node_modules
+          key: ${{ steps.cache-keys.outputs.bun-key }}
+
+      - uses: actions/cache@v6
+        id: dist-cache
+        with:
+          path: packages/*/dist
+          key: ${{ steps.cache-keys.outputs.dist-key }}
+      - name: Install dependencies
+        run: bun install
+
+      - name: Build packages server depends on
+        # embeddings → connector-worker order matters: connector-worker's
+        # src/embeddings.ts imports `@lobu/embeddings` and resolves it via
+        # the workspace symlink → dist. connector-worker itself is required
+        # because `packages/server/src/utils/connector-catalog.ts` imports
+        # `@lobu/connector-worker/compile` (the shared compile pipeline),
+        # which resolves via the package's `exports` field to
+        # `./dist/compile/index.js`. Vitest's vite-node resolver follows
+        # the `import` condition and fails to load if dist is absent —
+        # which transitively breaks every integration file whose import
+        # graph touches `runs/queue-service` / `worker-api` / `connector-catalog`.
+        #
+        # pgvector-embedded must build too: the test backend
+        # (src/__tests__/setup/embedded-postgres-backend.ts) imports
+        # `@lobu/pgvector-embedded`, so vite resolves its `import` condition
+        # (./dist/index.js) at transform time even though the embedded backend
+        # is never started when DATABASE_URL points at the external Postgres.
+        if: steps.dist-cache.outputs.cache-hit != 'true'
+        run: |
+          cd packages/core && bun run build && cd ../..
+          cd packages/connector-sdk && bun run build && cd ../..
+          cd packages/embeddings && bun run build && cd ../..
+          cd packages/connector-worker && bun run build && cd ../..
+          cd packages/pgvector-embedded && bun run build && cd ../..
+
+      - name: Verify Postgres health (fail fast if pgvector setup is broken)
+        run: |
+          for _ in {1..20}; do
+            if pg_isready -h 127.0.0.1 -p 5433 -U postgres; then break; fi
+            sleep 1
+          done
+          PGPASSWORD=postgres psql -h 127.0.0.1 -p 5433 -U postgres -d lobu_test \
+            -c "CREATE EXTENSION IF NOT EXISTS vector"
+      - name: Raise maintenance_work_mem for ivfflat index builds
+        # The baseline idx_events_embedding ivfflat index (lists=1000) needs
+        # ~150MB to build; the default 64MB fails with "memory required is
+        # 150 MB". Service containers can't override the postgres command, so
+        # set it at the system level + reload (reload-context GUC, so fresh
+        # sessions pick it up).
+        run: |
+          PGPASSWORD=postgres psql -h 127.0.0.1 -p 5433 -U postgres \
+            -c "ALTER SYSTEM SET maintenance_work_mem='256MB'" -c "SELECT pg_reload_conf()"
+
+      - name: server integration suite shard ${{ matrix.shard }}/3 (vitest under Node)
+        working-directory: packages/server
+        # Fail-closed double gate (#1216): vitest's exit code alone went green
+        # on a run with 8 failed tests (a `beforeExit` hook from a transitive
+        # dep force-exited 0 after the summary). The JSON report is written by
+        # the reporter while vitest still owns the process, so a second step
+        # independently asserts zero failures — and a missing/unparseable
+        # report (crashed run) also fails.
+        run: |
+          node node_modules/.bin/vitest run --reporter=default --reporter=json --outputFile.json="$RUNNER_TEMP/vitest-report.json" \
+            --shard=${{ matrix.shard }}/3 \
+            --coverage.enabled --coverage.provider=v8 --coverage.reporter=lcov --coverage.reportsDirectory=coverage
+          mv coverage/lcov.info coverage/vitest-shard-${{ matrix.shard }}.lcov.info
+          node ../../scripts/assert-vitest-report-clean.mjs "$RUNNER_TEMP/vitest-report.json"
+
+      - name: Upload server integration coverage shard ${{ matrix.shard }}/3
+        if: always()
+        uses: codecov/codecov-action@v7
+        with:
+          directory: packages/server/coverage
+          flags: server-integration-vitest-${{ matrix.shard }}
+          fail_ci_if_error: false
+
+  # The bun:test suites need Postgres but are intentionally separate from
+  # Vitest: they use bun's runner and several gateway directories need their
+  # own process for module/fixture isolation. Running this job alongside the
+  # Vitest shards removes another ~2 minutes from the serial critical path.
+  server-integration-bun:
+    name: integration-bun
+    needs: [check-author, paths]
+    if: needs.paths.outputs.packages == 'true'
+    runs-on: ${{ needs.check-author.outputs.runner }}
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: pgvector/pgvector:pg18
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: lobu_test
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5433/lobu_test
+      DB_POOL_MAX: '5'
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/setup-submodule
+        with:
+          deploy-key: ${{ secrets.OWLETTO_WEB_DEPLOY_KEY }}
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.5
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+
+      - name: Compute cache keys
+        id: cache-keys
+        shell: bash
+        run: |
+          PKG_TREE=$(git rev-parse HEAD:packages 2>/dev/null || echo no-tree)
+          ROOT=$( { git hash-object tsconfig.json bunfig.toml Makefile package.json scripts/build-packages.mjs 2>/dev/null; git rev-parse HEAD:patches HEAD:config HEAD:db HEAD:skills 2>/dev/null; } | git hash-object --stdin || echo no-root)
+          LOCK=$(git hash-object bun.lock 2>/dev/null || echo no-lock)
+          echo "bun-key=bun-$LOCK" >> "$GITHUB_OUTPUT"
+          echo "dist-key=dist-integration-$PKG_TREE-$LOCK-$ROOT" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@v6
+        id: bun-cache
+        with:
+          path: node_modules
+          key: ${{ steps.cache-keys.outputs.bun-key }}
+
+      - uses: actions/cache@v6
+        id: dist-cache
+        with:
+          path: packages/*/dist
+          key: ${{ steps.cache-keys.outputs.dist-key }}
+      - name: Install dependencies
+        run: bun install
+
+      - name: Build packages server depends on
+        if: steps.dist-cache.outputs.cache-hit != 'true'
+        run: |
+          cd packages/core && bun run build && cd ../..
+          cd packages/connector-sdk && bun run build && cd ../..
+          cd packages/embeddings && bun run build && cd ../..
+          cd packages/connector-worker && bun run build && cd ../..
+          cd packages/pgvector-embedded && bun run build && cd ../..
+
+      - name: Verify Postgres health (fail fast if pgvector setup is broken)
+        run: |
+          for _ in {1..20}; do
+            if pg_isready -h 127.0.0.1 -p 5433 -U postgres; then break; fi
+            sleep 1
+          done
+          PGPASSWORD=postgres psql -h 127.0.0.1 -p 5433 -U postgres -d lobu_test \
+            -c "CREATE EXTENSION IF NOT EXISTS vector"
+
+      - name: Raise maintenance_work_mem for ivfflat index builds
+        run: |
+          PGPASSWORD=postgres psql -h 127.0.0.1 -p 5433 -U postgres \
+            -c "ALTER SYSTEM SET maintenance_work_mem='256MB'" -c "SELECT pg_reload_conf()"
+
+      - name: server root gateway suites (two Bun lanes, isolated Postgres)
+        working-directory: packages/server
+        env:
+          GATEWAY_TEST_DATABASE_URL_1: postgres://postgres:postgres@127.0.0.1:5433/lobu_test_lane_1
+          GATEWAY_TEST_DATABASE_URL_2: postgres://postgres:postgres@127.0.0.1:5433/lobu_test_lane_2
+        run: |
+          # The gateway harness resets `public`, so concurrent lanes need
+          # independent databases rather than independent schemas.
+          PGPASSWORD=postgres createdb -h 127.0.0.1 -p 5433 -U postgres lobu_test_lane_1
+          PGPASSWORD=postgres createdb -h 127.0.0.1 -p 5433 -U postgres lobu_test_lane_2
+          node ../../scripts/run-gateway-test-lanes.mjs
+
+      - name: server nested gateway suites (bun:test, needs Postgres)
+        # The gateway bun:test files are excluded from vitest (vitest.config.ts)
+        # and need a real Postgres, so they run here. We run EACH __tests__ dir
+        # in its own `bun test` process rather than one `bun test src/gateway`:
+        # bun has no per-file module isolation (unlike vitest's forks), and the
+        # gateway suites are not mutually hermetic — co-running the whole tree in
+        # one process leaks DB rows and module singletons across files (org rows,
+        # service registries) and fails. A process per dir gives each dir a clean
+        # module registry, matching why vitest uses singleFork here. `find`
+        # auto-discovers every nested directory, including
+        # src/gateway/infrastructure/queue (#1238). Run all dirs and fail at the
+        # end so one run reports every failing dir, not just the first.
+        # The root __tests__ tree (including its ordinary child directories)
+        # ran in the isolated lanes above. Keep every other directory named
+        # __tests__ in its own process for its existing module/fixture isolation
+        # contract. packages/server/bunfig.toml routes --coverage to
+        # ./coverage/lcov.info; move each report before the next overwrites it.
+        working-directory: packages/server
+        run: |
+          set -uo pipefail
+          dirs=$(find src/gateway -type d -name __tests__ ! -path src/gateway/__tests__ | sort)
+          # Fail loudly if the glob matches nothing (path typo / restructure):
+          # an empty loop would otherwise run zero tests and exit green.
+          [ -n "$dirs" ] || { echo "no gateway __tests__ dirs found" >&2; exit 1; }
+          rc=0
+          for d in $dirs; do
+            echo "::group::bun test $d"
+            # Database setup hooks can exceed Bun's 5s default under CI load;
+            # Bun 1.3.5 ignores `[test].timeout`, so use the CLI flag.
+            bun test "$d" --coverage --timeout 30000 || rc=1
+            if [ -f coverage/lcov.info ]; then
+              safe=$(printf '%s' "$d" | tr '/' '-')
+              mv coverage/lcov.info "coverage/gateway-${safe}.lcov.info"
+            fi
+            echo "::endgroup::"
+          done
+          exit $rc
+
+      - name: server lobu/scheduled/workspace suites (bun:test, needs Postgres)
+        # These bun:test files live outside src/gateway and are also excluded
+        # from vitest because they import bun:test directly. They co-run cleanly
+        # in one process (verified). src/lobu also holds vitest-style tests
+        # (src/lobu/stores/__tests__) that vitest owns, so we target
+        # src/lobu/__tests__ specifically rather than the whole src/lobu tree.
+        working-directory: packages/server
+        run: |
+          bun test src/lobu/__tests__ src/scheduled src/workspace/__tests__ src/tools/admin/__tests__ src/auth/oauth/__tests__ src/utils/__tests__/deployment-pause.test.ts --coverage --timeout 30000
+          mv coverage/lcov.info coverage/server-postgres-other.lcov.info
+
+      - name: Upload server Bun/Postgres coverage
+        if: always()
+        uses: codecov/codecov-action@v7
+        with:
+          directory: packages/server/coverage
+          flags: server-integration-bun
+          fail_ci_if_error: false
+
+  # Keep the branch-protection context stable while the expensive work fans
+  # out above. Matrix failures collapse into `needs.*.result == failure`, and
+  # this job runs under `always()` so a failed/cancelled dependency cannot turn
+  # into a skipped required check.
+  integration:
+    if: always()
+    # `check-author` and `paths` are in `needs` on purpose: the shards `needs`
+    # them, so when either fails the shards report `skipped`, and a fan-in
+    # that accepted `skipped` unconditionally turned a broken gate job into a
+    # green required check. Skipped shards are only legitimate when the paths
+    # filter itself said no runtime paths changed.
+    needs: [check-author, paths, server-integration-vitest, server-integration-bun]
+    # This compatibility context only evaluates a handful of strings. Keep it on the
+    # lightweight runner image while older open PRs still require the legacy
+    # `integration` context; branch protection can move directly to the four
+    # worker contexts once those PRs refresh.
+    runs-on: ubuntu-slim
+    timeout-minutes: 5
+    steps:
+      - name: Require every backend integration job
+        env:
+          AUTHOR_RESULT: ${{ needs.check-author.result }}
+          PATHS_RESULT: ${{ needs.paths.result }}
+          PACKAGES_CHANGED: ${{ needs.paths.outputs.packages }}
+          VITEST_RESULT: ${{ needs.server-integration-vitest.result }}
+          BUN_RESULT: ${{ needs.server-integration-bun.result }}
+        run: |
+          echo "check-author: $AUTHOR_RESULT"
+          echo "paths: $PATHS_RESULT (packages=$PACKAGES_CHANGED)"
+          echo "Vitest matrix: $VITEST_RESULT"
+          echo "Bun/Postgres: $BUN_RESULT"
+          for r in "$AUTHOR_RESULT" "$PATHS_RESULT"; do
+            if [ "$r" != success ]; then
+              echo "gate job result \"$r\" is not success"
+              exit 1
+            fi
+          done
+          # Skipped shards are success ONLY when the paths filter decided no
+          # runtime paths changed. With packages=true a skipped shard means an
+          # upstream dependency failed and must not pass as green.
+          for r in "$VITEST_RESULT" "$BUN_RESULT"; do
+            if [ "$r" = success ]; then continue; fi
+            if [ "$r" = skipped ] && [ "$PACKAGES_CHANGED" != true ]; then continue; fi
+            echo "job result \"$r\" is not acceptable (packages=$PACKAGES_CHANGED)"
+            exit 1
+          done
+
+  format-lint:
+    runs-on: ${{ vars.CI_LINUX_RUNNER || 'ubuntu-24.04' }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - id: submodule
+        uses: ./.github/actions/setup-submodule
+        with:
+          deploy-key: ${{ secrets.OWLETTO_WEB_DEPLOY_KEY }}
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.5
+
+      - name: Compute cache keys
+        id: cache-keys
+        shell: bash
+        run: |
+          LOCK=$(git hash-object bun.lock 2>/dev/null || echo no-lock)
+          echo "bun-key=bun-$LOCK" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@v6
+        id: bun-cache
+        with:
+          path: node_modules
+          key: ${{ steps.cache-keys.outputs.bun-key }}
+      - name: Install dependencies
+        run: bun install
+
+      - name: Run biome format check
+        run: bun run format:check
+
+      - name: Run biome lint check
+        run: bun run lint
+
+      - name: Static security guards
+        # The former security-tests workflow duplicated unit/integration test
+        # execution in three extra jobs on every revision. Its one unique gate
+        # belongs here: format-lint is already required and has the checkout.
+        run: ./scripts/check-security-patterns.sh
+
+      - name: Duplication gate (jscpd)
+        run: bun run dupes
+
+      - name: Test-runner coverage gate (#1238)
+        # Every packages/server *.test.ts must run in at least one runner (vitest
+        # or a bun:test job), keyed on its import. Catches files that drift into
+        # running nowhere — a skipped test is indistinguishable from a passing one.
+        run: bun scripts/check-test-runner-coverage.mjs
+
+      - name: Exposed-surface naming gate
+        # Automation is canonical across storage, runtime, and public surfaces.
+        # Keep schemas, discovery metadata, callable methods, and reaction types
+        # aligned so a partial vocabulary cutover cannot reach production.
+        run: bun scripts/check-exposed-surface-naming.ts
+
+      - name: Exposed-surface naming gate fixtures
+        # The guard itself is the thing most likely to rot silently: four earlier
+        # revisions PASSED CLEAN on violations they were written to catch. These
+        # fixtures mutate the real scanned files and assert the exit code, so a
+        # guard that stops catching regressions fails here instead of going quiet.
+        run: bun test scripts/__tests__/check-exposed-surface-naming.test.ts --timeout 30000
+
+      - name: Gateway LLM client gate
+        # packages/server speaks to model providers through ONE client
+        # (gateway/inference/gateway-completion.ts). A new per-feature
+        # <PREFIX>_API_KEY/_BASE_URL/_MODEL triple or a second vendor SDK is how
+        # suggest-followups and the query rewriter ended up reading env vars no
+        # environment set — dead on every request since launch.
+        run: node scripts/check-gateway-llm-calls.mjs
+
+      - name: Gateway LLM client gate fixtures
+        # Same reasoning as the naming-gate fixtures above: a guard that stops
+        # catching its violations is worse than no guard, because it reads as
+        # proof. These seed real violations and assert the exit code.
+        run: bun test scripts/__tests__/check-gateway-llm-calls.test.ts --timeout 30000
+
+      - name: Publish manifest gate fixtures
+        # @lobu/worker@14.3.0 shipped five private workspace dependencies at
+        # their `0.0.0` placeholder versions, so external installs failed
+        # (#2186). These fixtures exercise the publish transform's guard.
+        run: bun test scripts/__tests__/publish-packages-guard.test.ts --timeout 30000
+
+      - name: Image tag derivation
+        # Decides which docker tags a build publishes. `latest` used to follow
+        # every main commit (#2184); the logic that stopped that lives in a
+        # script precisely so it is testable — as embedded workflow shell it
+        # could only be exercised by cutting a real release.
+        run: bun test scripts/__tests__/derive-image-tags.test.ts --timeout 30000
+
+      - name: Release publish ordering
+        # 14.9.0 and 14.10.0 never reached npm: release-please dispatched
+        # publish-packages the moment the release existed, build-images was
+        # still `queued`, and the image-smoke guard correctly refused. The
+        # ordering now lives in build-images.yml's `trigger-package-publish`.
+        # Workflow YAML is not covered by any other suite, so a re-introduced
+        # dispatch in release-please.yml would otherwise only surface at the
+        # next release.
+        run: bun test scripts/__tests__/release-publish-order.test.ts --timeout 30000
+
+      - name: Sparkle updater freshness
+        # RFC 2822 pubDate values begin with a weekday, so string sorting is
+        # not chronological and breaks the feed's newest-first contract.
+        env:
+          OWLETTO_SUBMODULE_STUBBED: ${{ steps.submodule.outputs.stubbed }}
+        run: bun test scripts/__tests__/sparkle-appcast-order.test.ts --timeout 30000
+
+      - name: Release image audit decision table
+        # The scheduled audit (release-image-audit.yml) is the only thing that
+        # notices a release which published no image — a run evicted from its
+        # concurrency queue fails nothing. A wrong decision table here silently
+        # disables that alarm, so it is pinned by tests like the tag logic above.
+        run: bun test scripts/__tests__/audit-release-images.test.ts --timeout 30000
+
+      - name: Mac bundle-identity gate
+        # The Release bundle id keys the URL scheme, the Keychain service name,
+        # and the Sparkle update path, so drift there stops every installed app
+        # from updating. The gate that pins it lives in mac-release.yml, which
+        # only ever runs on a lobu-v* tag — meaning nothing on a PR executes it
+        # and a broken guard would surface first at release time. Pin its rules
+        # here instead, including the swapped Release/Debug case that a
+        # set-of-distinct-values check structurally cannot detect.
+        env:
+          OWLETTO_SUBMODULE_STUBBED: ${{ steps.submodule.outputs.stubbed }}
+        run: bun test scripts/__tests__/check-mac-bundle-ids.test.ts --timeout 30000
+
+      - name: Merge integrity decision table
+        # #2273 was based on another feature branch; squashing that base away
+        # left GitHub reporting it MERGED with its fix absent from main, while
+        # #2279 stayed open describing that exact bug. Every required check was
+        # green. Same reasoning as the gates above — the guard is pinned here so
+        # it cannot quietly stop catching the thing it exists for.
+        run: bun test scripts/__tests__/check-merge-integrity.test.ts --timeout 30000
+
+      - name: Review-prompt blocker rule
+        # `pi-review` is required and enforce_admins is on, so `blockers>0` is
+        # unbypassable. §4 of the review prompt told the reviewer to record its
+        # OWN inability to run tests as a blocker, which red-flagged #2306 twice
+        # under codex's read-only sandbox and then passed on an identical re-run.
+        # Three other sections say the opposite; this pins the one direction.
+        run: bun test scripts/__tests__/review-prompt-env-blockers.test.ts --timeout 30000
+
+      - name: Review output schema dialect
+        # prompts/review-output-schema.json is handed to BOTH reviewer CLIs —
+        # `claude --json-schema` and `codex exec --output-schema` — and the
+        # review gate fails closed on a schema either one rejects. A stray
+        # draft-2020-12 `$schema` meta-ref made claude refuse the file outright
+        # ("no schema with key or ref …"), which surfaced only under a codex
+        # quota outage and read as a dead reviewer, not a bad key. Pins the
+        # schema to the reference-free shape both CLIs load.
+        run: bun test scripts/__tests__/review-output-schema.test.ts --timeout 30000
+
+      - name: Migration runner guards
+        # migrate-up.mjs --check-pending exit status 3 (nothing pending) and
+        # 4 (every pending migration marked -- lobu:no-quiesce) are the ONLY
+        # statuses that let the chart's pre-upgrade hook skip its
+        # scale-to-zero quiesce (charts/lobu/files/migrate-upgrade.sh). These
+        # pin the fail-closed paths: an unreachable ledger, a missing
+        # DATABASE_URL, or a duplicate migration version must never read as
+        # "nothing pending", or an incompatible migration applies while the
+        # old pods are still serving.
+        run: |
+          bun test scripts/__tests__/migrate-up-check-pending.test.ts --timeout 30000
+          bun test scripts/__tests__/migrate-up-duplicate-version.test.ts --timeout 30000
+
+      - name: Raw-array SQL-param gate
+        # packages/server's postgres.js client runs fetch_types:false, where a raw
+        # JS array bound as a query param serializes to a malformed array literal
+        # that Postgres rejects — a silent, prod-reproducing outage class. Type-aware
+        # gate: a value whose static type is a JS array, bound as a SQL param, fails.
+        run: bun scripts/check-raw-array-params.mjs
+
+      - name: Entity-write funnel gate
+        # Production entity-row writes must converge on entity-management.ts.
+        # Historical bypasses are fingerprinted as a shrinking allowlist; both a
+        # new literal write and a dynamic table target fail this required lane.
+        run: |
+          bun scripts/check-entity-write-funnel.mjs
+          bun test scripts/__tests__/check-entity-write-funnel.test.ts --timeout 30000
+
+      - name: Connection-visibility compiler gate
+        # The per-user connection-visibility READ-SEAM gate (connection_id IN
+        # (SELECT ... FROM connections ... visibility ...)) must come from the one
+        # compiler (packages/server/src/authz/connection-visibility.ts), not be
+        # re-derived inline — that is how the authz gate silently drifts and leaks
+        # another user's private-connection data through a new read path.
+        run: bun scripts/check-connection-visibility-compiler.mjs
+
+      - name: Directory-structure gate
+        # Two shapes that made modules unfindable and drifted back in unnoticed,
+        # because nothing mechanical rejected them. (1) A directory repeating its
+        # parent's name: gateway/gateway/ held class WorkerGateway in an index.ts,
+        # so the most important object in the dispatch path could not be located
+        # by filename. (2) A <name>.ts larger than the <name>/ beside it: that
+        # pairing is this repo's extraction facade (manage_connections.ts at 140
+        # lines over 4,229), and manage_operations.ts sat at 3,488 over 627 —
+        # an abandoned extraction, shape-identical to the finished ones.
+        run: bun scripts/check-directory-structure.mjs
+
+      - name: Directory-structure gate tests
+        run: bun test scripts/__tests__/check-directory-structure.test.ts --timeout 30000
+
+      - name: Review tooling shell tests
+        # These previously ran inside scripts/review.sh's local unit stage; the
+        # review runner is now LLM-only (CI owns the deterministic suites), so
+        # the review tooling's own regression tests must run here instead.
+        run: |
+          bash scripts/lib/__tests__/review-commit-lock.test.sh
+          bash scripts/lib/__tests__/review-process.test.sh
+          bash scripts/lib/__tests__/review-reviewer.test.sh
+          bash scripts/lib/__tests__/review-upstream-guard.test.sh
+          bash scripts/lib/__tests__/review-skip.test.sh
+          bash scripts/lib/__tests__/review-cache.test.sh
+          bash scripts/lib/__tests__/install-bubblewrap.test.sh
+          bash scripts/lib/__tests__/process-cleanup.test.sh
+
+      - name: Preview and staging workflow guards
+        # The preview deploy's mid-flight teardown decides whether to delete a
+        # namespace out from under a running PR. It only ever executes on a
+        # close/unlabel race, so without this it would first run in anger.
+        # Staging routing is the same shape: its release path runs on an
+        # unlabel, a close, or a manual dispatch, and a wrong answer there hands
+        # staging.lobu.ai to production's wildcard ingress or steals the host
+        # from its holder.
+        run: |
+          bash scripts/lib/__tests__/preview-teardown.test.sh
+          bash scripts/lib/__tests__/staging-routing.test.sh
+
+      - name: Kubeconfig workflow guards
+        # Mutating deploy workflows must fail closed before their first cluster
+        # write when the credential, cluster identity, or RBAC scope is stale.
+        run: sh scripts/lib/__tests__/kubeconfig-preflight.test.sh
+
+      - name: Remote CI wrapper guards
+        # Depot rewrites .github/actions paths to .depot/actions for local runs.
+        # Pin the duplicate action and the fail-closed run-status parser so a
+        # failed remote job can never be reported as a successful preflight.
+        run: |
+          cmp -s .github/actions/setup-submodule/action.yml .depot/actions/setup-submodule/action.yml
+          bash scripts/lib/__tests__/remote-ci.test.sh
+
+      - name: Submodule drift policy tests
+        run: |
+          bash scripts/lib/__tests__/submodule-drift.test.sh
+          bash scripts/lib/__tests__/submodule-bump.test.sh
+
+  typecheck:
+    runs-on: ${{ vars.CI_LINUX_RUNNER || 'ubuntu-24.04' }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The generated-client gate below diffs against the PR base commit.
+          # The default fetch-depth=1 only has HEAD, so the diff would fail
+          # and the gate would silently pass on every PR.
+          fetch-depth: 0
+
+      - uses: ./.github/actions/setup-submodule
+        with:
+          deploy-key: ${{ secrets.OWLETTO_WEB_DEPLOY_KEY }}
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.5
+
+      - name: Compute cache keys
+        id: cache-keys
+        shell: bash
+        run: |
+          PKG_TREE=$(git rev-parse HEAD:packages 2>/dev/null || echo no-tree)
+          ROOT=$( { git hash-object tsconfig.json bunfig.toml Makefile package.json scripts/build-packages.mjs 2>/dev/null; git rev-parse HEAD:patches HEAD:config HEAD:db HEAD:skills 2>/dev/null; } | git hash-object --stdin || echo no-root)
+          LOCK=$(git hash-object bun.lock 2>/dev/null || echo no-lock)
+          echo "bun-key=bun-$LOCK" >> "$GITHUB_OUTPUT"
+          echo "dist-key=dist-typecheck-$PKG_TREE-$LOCK-$ROOT" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@v6
+        id: bun-cache
+        with:
+          path: node_modules
+          key: ${{ steps.cache-keys.outputs.bun-key }}
+
+      - uses: actions/cache@v6
+        id: dist-cache
+        with:
+          path: packages/*/dist
+          key: ${{ steps.cache-keys.outputs.dist-key }}
+      - name: Install dependencies
+        run: bun install
+
+      - name: Build workspace packages (needed for downstream tsc resolution)
+        if: steps.dist-cache.outputs.cache-hit != 'true'
+        run: make build-packages
+
+      - name: Run TypeScript type check
+        run: bun run typecheck
+
+      - name: Type check server (excluded from root tsconfig)
+        # Every other excluded publishable package runs its own `tsc` as its
+        # build command inside make build-packages above. Server's build is an
+        # esbuild bundle, so it is the one excluded package that still needs a
+        # separate no-emit typecheck here.
+        run: cd packages/server && bunx tsc --noEmit
+
+      # Hard gate: published tarballs must not ship internal tests or dangling
+      # sourcemaps. Uses the packages built above and `npm pack --dry-run` to
+      # inspect exactly what `npm publish` would include. Fails hard if a
+      # package declaring `dist` in `files` packs no dist/ entries, so a
+      # missing build step can't turn the gate into a trivial pass.
+      - name: Package-content check (no tests/sourcemaps in tarballs)
+        run: bun run check:packages
+
+      # The files section is a hard gate: a PR that adds an unreachable file
+      # fails CI. Exports/deps/types stay report-only in the post-gate SDK job
+      # until their baseline is triaged.
+      - name: Dead-code gate (knip, unused files)
+        run: bun run knip --include files
+
+      # `packages/client/src/generated/**` is produced by `openapi-ts` from the
+      # server's LIVE `/lobu/api/docs/openapi.json`, so keeping it honest needs a
+      # booted server + Postgres. That is too heavy to run per PR, and nothing
+      # else enforces it — the file silently drifted across at least #2470
+      # (`connect_managed` was missing entirely, so SDK consumers could not see
+      # that action) and #2499 (`scheduler_client_id` outlived its removal) before
+      # #2502 swept it.
+      #
+      # This is the cheap proxy: if a PR edits the main sources the document is
+      # built from (tool contracts, gateway routes) but leaves the generated
+      # client untouched, say so. It is a HEURISTIC in both directions — a
+      # contract edit that provably does not change the emitted schema will
+      # still trip it, and schema edits outside the watched paths (e.g. TypeBox
+      # types under packages/server/src/types) can still slip through. The
+      # false-positive case is real, so there is an explicit escape hatch
+      # rather than a silent skip.
+      #
+      # To regenerate: boot the server (`make dev`) and run
+      #   cd packages/client && LOBU_OPENAPI_URL=http://127.0.0.1:<PORT>/lobu/api/docs/openapi.json bun run generate
+      # Re-run it even if you expect a no-op; an empty diff IS the proof.
+      - name: Generated client must track the contract
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          if git log "$BASE_SHA"..HEAD --format=%B | grep -qF '[client-regen-not-needed]'; then
+            echo "[client-regen-not-needed] sentinel present; generated-client check skipped for this PR."
+            exit 0
+          fi
+          contract=$(git diff --name-only "$BASE_SHA"...HEAD -- \
+            'packages/core/src/contracts/tools/**' \
+            'packages/server/src/gateway/routes/**')
+          if [ -z "$contract" ]; then
+            echo "No contract or route sources touched; nothing to check."
+            exit 0
+          fi
+          regenerated=$(git diff --name-only "$BASE_SHA"...HEAD -- 'packages/client/src/generated/**')
+          if [ -n "$regenerated" ]; then
+            echo "Contract sources changed and the generated client was updated alongside them."
+            exit 0
+          fi
+          echo "::error::Contract/route sources changed but packages/client/src/generated/** was not regenerated. Boot the server and run 'cd packages/client && LOBU_OPENAPI_URL=http://127.0.0.1:<PORT>/lobu/api/docs/openapi.json bun run generate'. If the emitted schema genuinely does not change, commit with '[client-regen-not-needed]' in the message."
+          echo "Contract/route files changed in this PR:"
+          echo "$contract"
+          exit 1
+
+  migrations:
+    # Serialize this short compatibility context behind format-lint so it does
+    # not occupy a hosted runner while the faster policy job is still running.
+    # Migration coverage and its required check name remain unchanged for
+    # existing open PRs.
+    if: ${{ !cancelled() }}
+    needs: format-lint
+    # Catches the class of bug that has now broken prod twice in one
+    # session: a migration file that's syntactically a SQL file but that the
+    # migration runner rejects (missing -- migrate:up directive, constraint
+    # violations against legacy data, etc.). Runs every migration in order
+    # against an empty Postgres on every PR using the SAME runner production
+    # uses (scripts/migrate-up.mjs), so a migration that only the prod runner
+    # can apply (e.g. transaction:false heal-DO + CONCURRENTLY) is validated
+    # here instead of silently diverging from `dbmate up`.
+    runs-on: ${{ vars.CI_LINUX_RUNNER || 'ubuntu-24.04' }}
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: pgvector/pgvector:pg18
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: lobu_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      # `needs` normally turns a downstream job into a skipped check when its
+      # prerequisite fails. This compatibility context is branch-required, so
+      # emit an explicit failure instead of allowing a skipped migration check.
+      - name: Require format and policy checks
+        env:
+          FORMAT_LINT_RESULT: ${{ needs.format-lint.result }}
+        run: test "$FORMAT_LINT_RESULT" = success
+
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Lint migration directives
+        # Sub-second pre-flight: every file under db/migrations/ must
+        # contain `-- migrate:up`. Catches the most common authoring
+        # mistake before we even spin up Postgres.
+        run: |
+          missing=$(grep -L '^-- migrate:up' db/migrations/*.sql || true)
+          if [ -n "$missing" ]; then
+            echo "::error::Migrations missing '-- migrate:up' directive:"
+            echo "$missing"
+            exit 1
+          fi
+
+      - name: Migration immutability — fail on edits to applied migrations
+        # dbmate keys migrations by their version filename. Once a migration
+        # has shipped to main, editing it silently no-ops in any environment
+        # whose schema_migrations row already lists that version (i.e. prod).
+        # Fail the PR when a migration file changes (rather than is added)
+        # relative to main; force authors to ship a new dated migration instead.
+        #
+        # Exceptions:
+        #   1. The baseline at 00000000000000_baseline.sql may be regenerated
+        #      by re-running the squash workflow (always modifiable).
+        #   2. PRs whose commit message contains the explicit sentinel
+        #      `[squash-baseline]` may delete the forward-delta migration
+        #      files that were collapsed into the baseline. This is a
+        #      one-time-per-squash exception and code review is the gate.
+        #   3. PRs whose commit message contains the explicit sentinel
+        #      `[dup-version-rename]` may rename a migration file. This exists
+        #      for the one legitimate case the path-based check cannot tell
+        #      apart from a forbidden edit: two migrations landed at the SAME
+        #      version (a merge race), so `dbmate up` halts on a duplicate
+        #      schema_migrations PK and the second-keyed file's body was never
+        #      applied where the first already recorded that version. The fix
+        #      is to rename one of the colliding files to a free version so it
+        #      applies. Code review is the gate — confirm the renamed file is a
+        #      true duplicate-version collision and its body is idempotent.
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if git log "$BASE_SHA"..HEAD --format=%B | grep -qF '[squash-baseline]'; then
+            echo "[squash-baseline] sentinel present; immutability check is skipped for this PR."
+            exit 0
+          fi
+          if git log "$BASE_SHA"..HEAD --format=%B | grep -qF '[dup-version-rename]'; then
+            echo "[dup-version-rename] sentinel present; immutability check is skipped for this PR."
+            exit 0
+          fi
+          # 4. PRs whose commit message contains `[migration-never-applied]` may
+          #    edit a migration that has NEVER successfully applied in any
+          #    environment. This exists for the one legitimate edit case the
+          #    path-based check cannot tell from a forbidden one: a migration
+          #    that CI's `dbmate up` has always rejected (so main went red the
+          #    moment it merged and no deploy could have applied it). Because it
+          #    never recorded a schema_migrations row anywhere, editing its body
+          #    does not silently no-op — the fix is genuinely applied on next
+          #    run. Code review is the gate: confirm the edited migration is
+          #    absent from every live schema_migrations before using this.
+          if git log "$BASE_SHA"..HEAD --format=%B | grep -qF '[migration-never-applied]'; then
+            echo "[migration-never-applied] sentinel present; immutability check is skipped for this PR."
+            exit 0
+          fi
+          edited=$(git diff --name-only --diff-filter=MRD "$BASE_SHA"...HEAD -- db/migrations/ \
+            | grep -v '^db/migrations/00000000000000_baseline\.sql$' || true)
+          if [ -n "$edited" ]; then
+            echo "::error::Migration files were modified or renamed — applied migrations are immutable (only db/migrations/00000000000000_baseline.sql is excluded). Add a new dated migration instead."
+            echo "$edited"
+            exit 1
+          fi
+
+      - name: Lock-safety lint for new migrations (squawk)
+        # `dbmate up` proves a migration APPLIES to an empty DB; it does not
+        # prove it's safe to apply at prod row counts. squawk catches the
+        # prod-lock-outage class — CREATE INDEX without CONCURRENTLY,
+        # table-rewriting NOT NULL / DEFAULT adds, constraints missing NOT
+        # VALID, etc. Scoped to migrations ADDED/MODIFIED in this PR (the
+        # squashed baseline is unparseable + immutable, and the existing
+        # backlog shouldn't block new work). Excludes:
+        #   - ban-drop-column: this repo does intentional two-phase column drops
+        #   - require-timeout-settings: handled at the deploy layer (no existing
+        #     migration sets per-statement timeouts)
+        # Pinned squawk version matches the `db:lint` package.json script.
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          changed=$(git diff --name-only --diff-filter=AM "$BASE_SHA"...HEAD -- 'db/migrations/*.sql' \
+            | grep -v '^db/migrations/00000000000000_baseline\.sql$' || true)
+          if [ -z "$changed" ]; then
+            echo "No new or modified migrations to lint."
+            exit 0
+          fi
+          echo "Linting migrations:"
+          echo "$changed"
+          echo "$changed" | xargs npx --yes squawk-cli@2.58.0 --exclude=ban-drop-column,require-timeout-settings
+
+      - name: Install dbmate
+        run: |
+          # Retry transient GitHub release failures such as HTTP 503.
+          curl -fsSL --retry 5 --retry-delay 2 \
+            -o /usr/local/bin/dbmate \
+            https://github.com/amacneil/dbmate/releases/download/v2.21.0/dbmate-linux-amd64
+          chmod +x /usr/local/bin/dbmate
+
+      - name: Raise maintenance_work_mem for ivfflat index builds
+        # The baseline idx_events_embedding ivfflat index (lists=1000) needs
+        # ~150MB to build; the default 64MB fails with "memory required is
+        # 150 MB". Service containers can't override the postgres command, so
+        # set it at the system level + reload (reload-context GUC, so dbmate's
+        # fresh sessions pick it up). Wait for readiness first (this job has no
+        # health-wait step of its own).
+        run: |
+          for _ in {1..20}; do
+            if pg_isready -h 127.0.0.1 -p 5432 -U postgres; then break; fi
+            sleep 1
+          done
+          PGPASSWORD=postgres psql -h 127.0.0.1 -p 5432 -U postgres \
+            -c "ALTER SYSTEM SET maintenance_work_mem='256MB'" -c "SELECT pg_reload_conf()"
+
+      - name: Apply all migrations against an empty Postgres
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/lobu_ci?sslmode=disable
+        # The baseline migration plus any forward deltas must apply cleanly
+        # to a fresh DB. That's the only schema check left after the squash —
+        # db/schema.sql + the drift-gate-vs-baseline diff are gone since the
+        # baseline IS the canonical schema.
+        #
+        # Apply with the SAME runner production uses (scripts/migrate-up.mjs, via
+        # docker/app/start.sh), NOT `dbmate up`. dbmate Exec's a migration's
+        # whole up section as one simple-query batch, which Postgres runs in an
+        # implicit transaction; a `transaction:false` migration that pairs a heal
+        # DO with CREATE/DROP INDEX CONCURRENTLY then fails with "CREATE INDEX
+        # CONCURRENTLY cannot run inside a transaction block". migrate-up.mjs
+        # splits top-level statements so CONCURRENTLY runs on its own, and still
+        # records versions in the dbmate-compatible public.schema_migrations
+        # ledger (the `dbmate status` verify step below reads it). Its only
+        # runtime dep is `postgres`; npm can't install the workspace root
+        # (workspace: protocol), so install just that package in a scratch dir
+        # and expose it via a top-level node_modules entry the ESM loader resolves.
+        run: |
+          tmp="$(mktemp -d)"
+          (cd "$tmp" && npm init -y >/dev/null && npm install --no-audit --no-fund postgres@^3.4.7 >/dev/null)
+          mkdir -p node_modules
+          cp -r "$tmp/node_modules/postgres" node_modules/postgres
+          node scripts/migrate-up.mjs
+
+      - name: Verify migrations are listed in the schema_migrations table
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/lobu_ci?sslmode=disable
+        run: |
+          dbmate --migrations-dir db/migrations status
+          # Fail if any pending remain
+          pending=$(dbmate --migrations-dir db/migrations status | grep -c '^\[ \]' || true)
+          if [ "$pending" != "0" ]; then
+            echo "::error::$pending migrations still pending after dbmate up"
+            exit 1
+          fi
+
+      - name: Pending-check contract (pre-upgrade quiesce fast path)
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/lobu_ci?sslmode=disable
+        # charts/lobu/files/migrate-upgrade.sh skips its scale-to-zero quiesce
+        # on --check-pending exit status 3 (nothing pending) or 4 (every
+        # pending migration marked -- lobu:no-quiesce). Pin all three
+        # real-database answers here, where every migration was just applied.
+        # --check-pending never executes migration SQL, so the probe files
+        # below are read and discarded without touching the schema.
+        run: |
+          probe=db/migrations/99999999999999_pending_probe.sql
+          # A complete ledger reports 3.
+          pending_rc=0; node scripts/migrate-up.mjs --check-pending || pending_rc=$?
+          test "$pending_rc" -eq 3
+          # An unmarked pending file reports 0 -- quiesce.
+          printf -- '-- migrate:up\nSELECT 1;\n' > "$probe"
+          pending_rc=0; node scripts/migrate-up.mjs --check-pending || pending_rc=$?
+          rm "$probe"
+          test "$pending_rc" -eq 0
+          # Marked: the author declared the running code can serve across it,
+          # so the hook may skip its scale-to-zero.
+          printf -- '-- migrate:up\n-- lobu:no-quiesce\nALTER TABLE public.events ADD COLUMN IF NOT EXISTS quiesce_probe text;\n' > "$probe"
+          pending_rc=0; node scripts/migrate-up.mjs --check-pending || pending_rc=$?
+          rm "$probe"
+          test "$pending_rc" -eq 4
+
+      # The committed pgvector libraries bypass normal TypeScript builds. Keep
+      # their ABI floor in this already-required, Docker-capable policy job
+      # instead of allocating another post-gate runner.
+      - name: Assert glibc floor on committed pgvector prebuilts
+        run: |
+          set -euo pipefail
+          for arch in linux-x64 linux-arm64; do
+            packages/pgvector-embedded/scripts/assert-glibc-floor.sh \
+              "packages/pgvector-embedded/prebuilt/${arch}"
+          done
+
+      - name: Resolve the x64 prebuilt on the oldest supported glibc
+        run: |
+          set -euo pipefail
+          out=$(docker run --rm -v "$PWD:/w:ro" debian:bullseye \
+            ldd /w/packages/pgvector-embedded/prebuilt/linux-x64/vector.so 2>&1)
+          echo "$out"
+          if echo "$out" | grep -qi "not found"; then
+            echo "::error::vector.so has unresolved dependencies on debian:bullseye (glibc 2.31)."
+            exit 1
+          fi
+
+  # One path filter for the optional Mac and connector-runtime smoke jobs.
+  # Keeping both decisions in one checkout avoids spending two hosted slots
+  # just to evaluate the same PR diff.
+  # `github.event.pull_request.changed_files` in the webhook payload is an
+  # integer (the count of changed files), not a list — `contains()` over it
+  # never matches. On push events there is no PR base, so both smokes run.
+  optional-smoke-filter:
+    runs-on: ${{ vars.CI_LINUX_RUNNER || 'ubuntu-24.04' }}
+    outputs:
+      mac: ${{ steps.filter.outputs.mac }}
+      connector: ${{ steps.filter.outputs.connector }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Need the PR base commit so we can diff against it. The default
+          # fetch-depth=1 only has HEAD.
+          fetch-depth: 0
+
+      - name: Decide which optional smokes to run
+        id: filter
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          if [ -z "${BASE_SHA:-}" ]; then
+            echo "mac=true" >> "$GITHUB_OUTPUT"
+            echo "connector=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          changed=$(git diff --name-only "$BASE_SHA"...HEAD)
+          if echo "$changed" | grep -E '^(packages/owletto($|/)|packages/cli/|packages/connector-worker/|packages/core/|config/macos/lobu-auth\.entitlements$|scripts/(build-mac-auth-cli|build-mac-device-daemon|test-mac-device-daemon-package|check-mac-device-daemon-graph|verify-mac-device-daemon|with-owletto-mac-daemon)\.|package\.json$|bun\.lock$|\.github/workflows/mac-release\.yml$|\.github/workflows/ci\.yml$|\.github/actions/setup-submodule(/|$)|\.gitmodules$)' >/dev/null; then
+            echo "mac=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "mac=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No paths affecting the Mac build changed — skipping mac-build-smoke."
+          fi
+          if echo "$changed" | grep -E '^(docker/|packages/connector-worker/|packages/connector-sdk/|packages/connectors/|packages/core/|packages/embeddings/|packages/cli/|package\.json$|bun\.lock$|\.github/workflows/ci\.yml$|\.github/workflows/build-images\.yml$)' >/dev/null; then
+            echo "connector=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "connector=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No paths affecting the connector runtime changed — skipping connector-parity-smoke."
+          fi
+
+  # Standalone Swift tests + a cheap end-to-end Xcode build for the Mac app.
+  # `mac-release.yml` runs only for manual dispatches and published releases,
+  # so a rename or path move inside the owletto submodule (Mac source lives at
+  # `packages/owletto/apps/mac/`) can silently break the release pipeline and
+  # surface only during a release. Build-only (no archive, no signing, no
+  # notarize) is enough to prove the Xcode project + submodule layout still
+  # compose.
+  #
+  # Runner cost is bounded by the filter job above — the macOS runner is only
+  # allocated when something the Mac build actually consumes changes: the
+  # submodule pointer, the bundled auth CLI sources/signing inputs, the
+  # device-daemon sources (`packages/connector-worker/`, `packages/core/`) or
+  # its build/verify scripts, the workspace manifest or lockfile, the release
+  # workflow, this workflow, the submodule setup action, or `.gitmodules`. This
+  # workflow is in the filter so a PR editing this job can't skip it.
+  mac-build-smoke:
+    needs: optional-smoke-filter
+    if: needs.optional-smoke-filter.outputs.mac == 'true'
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - id: submodule
+        uses: ./.github/actions/setup-submodule
+        with:
+          deploy-key: ${{ secrets.OWLETTO_WEB_DEPLOY_KEY }}
+
+      # Forks (and any run where the secret isn't available) get a stub
+      # package.json from setup-submodule. There's no Mac source to build
+      # there, so skip the rest gracefully rather than fail. Same-repo PRs
+      # and push events both have the key, so a stub there means the secret
+      # is misconfigured — fail loudly.
+      - name: Fail fast if submodule is stubbed (same-repo PRs and push)
+        if: steps.submodule.outputs.stubbed == 'true' && !(github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)
+        run: |
+          echo "::error::Mac source unreachable — OWLETTO_WEB_DEPLOY_KEY missing or invalid."
+          exit 1
+
+      - name: Skip on fork PRs without submodule access
+        if: steps.submodule.outputs.stubbed == 'true' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
+        run: echo "::notice::Submodule stubbed on fork PR — skipping Mac smoke build."
+
+      - uses: oven-sh/setup-bun@v2
+        if: steps.submodule.outputs.stubbed != 'true'
+        with:
+          # Bun 1.3.5 silently ignores --metafile; the packaging graph guard
+          # requires the measured Bun 1.3.14 toolchain.
+          bun-version: 1.3.14
+
+      - name: Install workspace dependencies for Mac daemon smoke
+        if: steps.submodule.outputs.stubbed != 'true'
+        run: bun install --frozen-lockfile
+
+      - name: Build and smoke standalone Mac device daemon
+        if: steps.submodule.outputs.stubbed != 'true'
+        run: scripts/test-mac-device-daemon-package.sh
+
+      - name: Build and smoke bundled Mac auth helper
+        if: steps.submodule.outputs.stubbed != 'true'
+        run: |
+          AUTH_CLI="$RUNNER_TEMP/lobu-mac-auth"
+          scripts/build-mac-auth-cli.sh "$AUTH_CLI"
+          test "$("$AUTH_CLI" --version)" = "$(bun -p 'require("./packages/cli/package.json").version')"
+          "$AUTH_CLI" login --help | grep -q -- '--wait-for-approval'
+          "$AUTH_CLI" whoami --help | grep -q -- '--json'
+          codesign --force --options runtime --sign - \
+            --entitlements config/macos/lobu-auth.entitlements "$AUTH_CLI"
+          test "$("$AUTH_CLI" --version)" = "$(bun -p 'require("./packages/cli/package.json").version')"
+
+      # The Mac app has no XCTest target, so xcodebuild does not discover the
+      # standalone @main tests under apps/mac/Tests — before this step they ran
+      # only when someone pasted a swiftc line out of a file header, which is
+      # how AutomationDecodingTests stopped compiling on 2026-07-05 and stayed
+      # broken. Runs before the app build so a failure names the assertion.
+      - name: Run standalone Swift tests
+        if: steps.submodule.outputs.stubbed != 'true'
+        run: packages/owletto/apps/mac/Tests/run-tests.sh
+
+      # The wrapper compiles the device daemon into the submodule's resource
+      # directory for the duration of the build, then removes it. The verify
+      # afterwards is a different assertion from the wrapper's own: it proves
+      # Xcode's resource copy landed the daemon inside the built bundle still
+      # executable and still arm64, which is what the app resolves at launch.
+      - name: Build (unsigned, no archive)
+        if: steps.submodule.outputs.stubbed != 'true'
+        run: |
+          DERIVED_DATA="$RUNNER_TEMP/owletto-derived"
+          scripts/with-owletto-mac-daemon.sh xcodebuild \
+            -project packages/owletto/apps/mac/Owletto.xcodeproj \
+            -scheme Owletto -configuration Release build \
+            -derivedDataPath "$DERIVED_DATA" \
+            CODE_SIGNING_ALLOWED=NO
+          scripts/verify-mac-device-daemon.sh \
+            "$DERIVED_DATA/Build/Products/Release/Owletto.app/Contents/Resources/lobu-device-daemon/lobu-device-daemon"
+
+  # Connector-runtime parity smoke gate. Guards against the packaging/parity
+  # drift that broke prod: the worker image shipped missing `COPY packages/core`,
+  # so `@lobu/connector-sdk`'s transitive `@lobu/core` import dangled and every
+  # feed sync crashed at runtime — yet CI was green because the workspace tests
+  # resolve `@lobu/core` and build-images.yml builds+pushes images but never RUNS
+  # them. This job RUNS the built artifact's self-check on BOTH surfaces (the
+  # worker image and the host CLI), which both call the SAME
+  # runConnectorRuntimeSelfCheck() over the same compile + default
+  # SubprocessExecutor path.
+  connector-parity-smoke:
+    needs: optional-smoke-filter
+    if: needs.optional-smoke-filter.outputs.connector == 'true'
+    runs-on: ${{ vars.CI_LINUX_RUNNER || 'ubuntu-24.04' }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+
+      # Submodule needed so `bun install` keeps packages/owletto in the lockfile
+      # graph (a bare install without it can prune the entry). The CLI self-check
+      # itself doesn't need the web UI; the worker image build below doesn't use
+      # the submodule at all.
+      - uses: ./.github/actions/setup-submodule
+        with:
+          deploy-key: ${{ secrets.OWLETTO_WEB_DEPLOY_KEY }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      # Build the worker image for amd64 only (no QEMU/arm64 — this is a smoke
+      # gate, not a release) and load it into the local daemon instead of
+      # pushing. Reuse the GHA buildx cache shared with build-images.yml so this
+      # leg doesn't pay a cold worker build.
+      - name: Build worker image (amd64, load, no push)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          file: ./docker/worker/Dockerfile
+          load: true
+          push: false
+          tags: lobu-worker:parity-smoke
+          cache-from: type=gha,scope=worker
+          cache-to: type=gha,mode=max,scope=worker
+
+      # The real prod runtime contract: run the built image's self-check with NO
+      # network, so a green result can't depend on reaching anything external.
+      - name: Worker image self-check (docker run --network=none)
+        # The image runs under Node so the connector isolate lane (isolated-vm,
+        # a V8 addon Bun cannot load) works in prod. A green self-check alone
+        # does not prove that addon's native build, so assert the lane too: an
+        # unavailable lane means the builder's node-gyp toolchain or the
+        # optionalDependency install regressed inside the image.
+        run: |
+          set -o pipefail
+          docker run --rm --network=none lobu-worker:parity-smoke \
+            node dist/bin.js self-check --json | tee worker-self-check.json
+          jq -e '.isolate_lane.available == true' worker-self-check.json >/dev/null || {
+            echo "::error::worker image cannot load isolated-vm: $(jq -c .isolate_lane worker-self-check.json)"
+            exit 1
+          }
+
+      # Host (CLI) leg: same self-check function, exercised from the built CLI
+      # runtime. This PR touches the gated paths, so this leg dogfoods the gate.
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.5
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+
+      - name: Compute cache keys
+        id: cache-keys
+        shell: bash
+        run: |
+          PKG_TREE=$(git rev-parse HEAD:packages 2>/dev/null || echo no-tree)
+          ROOT=$( { git hash-object tsconfig.json bunfig.toml Makefile package.json scripts/build-packages.mjs 2>/dev/null; git rev-parse HEAD:patches HEAD:config HEAD:db HEAD:skills 2>/dev/null; } | git hash-object --stdin || echo no-root)
+          LOCK=$(git hash-object bun.lock 2>/dev/null || echo no-lock)
+          echo "bun-key=bun-$LOCK" >> "$GITHUB_OUTPUT"
+          echo "dist-key=dist-connector-parity-$PKG_TREE-$LOCK-$ROOT" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@v6
+        id: bun-cache
+        with:
+          path: node_modules
+          key: ${{ steps.cache-keys.outputs.bun-key }}
+
+      - uses: actions/cache@v6
+        id: dist-cache
+        with:
+          path: packages/*/dist
+          key: ${{ steps.cache-keys.outputs.dist-key }}
+      - name: Install dependencies
+        run: bun install
+
+      - name: Build workspace packages (CLI + deps)
+        if: steps.dist-cache.outputs.cache-hit != 'true'
+        run: make build-packages
+
+      - name: CLI runtime self-check (host)
+        run: node packages/cli/bin/lobu.js connector runtime-self-check --json

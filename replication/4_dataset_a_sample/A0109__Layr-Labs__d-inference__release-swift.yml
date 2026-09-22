@@ -1,0 +1,888 @@
+name: Release Provider Bundle (Swift)
+
+# CLI-only Swift release pipeline.
+#
+# Builds and ships:
+#   - bin/darkbloom          (provider CLI)
+#   - bin/darkbloom-enclave  (Secure Enclave attestation/sign helper)
+#   - bin/mlx.metallib       (compiled Metal kernels for the matching MLX)
+#   - Darkbloom.app/Contents/Helpers/darkbloom-fan-helper (dormant opt-in root helper)
+#   - Darkbloom.app/Contents/Resources/*.bundle (SwiftPM resources)
+#
+# install.sh creates a backward-compatibility symlink from the legacy
+# `eigeninference-enclave` name to `darkbloom-enclave` for existing
+# installations that referenced the old binary name.
+#
+# No SwiftUI app, no DMG, and no Python runtime — this is a pure Swift CLI
+# build. The legacy `release.yml` was deleted alongside `app/` once we
+# committed to a CLI-only migration.
+#
+# Swift cutover tag conventions:
+#   - vX.Y.Z           -> prod Swift release (reviewer approval required)
+#   - vX.Y.Z-swift     -> accepted alias while the migration is in progress
+#   - vX.Y.Z-swift.N   -> accepted alias while the migration is in progress
+# Dev releases use workflow_dispatch so the requested version can remain
+# byte-identical to the checked-in provider and coordinator source constants.
+#
+# Repo secrets use DEV_/PROD_ prefixes so both environments can remain at
+# repo level. The release job still binds the resolved GitHub environment so
+# production tags must pass the environment's deployment protection rules:
+#   DEV_R2_ACCESS_KEY_ID  / PROD_R2_ACCESS_KEY_ID
+#   DEV_R2_SECRET_ACCESS_KEY / PROD_R2_SECRET_ACCESS_KEY
+#   DEV_R2_ENDPOINT       / PROD_R2_ENDPOINT
+#   DEV_R2_BUCKET         / PROD_R2_BUCKET
+#   DEV_R2_PUBLIC_URL     / PROD_R2_PUBLIC_URL
+#   DEV_COORDINATOR_URL   / PROD_COORDINATOR_URL
+#   DEV_RELEASE_KEY       / PROD_RELEASE_KEY
+# Apple signing secrets are shared (same cert for both envs).
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+      - 'v*-swift'
+      - 'v*-swift.*'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        type: choice
+        options: [dev, prod]
+        default: dev
+      version_override:
+        description: 'Optional version string when running manually (otherwise derived from tag)'
+        required: false
+        type: string
+
+permissions:
+  contents: write   # gh release create
+
+env:
+  DEVELOPER_ID: 'Developer ID Application: Eigen Labs, Inc. (SLDQ2GJ6TL)'
+  APPLE_TEAM_ID: 'SLDQ2GJ6TL'
+  CLI_NAME: 'darkbloom'
+  ENCLAVE_NAME: 'darkbloom-enclave'
+  FAN_HELPER_NAME: 'darkbloom-fan-helper'
+  FAN_HELPER_ID: 'io.darkbloom.fan-helper'
+  MIN_MACOS: '14.0'
+  # The mlx.metallib (compiled Metal GPU kernels) is BUILT FROM SOURCE from the
+  # MLX fork pinned at libs/mlx-swift/Source/Cmlx/mlx — NOT fetched from a PyPI
+  # wheel. Building from source guarantees the GPU kernels match the exact fork
+  # commit the host C++ links against (incl. the resource-count trim and the M5
+  # _nax kernels) and removes the dependency on a published wheel (there is no
+  # mlx==0.32.0 on PyPI). The _nax kernels are only compiled when SDK >= 26.2
+  # AND deployment target >= 26.2 AND Metal >= 4.0 (see
+  # mlx/backend/metal/kernels/CMakeLists.txt), so we pin the deployment target.
+  MLX_METALLIB_DEPLOYMENT_TARGET: '26.2'
+
+jobs:
+  resolve-env:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    outputs:
+      environment: ${{ steps.pick.outputs.environment }}
+      version: ${{ steps.pick.outputs.version }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - id: pick
+        run: |
+          set -euo pipefail
+          if [ -n "${{ inputs.environment }}" ]; then
+            ENV="${{ inputs.environment }}"
+          else
+            ENV="prod"
+          fi
+          if [ "${{ github.ref_type }}" = "tag" ] && [[ "${{ github.ref_name }}" == *-dev.* ]]; then
+            echo "::error::-dev tags are unsupported by the exact-version release contract; use workflow_dispatch with environment=dev"
+            exit 1
+          fi
+          if [ "$ENV" = "prod" ] && [ "${{ github.ref_type }}" != "tag" ]; then
+            echo "::error::Production publication requires a source-matching release tag"
+            exit 1
+          fi
+          echo "environment=$ENV" >> "$GITHUB_OUTPUT"
+
+          if [ -n "${{ inputs.version_override }}" ]; then
+            VERSION="${{ inputs.version_override }}"
+          elif [ "${{ github.ref_type }}" != "tag" ]; then
+            VERSION=$(awk -F'\"' '/public static let version =/ { print $2 }' \
+              provider-swift/Sources/ProviderCore/ProviderCore.swift)
+          else
+            REF="${GITHUB_REF_NAME#v}"
+            VERSION="${REF%-swift*}"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Resolved env=$ENV version=$VERSION"
+
+      - name: Fail before approval on version drift
+        run: ./scripts/check-release-version.sh "${{ steps.pick.outputs.version }}"
+
+  build-and-release:
+    name: Build, sign, notarize, upload, register
+    needs: [resolve-env]
+    runs-on: blacksmith-12vcpu-macos-latest
+    environment: ${{ needs.resolve-env.outputs.environment }}
+
+    env:
+      VERSION: ${{ needs.resolve-env.outputs.version }}
+      ENV_PREFIX: ${{ needs.resolve-env.outputs.environment }}
+
+    steps:
+      - name: Resolve env-specific secrets
+        env:
+          ENV_PREFIX: ${{ needs.resolve-env.outputs.environment }}
+          DEV_R2_ACCESS_KEY_ID: ${{ secrets.DEV_R2_ACCESS_KEY_ID }}
+          PROD_R2_ACCESS_KEY_ID: ${{ secrets.PROD_R2_ACCESS_KEY_ID }}
+          DEV_R2_SECRET_ACCESS_KEY: ${{ secrets.DEV_R2_SECRET_ACCESS_KEY }}
+          PROD_R2_SECRET_ACCESS_KEY: ${{ secrets.PROD_R2_SECRET_ACCESS_KEY }}
+          DEV_R2_ENDPOINT: ${{ secrets.DEV_R2_ENDPOINT }}
+          PROD_R2_ENDPOINT: ${{ secrets.PROD_R2_ENDPOINT }}
+          DEV_R2_BUCKET: ${{ secrets.DEV_R2_BUCKET }}
+          PROD_R2_BUCKET: ${{ secrets.PROD_R2_BUCKET }}
+          DEV_R2_PUBLIC_URL: ${{ secrets.DEV_R2_PUBLIC_URL }}
+          PROD_R2_PUBLIC_URL: ${{ secrets.PROD_R2_PUBLIC_URL }}
+          DEV_COORDINATOR_URL: ${{ secrets.DEV_COORDINATOR_URL }}
+          PROD_COORDINATOR_URL: ${{ secrets.PROD_COORDINATOR_URL }}
+          DEV_RELEASE_KEY: ${{ secrets.DEV_RELEASE_KEY }}
+          PROD_RELEASE_KEY: ${{ secrets.PROD_RELEASE_KEY }}
+          # Legacy unprefixed prod secrets (pre-DEV_/PROD_ split). Fall back
+          # to these when PROD_* is empty so we don't have to duplicate every
+          # secret in the GitHub UI just to satisfy the new naming scheme.
+          LEGACY_R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          LEGACY_R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          LEGACY_R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          LEGACY_R2_BUCKET: ${{ vars.R2_BUCKET }}
+          LEGACY_R2_PUBLIC_URL: ${{ secrets.R2_PUBLIC_URL }}
+          LEGACY_COORDINATOR_URL: ${{ secrets.COORDINATOR_URL }}
+          LEGACY_RELEASE_KEY: ${{ secrets.RELEASE_KEY }}
+        run: |
+          set -euo pipefail
+          PREFIX=$(echo "$ENV_PREFIX" | tr '[:lower:]' '[:upper:]')
+          for key in R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_ENDPOINT R2_BUCKET R2_PUBLIC_URL COORDINATOR_URL RELEASE_KEY; do
+            primary="${PREFIX}_${key}"
+            legacy="LEGACY_${key}"
+            outkey=$(echo "$key" | tr '[:upper:]' '[:lower:]')
+            value="${!primary:-}"
+            if [ -z "$value" ] && [ "$PREFIX" = "PROD" ]; then
+              value="${!legacy:-}"
+              if [ -n "$value" ]; then
+                echo "::notice::Using legacy unprefixed secret for ${key} (set PROD_${key} to silence this)"
+              fi
+            fi
+            if [ -z "$value" ]; then
+              echo "::error::No value resolved for ${PREFIX}_${key} (also tried LEGACY_${key})"
+              exit 1
+            fi
+            echo "${outkey}=${value}" >> "$GITHUB_ENV"
+          done
+
+      - name: Checkout (with submodules)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          submodules: recursive
+          fetch-depth: 0   # gh release --generate-notes wants full history
+
+      - name: Validate release version integrity
+        run: ./scripts/check-release-version.sh "$VERSION"
+
+      - name: Set up Go for prompt parity
+        uses: actions/setup-go@f111f3307d8850f501ac008e886eec1fd1932a34 # v5.4.0
+        with:
+          go-version: '1.25.0'
+
+      - name: Show toolchain versions
+        run: |
+          set -euo pipefail
+          go version
+          xcodebuild -version
+          swift --version
+          xcrun --sdk macosx --show-sdk-version
+          uname -a
+
+      - name: Import Developer ID certificate
+        env:
+          P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          P12_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain-db"
+          echo "$P12_BASE64" | base64 --decode > /tmp/cert.p12
+
+          security create-keychain -p "build" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "build" "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"')
+          security import /tmp/cert.p12 -k "$KEYCHAIN_PATH" \
+            -P "$P12_PASSWORD" -T /usr/bin/codesign -T /usr/bin/productsign -f pkcs12
+          security set-key-partition-list -S apple-tool:,apple: \
+            -s -k "build" "$KEYCHAIN_PATH"
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH"
+
+          echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+          rm -f /tmp/cert.p12
+
+      - name: Install awscli (R2)
+        run: |
+          if ! command -v aws >/dev/null 2>&1; then
+            brew install awscli >/dev/null 2>&1 || true
+          fi
+          aws --version
+
+      - name: Restore SwiftPM cache
+        uses: actions/cache/restore@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
+        with:
+          path: |
+            ~/Library/Caches/org.swift.swiftpm
+            ~/Library/org.swift.swiftpm
+            provider-swift/.build
+            libs/mlx-swift-lm/.build
+          key: spm-v3-${{ runner.os }}-${{ github.sha }}-${{ hashFiles('provider-swift/Package.resolved', 'libs/mlx-swift/Package.swift', 'libs/mlx-swift-lm/Package.swift') }}
+          restore-keys: |
+            spm-v3-${{ runner.os }}-
+      - name: Discard metallibs restored by the generic SwiftPM cache
+        run: |
+          for root in provider-swift/.build libs/mlx-swift-lm/.build; do
+            [ ! -d "$root" ] || find "$root" -type f -name mlx.metallib -delete
+          done
+
+      - name: Verify production prompt parity
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal
+          rustup override set 1.88.0
+          ./scripts/verify-prompt-parity.sh
+
+      # The root helper is the sole metallib builder. The Actions cache stores
+      # its private cache directory; the helper still runs on every release and
+      # authorizes the exact source/toolchain/deployment/JIT contract itself.
+      - name: Resolve source-matched metallib cache namespace
+        id: mlxkey
+        run: |
+          set -euo pipefail
+          MLX_SRC="libs/mlx-swift/Source/Cmlx/mlx"
+          test -f "$MLX_SRC/mlx/version.h" || { echo "::error::mlx submodule not checked out at $MLX_SRC"; exit 1; }
+          SOURCE_STATUS=$(git -C "$MLX_SRC" status --porcelain=v1 --untracked-files=all)
+          if [ -n "$SOURCE_STATUS" ]; then
+            echo "::error::release metallib source checkout is dirty"
+            printf '%s\n' "$SOURCE_STATUS"
+            exit 1
+          fi
+          MLX_SHA=$(git -C "$MLX_SRC" rev-parse HEAD)
+          HELPER_SHA=$(shasum -a 256 scripts/fetch-metallib.sh | cut -d' ' -f1)
+          SDK=$(xcrun --sdk macosx --show-sdk-version)
+          XCODE=$(xcodebuild -version | tr -cs '[:alnum:].' '-')
+          KEY="metallib-helper-v1-${MLX_SHA}-${HELPER_SHA}-${XCODE}-sdk${SDK}-dt${MLX_METALLIB_DEPLOYMENT_TARGET}-jitoff"
+          echo "key=$KEY" >> "$GITHUB_OUTPUT"
+          echo "mlx_sha_short=${MLX_SHA:0:12}" >> "$GITHUB_OUTPUT"
+          echo "Metallib cache namespace: $KEY"
+
+      - name: Restore source-matched metallib cache
+        id: metallib-cache
+        uses: actions/cache/restore@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
+        with:
+          path: ${{ runner.temp }}/metallib-cache
+          key: ${{ steps.mlxkey.outputs.key }}
+
+      - name: Build source-matched mlx.metallib through root helper
+        id: metallib
+        env:
+          METALLIB_CACHE_DIR: ${{ runner.temp }}/metallib-cache
+        run: |
+          set -euo pipefail
+          command -v cmake >/dev/null 2>&1 || brew install cmake
+          MLX_SRC="libs/mlx-swift/Source/Cmlx/mlx"
+          test -z "$(git -C "$MLX_SRC" status --porcelain=v1 --untracked-files=all)"
+          ./scripts/fetch-metallib.sh "$RUNNER_TEMP/metallib"
+          test -z "$(git -C "$MLX_SRC" status --porcelain=v1 --untracked-files=all)" || {
+            echo "::error::metallib helper modified the release source checkout"
+            exit 1
+          }
+          MLIB="$RUNNER_TEMP/metallib/mlx.metallib"
+          test -s "$MLIB" || { echo "::error::metallib missing at $MLIB"; exit 1; }
+          echo "metallib=$MLIB" >> "$GITHUB_OUTPUT"
+
+      - name: Save source-matched metallib cache
+        if: steps.metallib-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
+        with:
+          path: ${{ runner.temp }}/metallib-cache
+          key: ${{ steps.mlxkey.outputs.key }}
+
+      # ----------------------------------------------------------------------
+      # Build (tests run by CI, not the release workflow).
+      # ----------------------------------------------------------------------
+
+      - name: Build provider-swift (release)
+        working-directory: provider-swift
+        run: |
+          set -euo pipefail
+          swift build -c release --product darkbloom
+          swift build -c release --product darkbloom-enclave
+          swift build -c release --product darkbloom-fan-helper
+          BIN_DIR=$(swift build -c release --show-bin-path)
+          test -x "$BIN_DIR/$CLI_NAME"
+          test -x "$BIN_DIR/$ENCLAVE_NAME"
+          test -x "$BIN_DIR/$FAN_HELPER_NAME"
+          echo "BIN_DIR=$BIN_DIR" >> "$GITHUB_ENV"
+          ls -la "$BIN_DIR" | head -50
+          REPORTED=$("$BIN_DIR/$CLI_NAME" --version)
+          ../scripts/check-release-version.sh "$VERSION" "$REPORTED"
+
+      - name: Save SwiftPM cache
+        uses: actions/cache/save@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
+        if: always()
+        with:
+          path: |
+            ~/Library/Caches/org.swift.swiftpm
+            ~/Library/org.swift.swiftpm
+            provider-swift/.build
+            libs/mlx-swift-lm/.build
+          key: spm-v3-${{ runner.os }}-${{ github.sha }}-${{ hashFiles('provider-swift/Package.resolved', 'libs/mlx-swift/Package.swift', 'libs/mlx-swift-lm/Package.swift') }}
+
+      # Unit tests are run by CI (ci.yml + integration.yml) on push to
+      # master. Skipped here to avoid flaky live MLX inference tests
+      # blocking signed releases on CI hardware timing differences.
+
+      # ----------------------------------------------------------------------
+      # Stage the app, every SwiftPM runtime bundle, and flat verifier files.
+      # ----------------------------------------------------------------------
+
+      - name: Embed provisioning profile
+        env:
+          PROVISIONING_PROFILE_BASE64: ${{ secrets.PROVISIONING_PROFILE_BASE64 }}
+        run: |
+          set -euo pipefail
+          if [ -z "${PROVISIONING_PROFILE_BASE64:-}" ]; then
+            echo "::error::PROVISIONING_PROFILE_BASE64 is required (PR #146 persistent SE key)"
+            exit 1
+          fi
+          echo "$PROVISIONING_PROFILE_BASE64" | base64 --decode > /tmp/embedded.provisionprofile
+
+          # Decode the CMS-wrapped profile to its plist payload so we can
+          # introspect entitlements + expiry. Without this, a profile that
+          # doesn't grant SLDQ2GJ6TL.io.darkbloom.provider (or is expired)
+          # passes codesign but fails at runtime → silent attestation break.
+          security cms -D -i /tmp/embedded.provisionprofile > /tmp/profile.plist
+
+          python3 - <<'PY'
+          import plistlib, sys
+          from datetime import datetime, timezone
+
+          with open('/tmp/profile.plist', 'rb') as f:
+              p = plistlib.load(f)
+
+          errors = []
+          team = p.get('TeamIdentifier', [])
+          if 'SLDQ2GJ6TL' not in team:
+              errors.append(f"TeamIdentifier missing SLDQ2GJ6TL: {team}")
+
+          ents = p.get('Entitlements', {})
+          groups = ents.get('keychain-access-groups', [])
+          # Accept exact match or wildcard (SLDQ2GJ6TL.*) which covers
+          # SLDQ2GJ6TL.io.darkbloom.provider at runtime.
+          has_group = any(
+              g == 'SLDQ2GJ6TL.io.darkbloom.provider' or g == 'SLDQ2GJ6TL.*'
+              for g in groups
+          )
+          if not has_group:
+              errors.append(f"keychain-access-groups missing SLDQ2GJ6TL.io.darkbloom.provider or wildcard: {groups}")
+
+          app_id = ents.get('application-identifier', '')
+          # Developer ID profiles may omit application-identifier entirely;
+          # accept empty or wildcard alongside exact match.
+          if app_id and not (app_id.endswith('io.darkbloom.provider') or app_id.endswith('*')):
+              errors.append(f"application-identifier mismatch: {app_id}")
+
+          # v0.6.0 APNs code-identity: the embedded profile MUST grant
+          # aps-environment=production, or the signed binary AMFI-kills at launch
+          # (restricted entitlement without an authorizing profile). This is the
+          # only build-time guard against shipping the entitlement with a stale,
+          # non-push profile. Profiles key it short ('aps-environment') or long.
+          aps = ents.get('aps-environment') or ents.get('com.apple.developer.aps-environment')
+          if aps != 'production':
+              errors.append(
+                  f"profile does not grant aps-environment=production (got {aps!r}); "
+                  "regenerate the push-enabled provisioning profile and update PROVISIONING_PROFILE_BASE64"
+              )
+
+          expiry = p.get('ExpirationDate')
+          if expiry is not None:
+              # ExpirationDate is a naive UTC datetime from plistlib.
+              now = datetime.utcnow()
+              days_left = (expiry - now).days
+              if days_left < 30:
+                  errors.append(f"Profile expires in {days_left} days (renew before cutover): {expiry}")
+              else:
+                  print(f"Profile valid for {days_left} more days")
+          else:
+              print("::warning::Provisioning profile has no ExpirationDate field")
+
+          name = p.get('Name', '<unknown>')
+          uuid = p.get('UUID', '<unknown>')
+          print(f"Profile: name={name!r} uuid={uuid} team={team} app_id={app_id}")
+
+          if errors:
+              for e in errors:
+                  print(f"::error::{e}", file=sys.stderr)
+              sys.exit(1)
+          print("Provisioning profile verification passed")
+          PY
+
+          echo "profile_available=true" >> "$GITHUB_OUTPUT"
+        id: profile
+
+      - name: Stage and sign bundle
+        id: bundle
+        run: |
+          set -euo pipefail
+          STAGE=/tmp/darkbloom-bundle
+          rm -rf "$STAGE"
+
+          # Wrap the CLI in a minimal .app bundle so the provisioning profile
+          # authorizes keychain-access-groups for the persistent SE key.
+          APP="$STAGE/Darkbloom.app"
+          mkdir -p \
+            "$APP/Contents/MacOS" \
+            "$APP/Contents/Helpers" \
+            "$APP/Contents/Resources/darkbloom-runtime-capabilities"
+
+          cp "$BIN_DIR/$CLI_NAME" "$APP/Contents/MacOS/"
+          cp "$BIN_DIR/$ENCLAVE_NAME" "$APP/Contents/MacOS/"
+          cp "${{ steps.metallib.outputs.metallib }}" "$APP/Contents/MacOS/mlx.metallib"
+          install -m 0755 \
+            "$BIN_DIR/$FAN_HELPER_NAME" \
+            "$APP/Contents/Helpers/$FAN_HELPER_NAME"
+          printf '1\n' \
+            > "$APP/Contents/Resources/darkbloom-runtime-capabilities/fan-helper-v1"
+
+          cat > "$APP/Contents/Info.plist" << PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleIdentifier</key>
+              <string>io.darkbloom.provider</string>
+              <key>CFBundleExecutable</key>
+              <string>${CLI_NAME}</string>
+              <key>CFBundleName</key>
+              <string>Darkbloom</string>
+              <key>CFBundleVersion</key>
+              <string>${VERSION}</string>
+              <key>CFBundleShortVersionString</key>
+              <string>${VERSION}</string>
+              <key>CFBundlePackageType</key>
+              <string>APPL</string>
+              <key>LSMinimumSystemVersion</key>
+              <string>14.0</string>
+          </dict>
+          </plist>
+          PLIST
+
+          if [ "${{ steps.profile.outputs.profile_available }}" = "true" ]; then
+            cp /tmp/embedded.provisionprofile "$APP/Contents/embedded.provisionprofile"
+            echo "Provisioning profile embedded in app bundle"
+          fi
+
+          # Copy every product resource bundle into the canonical signed-app
+          # resource directory before signing/notarizing. PagedAttention uses
+          # a catchable locator instead of SwiftPM's fatal Bundle.module
+          # accessor and searches this sealed location. This includes
+          # mlx-swift-lm_MLXLMCommon.bundle/pagedattention.metal and future
+          # dependency resource bundles.
+          RESOURCE_MANIFEST=/tmp/darkbloom-swiftpm-resource-bundles.txt
+          scripts/stage-swiftpm-resource-bundles.sh \
+            "$BIN_DIR" "$APP" "$RESOURCE_MANIFEST"
+
+          # Package-real runtime gate. Before its first GPU access the staged
+          # child decodes the retained Gemma config, proves authoritative
+          # overwrite of all three low-level controls, snapshots the early R1
+          # latch/AOT capability without arming counters, then runs the
+          # existing GPT-OSS paged-kernel shapes. The v0.7.6 artifact still
+          # fails here because its resource bundle is absent.
+          PRE_SIGN_SMOKE_OUTPUT=$(DARKBLOOM_NO_UPDATE_CHECK=1 \
+            DARKBLOOM_GEMMA4_PREFILL_CHUNK_EVAL=18 \
+            MLX_GEMMA4_FUSED_WEIGHTED_UNSORT=1 \
+            MLX_GATHER_QMM_EXPERT_SLICES=1 \
+            "$APP/Contents/MacOS/$CLI_NAME" runtime-smoke)
+          printf '%s\n' "$PRE_SIGN_SMOKE_OUTPUT"
+          printf '%s\n' "$PRE_SIGN_SMOKE_OUTPUT" \
+            | grep -Fqx 'gemma-optimizations-runtime-smoke: ok'
+
+          # Hardened-runtime sign each binary and resource, then the bundle.
+          # mlx.metallib must be signed before the bundle or codesign rejects
+          # it as an unsigned subcomponent.
+          # The fan helper runs as root only after a separate, explicit sudo
+          # command. Give it its own identity and no provider APNs/keychain
+          # entitlements; ordinary installation leaves it sealed and dormant.
+          codesign --force --options runtime --timestamp \
+            --identifier "$FAN_HELPER_ID" \
+            --keychain "$KEYCHAIN_PATH" \
+            --sign "$DEVELOPER_ID" "$APP/Contents/Helpers/$FAN_HELPER_NAME"
+          FAN_HELPER_REQUIREMENT="anchor apple generic and identifier \"$FAN_HELPER_ID\" and certificate leaf[subject.OU] = \"$APPLE_TEAM_ID\""
+          codesign --verify --strict --verbose=2 \
+            "-R=$FAN_HELPER_REQUIREMENT" \
+            "$APP/Contents/Helpers/$FAN_HELPER_NAME"
+          codesign --force --options runtime --timestamp \
+            --keychain "$KEYCHAIN_PATH" \
+            --sign "$DEVELOPER_ID" "$APP/Contents/MacOS/mlx.metallib"
+          # darkbloom-enclave only uses ephemeral SE keys (no keychain).
+          # It gets its own entitlements without keychain-access-groups and
+          # application-identifier so AMFI doesn't require a provisioning
+          # profile match (which only works for the main bundle executable).
+          codesign --force --options runtime --timestamp \
+            --entitlements provider-swift/entitlements-enclave.plist \
+            --keychain "$KEYCHAIN_PATH" \
+            --sign "$DEVELOPER_ID" "$APP/Contents/MacOS/$ENCLAVE_NAME"
+          codesign --force --options runtime --timestamp \
+            --entitlements provider-swift/entitlements.plist \
+            --keychain "$KEYCHAIN_PATH" \
+            --sign "$DEVELOPER_ID" "$APP/Contents/MacOS/$CLI_NAME"
+          codesign --force --options runtime --timestamp \
+            --entitlements provider-swift/entitlements.plist \
+            --keychain "$KEYCHAIN_PATH" \
+            --sign "$DEVELOPER_ID" "$APP"
+
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          codesign --verify --verbose=2 "$APP/Contents/MacOS/$CLI_NAME"
+
+          # Packaged post-sign smoke: the release-candidate evaluator must be
+          # exposed by the exact signed main executable. This checks command
+          # wiring/help only; CI never downloads or runs model weights.
+          SIGNED_BENCHMARK_HELP=$(DARKBLOOM_NO_UPDATE_CHECK=1 \
+            "$APP/Contents/MacOS/$CLI_NAME" benchmark --help)
+          printf '%s\n' "$SIGNED_BENCHMARK_HELP" \
+            | grep -F -- '--scheduler-prefill-decision'
+
+          # Persistent Secure Enclave key requires keychain-access-groups
+          # bound to the team-scoped access group. If the entitlement is
+          # missing, providers fall back to ephemeral SE keys and PR #146
+          # silently no-ops. Fail the build instead of shipping a broken
+          # attestation.
+          EXPECTED_ACCESS_GROUP="SLDQ2GJ6TL.io.darkbloom.provider"
+          ENTITLEMENTS=$(codesign -d --entitlements - --xml "$APP/Contents/MacOS/$CLI_NAME" 2>&1 || true)
+          if ! echo "$ENTITLEMENTS" | grep -q "keychain-access-groups"; then
+            echo "::error::Signed CLI is missing keychain-access-groups entitlement"
+            echo "$ENTITLEMENTS"
+            exit 1
+          fi
+          if ! echo "$ENTITLEMENTS" | grep -q "$EXPECTED_ACCESS_GROUP"; then
+            echo "::error::Signed CLI is missing access group $EXPECTED_ACCESS_GROUP"
+            echo "$ENTITLEMENTS"
+            exit 1
+          fi
+          # v0.6.0 APNs code-identity assertions on the signed CLI:
+          #   (a) aps-environment present AND == production (parse the value, not a
+          #       bare grep — a dev profile would set 'development' and silently
+          #       register against the wrong APNs host).
+          #   (b) get-task-allow ABSENT — its absence (not "hardened runtime" per
+          #       se) is what blocks even-root debugger attach / dylib injection;
+          #       Developer ID + notarization strips it.
+          rm -f /tmp/cli-ents.plist
+          codesign -d --entitlements /tmp/cli-ents.plist --xml "$APP/Contents/MacOS/$CLI_NAME" 2>/dev/null || true
+          # Fail loudly if extraction produced nothing — otherwise the
+          # get-task-allow check below would pass vacuously on an empty file.
+          if [ ! -s /tmp/cli-ents.plist ]; then
+            echo "::error::Failed to extract entitlements from signed CLI for APNs/get-task-allow verification"
+            exit 1
+          fi
+          APS_ENV=$(/usr/libexec/PlistBuddy -c 'Print :com.apple.developer.aps-environment' /tmp/cli-ents.plist 2>/dev/null || echo "")
+          if [ "$APS_ENV" != "production" ]; then
+            echo "::error::Signed CLI aps-environment must be 'production' (got '${APS_ENV:-<absent>}'). Regenerate the push provisioning profile + entitlements (v0.6.0 APNs code-identity)."
+            exit 1
+          fi
+          if /usr/libexec/PlistBuddy -c 'Print :com.apple.security.get-task-allow' /tmp/cli-ents.plist 2>/dev/null | grep -qi true; then
+            echo "::error::Signed CLI has get-task-allow=true — defeats even-root injection resistance. It must be absent (Developer ID + notarized strips it)."
+            exit 1
+          fi
+          echo "APNs code-identity entitlements verified: aps-environment=production, get-task-allow absent"
+          if [ "${{ steps.profile.outputs.profile_available }}" = "true" ]; then
+            if [ ! -f "$APP/Contents/embedded.provisionprofile" ]; then
+              echo "::error::Provisioning profile secret set but not embedded in app bundle"
+              exit 1
+            fi
+          else
+            echo "::error::PROVISIONING_PROFILE_BASE64 secret is required to authorize the keychain-access-groups entitlement on provider machines"
+            exit 1
+          fi
+          echo "Entitlement verification passed: $EXPECTED_ACCESS_GROUP authorized via embedded provisioning profile"
+
+          # Flat layout alongside the .app bundle. Coordinator's release
+          # artifact verifier (release_handlers.go:413) requires bin/darkbloom
+          # to be a regular file — symlinks fail the tar.TypeReg check.
+          mkdir -p "$STAGE/bin"
+          cp "$APP/Contents/MacOS/$CLI_NAME" "$STAGE/bin/$CLI_NAME"
+          cp "$APP/Contents/MacOS/$ENCLAVE_NAME" "$STAGE/bin/$ENCLAVE_NAME"
+          cp "$APP/Contents/MacOS/mlx.metallib" "$STAGE/bin/mlx.metallib"
+
+          # Notarize only the canonical app. The flat bin/ copies exist solely
+          # for coordinator artifact verification and inherit signatures that
+          # are valid only in the app-bundle context, so they are not valid
+          # notarization inputs on their own.
+          ditto -c -k --keepParent "$APP" /tmp/darkbloom-notarize.zip
+
+          # The distribution tar retains both shapes: install.sh uses the app,
+          # while the coordinator hashes the regular file at bin/darkbloom.
+          tar czf /tmp/darkbloom-bundle-macos-arm64.tar.gz -C "$STAGE" .
+          tar tzf /tmp/darkbloom-bundle-macos-arm64.tar.gz | sort | tee /tmp/darkbloom-bundle-files.txt
+          echo "stage=$STAGE" >> "$GITHUB_OUTPUT"
+          ls -lh /tmp/darkbloom-bundle-macos-arm64.tar.gz
+
+      - name: Notarize bundle
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          set -euo pipefail
+          xcrun notarytool submit /tmp/darkbloom-notarize.zip \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_APP_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait --timeout 15m \
+            --output-format json | tee /tmp/notary-result.json
+
+          read -r NOTARY_ID NOTARY_STATUS < <(python3 - <<'PY'
+          import json
+
+          with open('/tmp/notary-result.json', encoding='utf-8') as result_file:
+              result = json.load(result_file)
+
+          submission_id = result.get('id')
+          status = result.get('status')
+          if not submission_id or not status:
+              raise SystemExit('notarytool result is missing id or status')
+          print(submission_id, status)
+          PY
+          )
+
+          if [ "$NOTARY_STATUS" != "Accepted" ]; then
+            echo "::error::Apple notarization $NOTARY_ID finished with status $NOTARY_STATUS (expected Accepted)"
+            if ! xcrun notarytool log "$NOTARY_ID" \
+              --apple-id "$APPLE_ID" \
+              --password "$APPLE_APP_PASSWORD" \
+              --team-id "$APPLE_TEAM_ID"; then
+              echo "::warning::Could not retrieve Apple's rejection log for $NOTARY_ID"
+            fi
+            exit 1
+          fi
+
+          # Stapler supports executable bundles, not individual Mach-O files.
+          # Require an attached ticket and a local Gatekeeper acceptance before
+          # the distribution artifact can be rebuilt or uploaded.
+          STAGE="${{ steps.bundle.outputs.stage }}"
+          APP="$STAGE/Darkbloom.app"
+          xcrun stapler staple "$APP"
+          xcrun stapler validate "$APP"
+          spctl --assess --type execute --verbose=4 "$APP"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+
+          # Stapling the bundle must not change the executable bytes registered
+          # with the coordinator and verified by provider self-update.
+          cmp "$STAGE/bin/$CLI_NAME" "$APP/Contents/MacOS/$CLI_NAME"
+          cmp "$STAGE/bin/$ENCLAVE_NAME" "$APP/Contents/MacOS/$ENCLAVE_NAME"
+          cmp "$STAGE/bin/mlx.metallib" "$APP/Contents/MacOS/mlx.metallib"
+
+          tar czf /tmp/darkbloom-bundle-macos-arm64.tar.gz -C "${{ steps.bundle.outputs.stage }}" .
+          tar tzf /tmp/darkbloom-bundle-macos-arm64.tar.gz | sort | tee /tmp/darkbloom-bundle-files.txt
+          grep -qx './bin/darkbloom' /tmp/darkbloom-bundle-files.txt
+          grep -qx './bin/darkbloom-enclave' /tmp/darkbloom-bundle-files.txt
+          grep -qx './bin/mlx.metallib' /tmp/darkbloom-bundle-files.txt
+          if grep -qx './bin/darkbloom-fan-helper' /tmp/darkbloom-bundle-files.txt; then
+            echo "::error::fan helper must not be present in the flat verifier layout"
+            exit 1
+          fi
+          grep -qx \
+            './Darkbloom.app/Contents/Helpers/darkbloom-fan-helper' \
+            /tmp/darkbloom-bundle-files.txt
+          grep -qx \
+            './Darkbloom.app/Contents/Resources/darkbloom-runtime-capabilities/fan-helper-v1' \
+            /tmp/darkbloom-bundle-files.txt
+          while IFS= read -r bundle_name; do
+            grep -qx \
+              "./Darkbloom.app/Contents/Resources/${bundle_name}/" \
+              /tmp/darkbloom-bundle-files.txt
+          done < /tmp/darkbloom-swiftpm-resource-bundles.txt
+          grep -qx \
+            './Darkbloom.app/Contents/Resources/mlx-swift-lm_MLXLMCommon.bundle/pagedattention.metal' \
+            /tmp/darkbloom-bundle-files.txt
+          grep -qx \
+            './Darkbloom.app/Contents/Resources/darkbloom-runtime-capabilities/paged-kernel-v1' \
+            /tmp/darkbloom-bundle-files.txt
+
+          # Verify the FINAL archived layout, not merely the staging tree.
+          # This runs after signing, notarization, stapling, and tar rebuild,
+          # and before any upload or coordinator registration.
+          SMOKE_ROOT=/tmp/darkbloom-final-artifact-smoke
+          rm -rf "$SMOKE_ROOT"
+          mkdir -p "$SMOKE_ROOT"
+          tar xzf /tmp/darkbloom-bundle-macos-arm64.tar.gz -C "$SMOKE_ROOT"
+          FINAL_APP_METALLIB="$SMOKE_ROOT/Darkbloom.app/Contents/MacOS/mlx.metallib"
+          FINAL_FLAT_METALLIB="$SMOKE_ROOT/bin/mlx.metallib"
+          test -s "$FINAL_APP_METALLIB"
+          test -s "$FINAL_FLAT_METALLIB"
+          cmp "$FINAL_FLAT_METALLIB" "$FINAL_APP_METALLIB"
+          # Repeat the helper's completeness contract against the final
+          # extracted, signed bytes rather than the pre-signing input.
+          NAX_SYMBOL="_nax"
+          GEMV_SYMBOL="gemv"
+          R1_BUILDER_SYMBOL="build_gemma4_sorted_expert_tiles_bm32"
+          R1_BUILDER_E256_SYMBOL="build_sorted_expert_tiles_bm32_e256"
+          R1_KERNEL_SYMBOL="affine_gather_qmm_gemma4_expert_tiles_bfloat16_t_gs_64_b_4_alN_true_bm_32_bn_32_bk_32"
+          QMV_WIDE_W4_M2_SYMBOL="affine_qmv_wide_bfloat16_t_gs_64_b_4_nv_2_kl_8_batch_0"
+          QMV_WIDE_W4_M4_BATCHED_SYMBOL="affine_qmv_wide_bfloat16_t_gs_64_b_4_nv_4_kl_8_batch_1"
+          QMV_WIDE_W8_M2_SYMBOL="affine_qmv_wide_bfloat16_t_gs_64_b_8_nv_2_kl_8_batch_0"
+          QMV_WIDE_W8_M4_BATCHED_SYMBOL="affine_qmv_wide_bfloat16_t_gs_64_b_8_nv_4_kl_8_batch_1"
+          for symbol in \
+            "$NAX_SYMBOL" \
+            "$GEMV_SYMBOL" \
+            "$R1_BUILDER_SYMBOL" \
+            "$R1_BUILDER_E256_SYMBOL" \
+            "$R1_KERNEL_SYMBOL" \
+            "$QMV_WIDE_W4_M2_SYMBOL" \
+            "$QMV_WIDE_W4_M4_BATCHED_SYMBOL" \
+            "$QMV_WIDE_W8_M2_SYMBOL" \
+            "$QMV_WIDE_W8_M4_BATCHED_SYMBOL"
+          do
+            MATCHES=$(strings "$FINAL_FLAT_METALLIB" | grep -F -c "$symbol" || true)
+            if [ "$MATCHES" -eq 0 ]; then
+              echo "::error::final signed metallib is missing required symbol: $symbol"
+              exit 1
+            fi
+          done
+          FINAL_FAN_HELPER="$SMOKE_ROOT/Darkbloom.app/Contents/Helpers/$FAN_HELPER_NAME"
+          FINAL_FAN_MARKER="$SMOKE_ROOT/Darkbloom.app/Contents/Resources/darkbloom-runtime-capabilities/fan-helper-v1"
+          test -f "$FINAL_FAN_HELPER"
+          test ! -L "$FINAL_FAN_HELPER"
+          test -x "$FINAL_FAN_HELPER"
+          test "$(stat -f '%Lp' "$FINAL_FAN_HELPER")" = "755"
+          test -f "$FINAL_FAN_MARKER"
+          test ! -L "$FINAL_FAN_MARKER"
+          test "$(tr -d '[:space:]' < "$FINAL_FAN_MARKER")" = "1"
+          LC_ALL=C grep -a -q -F 'darkbloom-fan-helper-v1' \
+            "$SMOKE_ROOT/Darkbloom.app/Contents/MacOS/$CLI_NAME"
+          FAN_HELPER_REQUIREMENT="anchor apple generic and identifier \"$FAN_HELPER_ID\" and certificate leaf[subject.OU] = \"$APPLE_TEAM_ID\""
+          codesign --verify --strict --verbose=2 \
+            "-R=$FAN_HELPER_REQUIREMENT" "$FINAL_FAN_HELPER"
+          codesign --verify --deep --strict --verbose=2 \
+            "$SMOKE_ROOT/Darkbloom.app"
+          FINAL_SMOKE_OUTPUT=$(DARKBLOOM_NO_UPDATE_CHECK=1 \
+            DARKBLOOM_GEMMA4_PREFILL_CHUNK_EVAL=18 \
+            MLX_GEMMA4_FUSED_WEIGHTED_UNSORT=1 \
+            MLX_GATHER_QMM_EXPERT_SLICES=1 \
+            "$SMOKE_ROOT/Darkbloom.app/Contents/MacOS/$CLI_NAME" runtime-smoke)
+          printf '%s\n' "$FINAL_SMOKE_OUTPUT"
+          printf '%s\n' "$FINAL_SMOKE_OUTPUT" \
+            | grep -Fqx 'gemma-optimizations-runtime-smoke: ok'
+          REPORTED=$("$SMOKE_ROOT/Darkbloom.app/Contents/MacOS/$CLI_NAME" --version)
+          ./scripts/check-release-version.sh "$VERSION" "$REPORTED"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' \
+            "$SMOKE_ROOT/Darkbloom.app/Contents/Info.plist")" = "$VERSION"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' \
+            "$SMOKE_ROOT/Darkbloom.app/Contents/Info.plist")" = "$VERSION"
+
+          BINARY_HASH=$(shasum -a 256 "$SMOKE_ROOT/bin/$CLI_NAME" | cut -d' ' -f1)
+          BUNDLE_HASH=$(shasum -a 256 /tmp/darkbloom-bundle-macos-arm64.tar.gz | cut -d' ' -f1)
+          METALLIB_HASH=$(shasum -a 256 "$FINAL_FLAT_METALLIB" | cut -d' ' -f1)
+          echo "BINARY_HASH=$BINARY_HASH" >> "$GITHUB_ENV"
+          echo "BUNDLE_HASH=$BUNDLE_HASH" >> "$GITHUB_ENV"
+          echo "METALLIB_HASH=$METALLIB_HASH" >> "$GITHUB_ENV"
+          echo "Binary hash:   $BINARY_HASH"
+          echo "Bundle hash:   $BUNDLE_HASH"
+          echo "Metallib hash: $METALLIB_HASH"
+
+      - name: Upload bundle to R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ env.r2_access_key_id }}
+          AWS_SECRET_ACCESS_KEY: ${{ env.r2_secret_access_key }}
+          R2_ENDPOINT: ${{ env.r2_endpoint }}
+          R2_BUCKET: ${{ env.r2_bucket }}
+        run: |
+          set -euo pipefail
+          PREFIX="s3://${R2_BUCKET}/releases/v${VERSION}"
+          aws s3 cp /tmp/darkbloom-bundle-macos-arm64.tar.gz \
+            "${PREFIX}/darkbloom-bundle-macos-arm64.tar.gz" \
+            --endpoint-url "$R2_ENDPOINT" --only-show-errors
+
+          # Latest pointer for `install.sh` discovery. Publish under both
+          # the canonical `darkbloom-bundle` name and the legacy
+          # `eigeninference-bundle` name for backward compatibility with
+          # any caller that hardcoded the old filename.
+          aws s3 cp /tmp/darkbloom-bundle-macos-arm64.tar.gz \
+            "s3://${R2_BUCKET}/releases/latest/darkbloom-bundle-macos-arm64.tar.gz" \
+            --endpoint-url "$R2_ENDPOINT" --only-show-errors
+          aws s3 cp /tmp/darkbloom-bundle-macos-arm64.tar.gz \
+            "s3://${R2_BUCKET}/releases/latest/eigeninference-bundle-macos-arm64.tar.gz" \
+            --endpoint-url "$R2_ENDPOINT" --only-show-errors
+
+      - name: Register release with coordinator
+        env:
+          COORDINATOR_URL: ${{ env.coordinator_url }}
+          RELEASE_KEY: ${{ env.release_key }}
+          R2_PUBLIC_URL: ${{ env.r2_public_url }}
+        run: |
+          set -euo pipefail
+          BUNDLE_URL="${R2_PUBLIC_URL}/releases/v${VERSION}/darkbloom-bundle-macos-arm64.tar.gz"
+
+          TAG_MSG=$(git tag -l --format='%(contents:subject)%0a%(contents:body)' "$GITHUB_REF_NAME" 2>/dev/null || echo "")
+          if [ -z "$TAG_MSG" ] || [ "$TAG_MSG" = $'\n' ]; then
+            TAG_MSG="Release v${VERSION}"
+          fi
+
+          # The Swift provider does NOT expose python_hash / runtime_hash, and
+          # its only template fact is the mlx_metallib hash (metallib_hash
+          # below). Per-model-family template hashes were CI fabrications no
+          # provider could ever echo — registering them armed a coordinator
+          # gate that zeroed fleet routing (2026-08-31 incident). Register
+          # only facts the provider actually reports.
+          python3 - <<PY > /tmp/release-payload.json
+          import json, os
+          payload = {
+              "version":         os.environ["VERSION"],
+              "platform":        "macos-arm64",
+              "backend":         "mlx-swift",
+              "binary_hash":     os.environ["BINARY_HASH"],
+              "bundle_hash":     os.environ["BUNDLE_HASH"],
+              "metallib_hash":   os.environ["METALLIB_HASH"],
+              "url":             "${BUNDLE_URL}",
+              "changelog":       """${TAG_MSG}""".strip(),
+          }
+          print(json.dumps(payload))
+          PY
+          curl -fsSL -X POST "${COORDINATOR_URL}/v1/releases" \
+            -H "Authorization: Bearer ${RELEASE_KEY}" \
+            -H "Content-Type: application/json" \
+            -d @/tmp/release-payload.json
+          echo
+          echo "Release v${VERSION} registered with coordinator"
+
+      - name: Create GitHub Release
+        if: needs.resolve-env.outputs.environment == 'prod' && github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cat > /tmp/release-notes.md <<NOTES
+          ## Provider v${VERSION} (Swift CLI)
+
+          **Binary hash:**   \`${BINARY_HASH}\`
+          **Bundle hash:**   \`${BUNDLE_HASH}\`
+          **Metallib hash:** \`${METALLIB_HASH}\` (built from mlx \`${{ steps.mlxkey.outputs.mlx_sha_short }}\`)
+          **Signed by:**     \`${DEVELOPER_ID}\`
+          **Notarized:**     yes
+          **Min macOS:**     ${MIN_MACOS}
+
+          ### Install
+
+          \`\`\`bash
+          curl -fsSL ${{ env.coordinator_url }}/install.sh | bash
+          \`\`\`
+
+          NOTES
+          gh release create "${{ github.ref_name }}" \
+            /tmp/darkbloom-bundle-macos-arm64.tar.gz \
+            --title "${{ github.ref_name }}" \
+            --notes-file /tmp/release-notes.md \
+            --generate-notes
+
+      - name: Cleanup keychain
+        if: always()
+        run: |
+          security delete-keychain "$KEYCHAIN_PATH" 2>/dev/null || true

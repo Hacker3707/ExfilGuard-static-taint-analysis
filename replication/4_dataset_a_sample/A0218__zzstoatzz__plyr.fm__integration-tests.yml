@@ -1,0 +1,129 @@
+name: integration tests
+
+on:
+  # run after staging deployment completes
+  workflow_run:
+    workflows: ["deploy staging"]
+    types:
+      - completed
+    branches:
+      - main
+
+  # allow manual trigger
+  workflow_dispatch:
+    inputs:
+      skip_if_no_tokens:
+        description: "Skip tests if tokens not configured (vs fail)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  integration:
+    name: run integration tests
+    runs-on: ubuntu-latest
+    # only run if staging deploy succeeded (or manual trigger)
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    # 30 min accommodates the long-form regression test (a ~150 MB 60 min
+    # WAV upload + transcode + PDS upload + scanners). short-form tests
+    # finish in seconds; the cap is sized for the worst case.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: check token configuration
+        id: check-tokens
+        run: |
+          if [ -z "${{ secrets.APP_PASSWORD_MINT_SECRET }}" ]; then
+            # a missing secret on our own main is a broken pipeline, not a skip;
+            # only a manual dispatch that explicitly opts in may skip
+            if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.skip_if_no_tokens }}" = "true" ]; then
+              echo "has_tokens=false" >> $GITHUB_OUTPUT
+              echo "::warning::APP_PASSWORD_MINT_SECRET not configured - integration tests skipped by request"
+            else
+              echo "::error::APP_PASSWORD_MINT_SECRET is not configured - integration tests cannot run"
+              exit 1
+            fi
+          else
+            echo "has_tokens=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: set up python
+        if: steps.check-tokens.outputs.has_tokens == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: install uv
+        if: steps.check-tokens.outputs.has_tokens == 'true'
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          cache-dependency-glob: "backend/uv.lock"
+
+      - name: install dependencies
+        if: steps.check-tokens.outputs.has_tokens == 'true'
+        run: cd backend && uv sync --locked
+
+      - name: install ffmpeg
+        if: steps.check-tokens.outputs.has_tokens == 'true'
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      # mint short-lived dev tokens just-in-time from stored app-passwords, so no
+      # long-lived token is ever stored (nothing to rotate, nothing to expire).
+      # the tokens are revoked in teardown; they also self-GC (1-day TTL).
+      - name: mint JIT dev tokens
+        if: steps.check-tokens.outputs.has_tokens == 'true'
+        env:
+          API: https://api-stg.plyr.fm
+          MINT_SECRET: ${{ secrets.APP_PASSWORD_MINT_SECRET }}
+          AP1: ${{ secrets.PLYR_TEST_APP_PASSWORD_1 }}
+          AP2: ${{ secrets.PLYR_TEST_APP_PASSWORD_2 }}
+          AP3: ${{ secrets.PLYR_TEST_APP_PASSWORD_3 }}
+        run: |
+          set -euo pipefail
+          mint() {
+            local handle="$1" apppw="$2" var="$3" resp token
+            resp=$(curl -sf -X POST "$API/auth/dev-token/app-password" \
+              -H "content-type: application/json" \
+              -H "x-admin-token: $MINT_SECRET" \
+              -d "{\"identifier\":\"$handle\",\"app_password\":\"$apppw\"}")
+            token=$(printf '%s' "$resp" | python3 -c "import sys,json;print(json.load(sys.stdin)['token'])")
+            echo "::add-mask::$token"
+            echo "$var=$token" >> "$GITHUB_ENV"
+          }
+          mint "zzstoatzz.io" "$AP1" PLYR_TEST_TOKEN_1
+          mint "plyr.fm" "$AP2" PLYR_TEST_TOKEN_2
+          mint "zzstoatzzdevlog.bsky.social" "$AP3" PLYR_TEST_TOKEN_3
+
+      - name: run integration tests
+        if: steps.check-tokens.outputs.has_tokens == 'true'
+        env:
+          PLYR_API_URL: https://api-stg.plyr.fm
+        run: |
+          cd backend
+          # test_private_media.py needs local postgres/redis fixtures and runs
+          # in test-backend.yml; this workflow only has the staging API
+          uv run pytest tests/integration -m integration -v --tb=short \
+            --ignore=tests/integration/test_private_media.py
+
+      # throw the JIT tokens away — revoke even if the tests failed.
+      - name: revoke JIT dev tokens
+        if: always() && steps.check-tokens.outputs.has_tokens == 'true'
+        env:
+          API: https://api-stg.plyr.fm
+        run: |
+          for var in PLYR_TEST_TOKEN_1 PLYR_TEST_TOKEN_2 PLYR_TEST_TOKEN_3; do
+            token="${!var:-}"
+            [ -z "$token" ] && continue
+            curl -s -X DELETE "$API/auth/developer-tokens/${token:0:8}" \
+              -H "Authorization: Bearer $token" >/dev/null || true
+          done
+
+      - name: prune uv cache
+        if: always() && steps.check-tokens.outputs.has_tokens == 'true'
+        run: uv cache prune --ci

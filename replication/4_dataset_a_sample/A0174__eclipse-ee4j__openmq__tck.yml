@@ -1,0 +1,122 @@
+#
+# Copyright (c) 2022 Contributors to the Eclipse Foundation
+#
+# This program and the accompanying materials are made available under the
+# terms of the Eclipse Public License v. 2.0 which is available at
+# http://www.eclipse.org/legal/epl-2.0,
+# or the Eclipse Distribution License v. 1.0 which is available at
+# http://www.eclipse.org/org/documents/edl-v10.php.
+#
+# SPDX-License-Identifier: EPL-2.0 OR BSD-3-Clause
+#
+
+name: Eclipse OpenMQ TCK
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build OpenMQ
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout for build
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    - name: Set up JDK
+      uses: actions/setup-java@dd06d9cba3e5552c54d9f8ea23572deb30010f7c # v6.0.0
+      with:
+        distribution: 'temurin'
+        java-version: 25
+    - name: Maven Build
+      run: |
+        ./mvnw --show-version \
+               --no-transfer-progress \
+               --define skipTests \
+               --define skipITs \
+               --define skipSBOM \
+               --define build.letter=t \
+               --define build.number=${GITHUB_REF_NAME}/${GITHUB_SHA}/${GITHUB_RUN_ID}.${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT} \
+               --file mq/main \
+               --threads 1C \
+               package
+    - name: Upload MQ Distribution
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        retention-days: 1
+        path: mq/dist/bundles/mq.zip
+        archive: false
+
+  tck:
+    name: Run Jakarta Messaging TCK against OpenMQ
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      OPENMQ_TCK_HOME: openmq-tck
+      TCK_VERSION: 3.1.0
+      ANT_VERSION: 1.10.17
+
+    steps:
+    - name: Download MQ Distribution
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      with:
+        name: mq.zip
+        skip-decompress: true
+    - name: Set up JDK
+      uses: actions/setup-java@dd06d9cba3e5552c54d9f8ea23572deb30010f7c # v6.0.0
+      with:
+        distribution: 'temurin'
+        java-version: 21
+    - name: Download and unpack Apache Ant
+      run: |
+        wget -q \
+          https://dlcdn.apache.org/ant/binaries/apache-ant-${ANT_VERSION}-bin.tar.gz \
+          -O - | \
+            tar xfz -
+    - name: Download and unpack Messaging TCK
+      env:
+        DOWNLOAD_TCK_NAME: jakarta-messaging-tck-${{ env.TCK_VERSION }}.zip
+        DOWNLOAD_TCK_INFO_NAME: jakarta-messaging-tck-${{ env.TCK_VERSION }}-tckinfo.txt
+        LOCAL_TCK_NAME: jakarta-messaging-tck.zip
+        LOCAL_TCK_INFO_NAME: jakarta-messaging-tck-tckinfo.txt
+        TCK_DOWNLOAD_BASE_URL: https://download.eclipse.org/ee4j/jakartaee-tck/jakartaee10/promoted/eftl
+      run: |
+        wget -q ${TCK_DOWNLOAD_BASE_URL}/${DOWNLOAD_TCK_NAME} -O ${LOCAL_TCK_NAME}
+        sha256sum ${LOCAL_TCK_NAME}
+        wget -q ${TCK_DOWNLOAD_BASE_URL}/${DOWNLOAD_TCK_INFO_NAME} -O ${LOCAL_TCK_INFO_NAME}
+        cat ${LOCAL_TCK_INFO_NAME}
+        unzip -qo -d ${OPENMQ_TCK_HOME} ${LOCAL_TCK_NAME}
+    - name: Extract MQ Distribution
+      run: unzip -d ${OPENMQ_TCK_HOME} -q mq.zip
+    - name: Prepare TCK
+      run: |
+        cd ${OPENMQ_TCK_HOME}
+        TCK_HOME=$(pwd)
+        mkdir --parents jmstckreport/jmstck
+        cd messaging-tck/bin
+        sed -i "s#^jms.home=.*#jms.home=${TCK_HOME}/mq#g" ts.jte
+        sed -i 's#^jms.classes=.*#jms.classes=${ri.jars}#g' ts.jte
+        sed -i "s#^report.dir=.*#report.dir=${TCK_HOME}/jmstckreport/jmstck#g" ts.jte
+        sed -i "s#^work.dir=.*#work.dir=${TCK_HOME}/jmstckwork/jmstck#g" ts.jte
+    - name: Prepare environment
+      run: apache-ant-${ANT_VERSION}/bin/ant -f ${OPENMQ_TCK_HOME}/messaging-tck/bin config.vi
+    - name: Execute TCK tests
+      run: apache-ant-${ANT_VERSION}/bin/ant -f ${OPENMQ_TCK_HOME}/messaging-tck/src/com/sun/ts/tests runclient | tee -a /tmp/run.log
+    - name: Cleanup after tests
+      run: apache-ant-${ANT_VERSION}/bin/ant -f ${OPENMQ_TCK_HOME}/messaging-tck/bin clean.vi
+    - name: Prepare summary
+      run: |
+        cp *-tckinfo.txt /tmp
+        cat /tmp/run.log | sed -e '1,/Completed running/d' > /tmp/summary.txt
+        echo PASSED_COUNT=`head -1 /tmp/summary.txt | tail -1 | sed 's/.*=\\s\\(.*\\)/\\1/'`
+        echo FAILED_COUNT=`head -2 /tmp/summary.txt | tail -1 | sed 's/.*=\\s\\(.*\\)/\\1/'`
+        echo ERROR_COUNT=`head -3 /tmp/summary.txt | tail -1 | sed 's/.*=\\s\\(.*\\)/\\1/'`
+    - name: Upload TCK Run Log
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: tck-summary
+        retention-days: 1
+        path: |
+          /tmp/run.log
+          /tmp/*.txt
+

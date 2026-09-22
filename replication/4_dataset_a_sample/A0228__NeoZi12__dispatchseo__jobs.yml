@@ -1,0 +1,43 @@
+name: Background job queue
+
+# Drains the work queue behind the article flow (src/lib/jobs.ts, migration
+# 0056): crawling a customer's site, finishing an accepted draft into
+# publishable HTML, posting it, and checking afterwards that the page is
+# genuinely live.
+#
+# Every 10 minutes because two of those jobs are user-visible waits. An owner
+# who connects their site expects the "we read your site" step to finish while
+# they are still looking at the screen, and an article scheduled for 9am should
+# go out at 9am, not at the top of the next hour. The endpoint exits in one
+# indexed query when the queue is empty, so an idle tick costs seconds - and an
+# idle tick reports as a claim-only run, which keeps it out of the staleness
+# clock and off anyone's dashboard.
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  # Never two drains at once. The claim is race-safe on its own (see claimDue),
+  # but overlapping runs would still double the outbound load on a customer's
+  # site for no gain.
+  group: jobs
+  cancel-in-progress: false
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    # continue-on-error at JOB level: the backend endpoint already logs any
+    # failure to cron_runs (banner + get_cron_health), so the RUN concluding
+    # green here just stops GitHub from also emailing "Run failed".
+    continue-on-error: true
+    timeout-minutes: 8
+    steps:
+      - name: Trigger the jobs cron endpoint
+        env:
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+        run: |
+          curl --fail-with-body -sS --max-time 300 \
+            -H "Authorization: Bearer $CRON_SECRET" \
+            ${{ vars.BACKEND_URL || 'https://dispatchseo.com' }}/api/cron/jobs

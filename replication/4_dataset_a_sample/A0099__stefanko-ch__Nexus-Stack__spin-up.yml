@@ -1,0 +1,1410 @@
+name: "Lifecycle: Spin Up (Rebuild)"
+
+on:
+  workflow_dispatch:
+    inputs:
+      enabled_services:
+        description: 'Comma-separated list of services to enable (empty = use D1 state)'
+        required: false
+        default: ''
+        type: string
+      smoke_check:
+        description: 'Check every container after the deploy: answering on its port, exited, or restart-looping (adds ~10s)'
+        required: false
+        default: true
+        type: boolean
+      silent_mode:
+        description: 'Suppress all automated emails for this run (persists in D1 until reset via toggle-silent-mode workflow)'
+        required: false
+        default: false
+        type: boolean
+      server_image:
+        description: 'Hetzner image to build from. Empty = ubuntu-26.04. A numeric image id restores from that snapshot.'
+        required: false
+        default: ''
+        type: string
+      min_disk_gb:
+        description: 'Constrain capacity selection to server types with at least this disk, in GB. Required when restoring a snapshot.'
+        required: false
+        default: ''
+        type: string
+      arch:
+        description: 'Constrain capacity selection to this architecture. Required when restoring a snapshot.'
+        required: false
+        default: ''
+        type: string
+      s3_persistence:
+        description: 'Override NEXUS_S3_PERSISTENCE. Set to false when restoring a snapshot, whose data is newer than R2.'
+        required: false
+        default: ''
+        type: string
+  workflow_call:
+    inputs:
+      enabled_services:
+        description: 'Comma-separated list of services to enable (passed by Control Plane from D1)'
+        required: false
+        default: ''
+        type: string
+      silent_mode:
+        description: 'Suppress all automated emails (passed from initial-setup)'
+        required: false
+        default: false
+        type: boolean
+      r2_access_key_id:
+        description: 'R2 Access Key ID (from setup-control-plane)'
+        required: false
+        type: string
+      r2_secret_access_key:
+        description: 'R2 Secret Access Key (from setup-control-plane)'
+        required: false
+        type: string
+      r2_data_access_key:
+        description: 'R2 Data Bucket Access Key (from setup-control-plane)'
+        required: false
+        type: string
+      r2_data_secret_key:
+        description: 'R2 Data Bucket Secret Key (from setup-control-plane)'
+        required: false
+        type: string
+      r2_data_bucket:
+        description: 'R2 Data Bucket Name (from setup-control-plane)'
+        required: false
+        type: string
+      ssh_pubkey:
+        description: 'SSH Public Key (from setup-control-plane)'
+        required: false
+        type: string
+      ssh_private_key:
+        description: 'SSH Private Key (from setup-control-plane, for initial setup)'
+        required: false
+        type: string
+      smoke_check:
+        description: 'Check every container after the deploy: answering on its port, exited, or restart-looping'
+        required: false
+        default: true
+        type: boolean
+      server_image:
+        description: 'Hetzner image to build from. Empty = ubuntu-26.04. A numeric image id restores from that snapshot.'
+        required: false
+        default: ''
+        type: string
+      min_disk_gb:
+        description: 'Constrain capacity selection to server types with at least this disk, in GB. Required when restoring a snapshot.'
+        required: false
+        default: ''
+        type: string
+      arch:
+        description: 'Constrain capacity selection to this architecture. Required when restoring a snapshot.'
+        required: false
+        default: ''
+        type: string
+      s3_persistence:
+        description: 'Override NEXUS_S3_PERSISTENCE. Set to false when restoring a snapshot, whose data is newer than R2.'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+# NOTE: No concurrency here - handled by calling workflow (initial-setup.yaml)
+# When called directly via workflow_dispatch, runs without concurrency lock
+
+jobs:
+  spin-up:
+    name: Spin Up
+    runs-on: ubuntu-latest
+    env:
+      TF_VAR_cloudflare_api_token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      TF_VAR_cloudflare_account_id: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      TF_VAR_cloudflare_zone_id: ${{ secrets.CLOUDFLARE_ZONE_ID }}
+      TF_VAR_hcloud_token: ${{ secrets.HCLOUD_TOKEN }}
+      TF_VAR_domain: ${{ secrets.DOMAIN }}
+      TF_VAR_access_emails: ${{ secrets.ACCESS_EMAILS }}
+      TF_VAR_infisical_token: ${{ secrets.INFISICAL_TOKEN }}
+      TF_VAR_dockerhub_username: ${{ secrets.DOCKERHUB_USERNAME }}
+      TF_VAR_dockerhub_token: ${{ secrets.DOCKERHUB_TOKEN }}
+      TF_VAR_github_owner: ${{ github.repository_owner }}
+      TF_VAR_github_repo: ${{ github.event.repository.name }}
+      # Hetzner Object Storage (for LakeFS) - credentials are secrets
+      TF_VAR_hetzner_object_storage_access_key: ${{ secrets.HETZNER_OBJECT_STORAGE_ACCESS_KEY }}
+      TF_VAR_hetzner_object_storage_secret_key: ${{ secrets.HETZNER_OBJECT_STORAGE_SECRET_KEY }}
+      # External S3 Storage (optional - for Filestash multi-backend)
+      TF_VAR_external_s3_endpoint: ${{ secrets.EXTERNAL_S3_ENDPOINT }}
+      TF_VAR_external_s3_region: ${{ secrets.EXTERNAL_S3_REGION || 'auto' }}
+      TF_VAR_external_s3_access_key: ${{ secrets.EXTERNAL_S3_ACCESS_KEY }}
+      TF_VAR_external_s3_secret_key: ${{ secrets.EXTERNAL_S3_SECRET_KEY }}
+      TF_VAR_external_s3_bucket: ${{ secrets.EXTERNAL_S3_BUCKET }}
+      TF_VAR_external_s3_label: ${{ secrets.EXTERNAL_S3_LABEL }}
+      # R2 Datalake (auto-created during setup, inputs override secrets for first-run)
+      TF_VAR_r2_data_access_key: ${{ inputs.r2_data_access_key || secrets.R2_DATA_ACCESS_KEY_ID || secrets.R2_ACCESS_KEY_ID }}
+      TF_VAR_r2_data_secret_key: ${{ inputs.r2_data_secret_key || secrets.R2_DATA_SECRET_ACCESS_KEY || secrets.R2_SECRET_ACCESS_KEY }}
+      TF_VAR_r2_data_bucket: ${{ inputs.r2_data_bucket || secrets.R2_DATA_BUCKET }}
+
+    steps:
+      - name: Mask R2 data credentials from inputs
+        if: inputs.r2_data_access_key != ''
+        run: |
+          echo "::add-mask::${{ inputs.r2_data_access_key }}"
+          echo "::add-mask::${{ inputs.r2_data_secret_key }}"
+          echo "::add-mask::${{ inputs.r2_data_bucket }}"
+
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Cache the npm store
+        # `npm ci` and every Wrangler invocation download through
+        # ~/.npm, and on a cold runner that is the single largest cost here:
+        # run 33852993550 lost 1463s across five gaps of 145-425s, each one
+        # an npm fetch with no log output in between -- 24 of its 35 minutes
+        # (#784). The earlier `_npx`-only proposal would have covered three
+        # of the five; the other two are `npm ci` for the Astro build.
+        #
+        # The Wrangler pin is IN the key on purpose. Without it a pin bump
+        # would restore the old store under the loose restore-key, and
+        # because the primary key already exists GitHub would not save the
+        # new one -- so every later run would re-download it, permanently.
+        # tests/unit/test_workflow_expressions.py keeps this literal equal
+        # to the pinned version.
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.npm
+          key: npm-${{ runner.os }}-wrangler4.129.0-${{ hashFiles('control-plane/package-lock.json') }}
+          restore-keys: |
+            npm-${{ runner.os }}-wrangler4.129.0-
+            npm-${{ runner.os }}-
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+
+      - name: Log workflow start
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          DOMAIN: ${{ secrets.DOMAIN }}
+        run: |
+          if [ -f .github/scripts/log-to-d1.sh ]; then
+            chmod +x .github/scripts/log-to-d1.sh
+            .github/scripts/log-to-d1.sh info "Spin-up workflow started"
+          fi
+
+      - name: Install OpenTofu
+        uses: opentofu/setup-opentofu@v2
+        with:
+          tofu_version: 1.10.0
+
+      - name: Cache OpenTofu providers
+        # Cuts ~30-45s off `tofu init` in steady-state — the providers
+        # (hetznercloud/hcloud, cloudflare/cloudflare, random, tls)
+        # add up to ~50 MB and only change when providers.tf or the
+        # lockfile changes. Key on the file hashes so a provider bump
+        # invalidates the cache automatically.
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            tofu/stack/.terraform
+            tofu/control-plane/.terraform
+            ~/.terraform.d/plugin-cache
+          key: tofu-${{ runner.os }}-${{ hashFiles('tofu/**/providers.tf', 'tofu/**/.terraform.lock.hcl') }}
+          restore-keys: |
+            tofu-${{ runner.os }}-
+
+      - name: Install uv
+        # Required by the `nexus_deploy` Python package — since #505
+        # Phase 4c, `python -m nexus_deploy run-pipeline` IS the
+        # deploy entrypoint (deploy.sh has been deleted). Pinned to
+        # the same version the python-tests CI uses so behaviour
+        # matches across workflows.
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "0.11.7"
+          enable-cache: true
+
+      - name: Sync nexus_deploy runtime deps
+        # Pre-resolve the lockfile-pinned runtime deps now so the
+        # `python -m nexus_deploy run-pipeline` step below doesn't
+        # hit the network mid-deploy. `--frozen` requires uv.lock to
+        # match pyproject.toml (which CI's python-tests already
+        # enforces); `--no-dev` skips ruff/mypy/pytest etc. since we
+        # only need runtime here.
+        run: uv sync --frozen --no-dev
+
+      - name: Install cloudflared
+        run: |
+          curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
+          chmod +x cloudflared
+          sudo mv cloudflared /usr/local/bin/
+
+      - name: Setup SSH key for server access
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+
+          # Ensure newly created key files are never group/world-readable
+          umask 077
+
+          # Get private key: 1) secrets (subsequent runs), 2) workflow input (initial setup)
+          if [ -n "${{ secrets.SSH_PRIVATE_KEY }}" ]; then
+            echo "🔑 Using SSH key from GitHub Secrets"
+            # SSH key heredocs: expression placeholders must NOT start at column 0
+            # (breaks GitHub Actions YAML parser). Keep indented and strip leading
+            # whitespace with sed to ensure clean key content.
+            sed 's/^[[:space:]]*//' > ~/.ssh/id_ed25519 <<'EOF_PRIVATE_KEY'
+          ${{ secrets.SSH_PRIVATE_KEY }}
+          EOF_PRIVATE_KEY
+          elif [ -n "${{ inputs.ssh_private_key }}" ]; then
+            echo "🔑 Using SSH key from workflow input (initial setup)"
+            # Mask each line of the private key to prevent log exposure
+            while IFS= read -r line; do
+              echo "::add-mask::$line"
+            done <<'EOF_MASK'
+          ${{ inputs.ssh_private_key }}
+          EOF_MASK
+            sed 's/^[[:space:]]*//' > ~/.ssh/id_ed25519 <<'EOF_PRIVATE_KEY'
+          ${{ inputs.ssh_private_key }}
+          EOF_PRIVATE_KEY
+          else
+            echo "❌ No SSH key found!"
+            echo "   Please run the 'Initial Setup' workflow (initial-setup.yaml) first to generate SSH keys."
+            exit 1
+          fi
+
+          # Ensure correct permissions (umask handles creation, this is a safety net)
+          chmod 600 ~/.ssh/id_ed25519
+
+          # Get public key: secrets, inputs, or derive from private key
+          if [ -n "${{ secrets.SSH_PUBLIC_KEY }}" ]; then
+            echo "${{ secrets.SSH_PUBLIC_KEY }}" > ~/.ssh/id_ed25519.pub
+          elif [ -n "${{ inputs.ssh_pubkey }}" ]; then
+            echo "${{ inputs.ssh_pubkey }}" > ~/.ssh/id_ed25519.pub
+          else
+            echo "ℹ️ Deriving public key from private key..."
+            ssh-keygen -y -f ~/.ssh/id_ed25519 > ~/.ssh/id_ed25519.pub
+          fi
+          chmod 644 ~/.ssh/id_ed25519.pub
+          echo "✅ SSH key configured"
+
+      - name: Create R2 credentials from secrets
+        run: |
+          mkdir -p tofu
+
+          # Use inputs from setup-control-plane if available, otherwise fall back to secrets
+          # This allows initial-setup.yaml to pass freshly created credentials
+          if [ -n "${{ inputs.r2_access_key_id }}" ] && [ -n "${{ inputs.r2_secret_access_key }}" ]; then
+            echo "📦 Using R2 credentials from setup-control-plane workflow"
+            R2_ACCESS_KEY_ID="${{ inputs.r2_access_key_id }}"
+            R2_SECRET_ACCESS_KEY="${{ inputs.r2_secret_access_key }}"
+            # Mask credentials passed via workflow inputs (security)
+            echo "::add-mask::$R2_ACCESS_KEY_ID"
+            echo "::add-mask::$R2_SECRET_ACCESS_KEY"
+          else
+            echo "📦 Using R2 credentials from GitHub Secrets"
+            # Trim whitespace and newlines from secrets to avoid auth issues
+            R2_ACCESS_KEY_ID=$(echo -n "${{ secrets.R2_ACCESS_KEY_ID }}" | tr -d '[:space:]')
+            R2_SECRET_ACCESS_KEY=$(echo -n "${{ secrets.R2_SECRET_ACCESS_KEY }}" | tr -d '[:space:]')
+
+            # Debug: Check if secrets are available (without exposing values)
+            if [ -z "$R2_ACCESS_KEY_ID" ] || [ -z "$R2_SECRET_ACCESS_KEY" ]; then
+              echo "⚠️  R2 credentials from secrets are empty"
+              echo "   R2_ACCESS_KEY_ID length: ${#R2_ACCESS_KEY_ID}"
+              echo "   R2_SECRET_ACCESS_KEY length: ${#R2_SECRET_ACCESS_KEY}"
+              echo ""
+              echo "   This might happen if:"
+              echo "   1. The 'Initial Setup' workflow hasn't been run yet"
+              echo "   2. The secrets weren't saved properly in setup-control-plane"
+              echo "   3. The secrets are in a different repository scope"
+              echo ""
+              echo "   Please run the 'Initial Setup' workflow (initial-setup.yaml) first,"
+              echo "   or manually set R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY in GitHub Settings → Secrets → Actions."
+            fi
+          fi
+
+          # Validate credentials are not empty
+          if [ -z "$R2_ACCESS_KEY_ID" ] || [ -z "$R2_SECRET_ACCESS_KEY" ]; then
+            echo "❌ R2 credentials are empty!"
+            echo "   Either run the 'Initial Setup' workflow (initial-setup.yaml) first,"
+            echo "   or set R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY in GitHub Settings → Secrets → Actions."
+            exit 1
+          fi
+
+          # Generate dynamic bucket name from domain
+          BUCKET_NAME=$(echo "${{ secrets.DOMAIN }}" | tr '.' '-')-terraform-state
+          echo "📦 Using bucket: $BUCKET_NAME"
+
+          cat > tofu/.r2-credentials << EOF
+          R2_ACCESS_KEY_ID="${R2_ACCESS_KEY_ID}"
+          R2_SECRET_ACCESS_KEY="${R2_SECRET_ACCESS_KEY}"
+          EOF
+          sed -i 's/^          //' tofu/.r2-credentials
+
+          cat > tofu/backend.hcl << EOF
+          endpoints = {
+            s3 = "https://${{ secrets.CLOUDFLARE_ACCOUNT_ID }}.r2.cloudflarestorage.com"
+          }
+          bucket = "${BUCKET_NAME}"
+          EOF
+          sed -i 's/^          //' tofu/backend.hcl
+
+          echo "✅ R2 credentials file created"
+
+      - name: Generate config.tfvars
+        # Shared with spin-up-snapshot.yml — see
+        # .github/actions/nexus-config-tfvars.
+        #
+        # The `|| 'ubuntu-26.04'` is load-bearing, not decoration: the
+        # action's own `default:` only applies when a key is ABSENT, and
+        # `with:` always sends this one. An unset workflow input would
+        # otherwise arrive as an empty string and fail the image
+        # validation. This workflow still carries no snapshot awareness —
+        # it names the base image and nothing else; only
+        # spin-up-snapshot.yml ever supplies a snapshot id.
+        uses: ./.github/actions/nexus-config-tfvars
+        with:
+          # Empty on the normal path — the action defaults to
+          # ubuntu-26.04. Only spin-up-snapshot.yml ever passes an id.
+          server_image: ${{ inputs.server_image || 'ubuntu-26.04' }}
+          enabled_services: ${{ inputs.enabled_services }}
+          server_type: ${{ vars.SERVER_TYPE }}
+          server_location: ${{ vars.SERVER_LOCATION }}
+          hetzner_s3_location: ${{ vars.HETZNER_S3_LOCATION }}
+          enable_forgejo_service_token: ${{ vars.ENABLE_FORGEJO_SERVICE_TOKEN }}
+          domain: ${{ secrets.DOMAIN }}
+          cloudflare_api_token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          cloudflare_account_id: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          tf_var_admin_email: ${{ secrets.TF_VAR_admin_email }}
+          tf_var_user_email: ${{ secrets.TF_VAR_user_email }}
+          tf_var_guest_emails: ${{ secrets.TF_VAR_guest_emails }}
+          subdomain_separator: ${{ secrets.SUBDOMAIN_SEPARATOR }}
+          dockerhub_username: ${{ secrets.DOCKERHUB_USERNAME }}
+          dockerhub_token: ${{ secrets.DOCKERHUB_TOKEN }}
+          hetzner_object_storage_server: ${{ secrets.HETZNER_OBJECT_STORAGE_SERVER }}
+
+      - name: Select Hetzner capacity
+        # Issue #536: Hetzner sells out of specific server-type /
+        # location combinations during capacity crunches; a single-
+        # pair config.tfvars then fails ``tofu apply`` with
+        # ``resource_unavailable``. This step queries the Hetzner
+        # Cloud API (``/v1/server_types`` to resolve type names to
+        # internal IDs, then ``/v1/datacenters`` for per-DC live
+        # availability keyed by those IDs) BEFORE tofu runs and
+        # picks the first available pair from the operator-provided
+        # preference list (vars.SERVER_PREFERENCES → config.tfvars's
+        # server_preferences key → legacy single-pair shorthand →
+        # built-in default). Rewrites server_type+server_location
+        # in config.tfvars in place. Soft-skips with a warning when
+        # HCLOUD_TOKEN is not available; hard-fails the workflow
+        # only when every preference is genuinely out of stock.
+        env:
+          HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
+          SERVER_PREFERENCES: ${{ vars.SERVER_PREFERENCES }}
+          MIN_DISK_GB: ${{ inputs.min_disk_gb }}
+          ARCH: ${{ inputs.arch }}
+        run: |
+          # A snapshot is architecture-locked and needs a target disk at
+          # least as large as the image's, so the snapshot path narrows
+          # the preference walk. Both empty on the normal path, where
+          # the flags are omitted and behaviour is unchanged.
+          #
+          # Read from env, never interpolated into the script: these are
+          # workflow inputs, so a value containing quotes or newlines
+          # would otherwise break the script constructing the argv. The
+          # regexes then constrain them to what the CLI can accept —
+          # a bad value fails here by name rather than as an argparse
+          # error three steps later.
+          EXTRA=""
+          if [ -n "$MIN_DISK_GB" ]; then
+            if ! printf '%s' "$MIN_DISK_GB" | grep -qE '^[0-9]{1,5}$'; then
+              echo "❌ min_disk_gb must be a plain integer, got '$MIN_DISK_GB'"
+              exit 1
+            fi
+            EXTRA="$EXTRA --min-disk-gb $MIN_DISK_GB"
+          fi
+          if [ -n "$ARCH" ]; then
+            if ! printf '%s' "$ARCH" | grep -qE '^[a-z0-9]{1,16}$'; then
+              echo "❌ arch must be lowercase alphanumeric, got '$ARCH'"
+              exit 1
+            fi
+            EXTRA="$EXTRA --arch $ARCH"
+          fi
+
+          # EXTRA now holds only regex-checked tokens and must word-split
+          # into separate flags, so it is deliberately unquoted.
+          # shellcheck disable=SC2086
+          uv run --quiet --project "$GITHUB_WORKSPACE" \
+            python -m nexus_deploy select-capacity \
+              --tfvars tofu/stack/config.tfvars $EXTRA
+
+      - name: Initialize OpenTofu
+        run: |
+          cd tofu/stack
+          source ../.r2-credentials
+          export AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
+          export AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
+          tofu init -backend-config=../backend.hcl
+
+      - name: Apply infrastructure
+        run: |
+          cd tofu/stack
+          source ../.r2-credentials
+          export AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
+          export AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
+          tofu init -backend-config=../backend.hcl -reconfigure >/dev/null 2>&1 || true
+          tofu apply -var-file=config.tfvars -auto-approve
+
+      - name: Open SSH port temporarily
+        run: |
+          cd tofu/stack
+          source ../.r2-credentials
+          export AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
+          export AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
+
+          SERVER_ID=$(tofu output -raw server_id)
+          FIREWALL_ID=$(tofu output -raw ssh_firewall_id)
+
+          echo "Attaching SSH firewall (ID: $FIREWALL_ID) to server (ID: $SERVER_ID)..."
+
+          HTTP_STATUS=$(curl -s -o /tmp/attach_response.txt -w "%{http_code}" -X POST \
+            -H "Authorization: Bearer $TF_VAR_hcloud_token" \
+            -H "Content-Type: application/json" \
+            -d "{\"apply_to\":[{\"type\":\"server\",\"server\":{\"id\":$SERVER_ID}}]}" \
+            "https://api.hetzner.cloud/v1/firewalls/$FIREWALL_ID/actions/apply_to_resources")
+
+          if [ "$HTTP_STATUS" -ge 200 ] && [ "$HTTP_STATUS" -lt 300 ]; then
+            echo "✅ SSH firewall attached - port 22 open for tunnel installation"
+          else
+            echo "❌ Failed to attach firewall (HTTP $HTTP_STATUS)"
+            cat /tmp/attach_response.txt
+            exit 1
+          fi
+
+      - name: Install Cloudflare Tunnel via SSH
+        run: |
+          cd tofu/stack
+          source ../.r2-credentials
+          export AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
+          export AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
+
+          SERVER_IP=$(tofu output -raw server_ip)
+          TUNNEL_TOKEN=$(tofu output -raw tunnel_token)
+          echo "::add-mask::$TUNNEL_TOKEN"
+
+          echo "Waiting for SSH + cloud-init on $SERVER_IP..."
+          # Race fix (2026-05-11): the old loop only probed bare SSH
+          # responsiveness via `echo 'SSH ready'`. sshd comes up
+          # within ~10s of boot, BUT cloud-init's apt-get update +
+          # docker install + apt-get install fail2ban etc. keeps the
+          # system busy for another 60-180s. The first SSH worked
+          # because `echo` is trivial; the second SSH (which streams
+          # an install script via stdin) then hit a banner-exchange
+          # timeout because sshd was too busy answering the new
+          # connection mid-apt.
+          #
+          # New gate: probe for the cloud-init completion marker
+          # `/opt/docker-server/.setup-complete` (touched as the very
+          # last line of the user_data script in tofu/stack/main.tf).
+          # That guarantees:
+          #   (a) sshd is up (test -f runs over SSH, so SSH worked),
+          #   (b) cloud-init's heavy lifting has finished (`docker
+          #       installed, fail2ban running, etc.),
+          #   (c) the second SSH connection won't compete with apt
+          #       for I/O.
+          # Bumped to 6 minutes — cloud-init's apt-get upgrade -y can
+          # take 4-5 min on a fresh Ubuntu image when there's
+          # a kernel update.
+          for i in {1..72}; do
+            if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o BatchMode=yes \
+              root@"$SERVER_IP" "test -f /run/nexus-setup-complete || { test -f /opt/docker-server/.setup-complete && systemctl is-active --quiet docker; }" 2>/dev/null; then
+              echo "✅ SSH ready + host provisioned (attempt $i)"
+              break
+            fi
+            if [ "$i" -eq 72 ]; then
+              echo "❌ cloud-init did not complete after 6 minutes"
+              echo "   Last attempt to surface diagnostic:"
+              ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o BatchMode=yes \
+                root@"$SERVER_IP" \
+                "cloud-init status; tail -50 /var/log/cloud-init-output.log" 2>&1 || true
+              exit 1
+            fi
+            sleep 5
+          done
+
+          echo "Installing Cloudflare Tunnel on $SERVER_IP..."
+
+          # Write tunnel install script.
+          # NOTE: `cloud-init status --wait` here is a defence-in-depth
+          # — the readiness gate above ALREADY waited for the
+          # completion marker, but cloud-init internally may still be
+          # tracking a few late finalization steps. The wait is a
+          # near-no-op in practice.
+          cat > /tmp/install-tunnel.sh << SCRIPT
+          #!/bin/bash
+          set -e
+          cloud-init status --wait || true
+          echo 'Installing/updating Cloudflare Tunnel...'
+          systemctl stop cloudflared 2>/dev/null || true
+          # Uninstall existing service if present (idempotent re-run safety).
+          if systemctl list-unit-files | grep -q cloudflared.service; then
+            echo 'Uninstalling existing cloudflared service...'
+            cloudflared service uninstall 2>/dev/null || true
+          fi
+          cloudflared service install $TUNNEL_TOKEN
+          systemctl enable cloudflared
+          systemctl start cloudflared
+          sleep 3
+          systemctl status cloudflared --no-pager || echo 'Warning: Tunnel service status check failed'
+          echo 'Tunnel started successfully!'
+          SCRIPT
+          sed -i 's/^          //' /tmp/install-tunnel.sh
+
+          # Retry the install-tunnel SSH up to 6 times, with the
+          # connect timeout and the gap both escalating — schedule below.
+          # Belt-and-suspenders: even with the readiness gate above, a
+          # banner-exchange timeout can still happen on slow Hetzner
+          # cold-starts (sshd reloading host keys, fail2ban tightening
+          # filters mid-flight, etc.). The install script is fully
+          # idempotent (stops + uninstalls cloudflared first), so a
+          # half-completed run + retry is safe.
+          #
+          # ESCALATING timeout, not a flat 60s. The common failure is
+          # sshd not answering yet on a freshly booted server, and it
+          # clears within seconds — measured on run 32733248894, where
+          # attempt 1 burned the full 60s ConnectTimeout plus a 20s
+          # sleep, and attempt 2 then succeeded in ~12s. Eighty seconds
+          # spent on a problem that had already resolved.
+          #
+          # A short first probe finds that case immediately; the budget
+          # is spent on later attempts where a long timeout might
+          # actually be the difference. Worst case is comparable to the
+          # old flat form (~5 min vs ~6 min), but the COMMON case drops
+          # from ~80s to ~15s.
+          #
+          # Restores make this more likely, not less: the server is
+          # ready sooner, so the pipeline knocks earlier.
+          for attempt in {1..6}; do
+            # 10, 20, 30, 45, 60, 60
+            case $attempt in
+              1) connect_timeout=10; backoff=5  ;;
+              2) connect_timeout=20; backoff=10 ;;
+              3) connect_timeout=30; backoff=15 ;;
+              4) connect_timeout=45; backoff=20 ;;
+              *) connect_timeout=60; backoff=20 ;;
+            esac
+            # ConnectTimeout covers the TCP connect and the banner
+            # exchange only. Once the session is up the install runs
+            # unbounded, so a short value here cannot truncate the work.
+            # BatchMode=yes, as on the readiness probes above. Without it
+            # a failed key auth falls back to an interactive password
+            # prompt, which reads from stdin — and stdin here IS the
+            # install script. ssh would swallow it as a password attempt
+            # instead of running it, and the retry loop would keep
+            # feeding a consumed script to a prompt nobody can answer.
+            attempt_started=$SECONDS
+            if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=$connect_timeout \
+                 -o ServerAliveInterval=10 -o BatchMode=yes \
+                 root@"$SERVER_IP" bash < /tmp/install-tunnel.sh; then
+              echo "✅ Cloudflare Tunnel installed on attempt $attempt"
+              break
+            fi
+            if [ "$attempt" -eq 6 ]; then
+              echo "❌ Tunnel install failed after 6 attempts — server unreachable or sshd misbehaving"
+              exit 1
+            fi
+            # Report the MEASURED duration, not the configured timeout.
+            # They differ in the case that matters: a refused connection
+            # or an unreachable host fails in well under a second, while
+            # a banner timeout runs the clock out. Printing the limit
+            # would make both look identical and send whoever reads this
+            # looking for a slow server when the server said no.
+            elapsed=$((SECONDS - attempt_started))
+            echo "⚠️  Attempt $attempt failed after ${elapsed}s (timeout was ${connect_timeout}s); retrying in ${backoff}s..."
+            sleep $backoff
+          done
+          rm -f /tmp/install-tunnel.sh
+
+      - name: Close SSH port
+        if: always()
+        run: |
+          cd tofu/stack
+          if [ -f ../.r2-credentials ]; then
+            source ../.r2-credentials
+            export AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
+            export AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
+
+            SERVER_ID=$(tofu output -raw server_id 2>/dev/null || true)
+            FIREWALL_ID=$(tofu output -raw ssh_firewall_id 2>/dev/null || true)
+            # Validate IDs are numeric (tofu wrapper may write ::error:: to stdout)
+            [[ "$SERVER_ID" =~ ^[0-9]+$ ]] || SERVER_ID=""
+            [[ "$FIREWALL_ID" =~ ^[0-9]+$ ]] || FIREWALL_ID=""
+
+            if [ -n "$SERVER_ID" ] && [ -n "$FIREWALL_ID" ]; then
+              echo "Detaching SSH firewall (ID: $FIREWALL_ID) from server (ID: $SERVER_ID)..."
+
+              HTTP_STATUS=$(curl -s -o /tmp/detach_response.txt -w "%{http_code}" -X POST \
+                -H "Authorization: Bearer $TF_VAR_hcloud_token" \
+                -H "Content-Type: application/json" \
+                -d "{\"remove_from\":[{\"type\":\"server\",\"server\":{\"id\":$SERVER_ID}}]}" \
+                "https://api.hetzner.cloud/v1/firewalls/$FIREWALL_ID/actions/remove_from_resources")
+
+              if [ "$HTTP_STATUS" -ge 200 ] && [ "$HTTP_STATUS" -lt 300 ]; then
+                echo "✅ SSH firewall detached - port 22 closed"
+              else
+                echo "⚠️ Failed to detach firewall (HTTP $HTTP_STATUS) - may already be detached"
+                cat /tmp/detach_response.txt
+                # Don't fail - firewall might already be detached
+              fi
+            else
+              echo "⚠️ Could not get server/firewall IDs - skipping detach"
+            fi
+          else
+            echo "⚠️ R2 credentials not available - skipping SSH cleanup"
+          fi
+
+      - name: Deploy stacks
+        # Phase 4c (#505): replaced ./scripts/deploy.sh with the
+        # Python pipeline. Everything that was in deploy.sh now lives
+        # in nexus_deploy.pipeline.run_pipeline (R2 creds, tofu reads,
+        # tfvars parse, ssh setup, orchestrator phases, done banner).
+        #
+        # RFC 0001 cutover: the S3-persistence env vars below switch
+        # the spinup-side restore from a no-op into the active path —
+        # restore_from_s3 reads them, pulls snapshots/latest.txt from
+        # R2, and seeds /mnt/nexus-data BEFORE docker compose comes
+        # up. Mirrors the teardown.yml wiring; both ends of the cycle
+        # see the same 7-var env. With the flag on (default since
+        # this PR), the Hetzner volume is no longer used at all.
+        env:
+          SSH_PRIVATE_KEY_CONTENT: ${{ secrets.SSH_PRIVATE_KEY || inputs.ssh_private_key }}
+          GH_MIRROR_TOKEN: ${{ secrets.GH_MIRROR_TOKEN }}
+          GH_MIRROR_REPOS: ${{ secrets.GH_MIRROR_REPOS }}
+          DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USER }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          # Feature flag — exact "true" opts in. The `|| 'true'`
+          # fallback means an unset secret still resolves to "true",
+          # so every spinup uses S3 persistence by default. To bypass
+          # (e.g. for an experiment), set the secret EXPLICITLY to a
+          # non-"true" value like "false"; just unsetting it leaves
+          # the default on.
+          # Snapshot restores pass 'false': the disk already holds data
+          # newer than R2, and restoring on top would silently revert the
+          # stack by one cycle. Empty everywhere else, so the secret (and
+          # its 'true' default) still decides.
+          NEXUS_S3_PERSISTENCE: ${{ inputs.s3_persistence || secrets.NEXUS_S3_PERSISTENCE || 'true' }}
+          # R2 persistence-bucket coords. ALL derived from already-
+          # existing secrets — no new operator-set secret needed:
+          #   - endpoint   = https://<CF account>.r2.cloudflarestorage.com
+          #   - region     = "auto" (R2 ignores region)
+          #   - bucket     = nexus-<domain-slug>-persistence (created
+          #                  idempotently by setup-control-plane.yaml,
+          #                  named the same way the data-bucket is)
+          # R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY are the same creds
+          # the Tofu state backend already uses (unified token set up
+          # by init-r2-state.sh).
+          PERSISTENCE_S3_ENDPOINT: https://${{ secrets.CLOUDFLARE_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          PERSISTENCE_S3_REGION: auto
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          # Manifest fields — bucket-name slug + release tag.
+          # PERSISTENCE_STACK_SLUG: workflow override → repo name fallback.
+          # PERSISTENCE_TEMPLATE_VERSION: github.ref_name (the running ref).
+          PERSISTENCE_STACK_SLUG: ${{ secrets.PERSISTENCE_STACK_SLUG || github.event.repository.name }}
+          PERSISTENCE_TEMPLATE_VERSION: ${{ github.ref_name }}
+          # Issue #607 — optional centralised monitoring (Nexus-Conductor #23).
+          # Both secrets are written by Conductor's `setup` operation when a
+          # stack is enrolled in the central monitoring tier. When unset (every
+          # standalone Nexus-Stack), the grafana renderer emits a no-op
+          # prometheus.yml and Prometheus runs exactly as before. TENANT_ID
+          # defaults to the stack's DOMAIN in the renderer when empty — Conductor
+          # may pin a different value if it wants per-class buckets or similar.
+          MONITORING_ENDPOINT: ${{ secrets.MONITORING_ENDPOINT }}
+          MONITORING_TOKEN: ${{ secrets.MONITORING_TOKEN }}
+          TENANT_ID: ${{ secrets.TENANT_ID }}
+        run: |
+          # Say which data this run starts from, before anything else.
+          #
+          # restore_from_s3 skips silently when the flag is off — by design,
+          # so a stack that never opted into persistence does not print a
+          # line every deploy. That silence is wrong for the opposite case:
+          # an operator who deliberately asked for an empty start gets no
+          # confirmation, and one who did not gets no warning that a
+          # snapshot is about to be applied. Both are the confusion behind
+          # #750, where a "First-Time Deploy" restored a two-day-old
+          # snapshot and the log said nothing about the choice.
+          #
+          # This states the decision without claiming the outcome: whether
+          # a snapshot exists in R2 is not known until the restore phase
+          # looks, and asserting it here would be a claim this step cannot
+          # check.
+          if [ "$NEXUS_S3_PERSISTENCE" = "true" ]; then
+            echo "♻️  S3 persistence is on: if R2 holds a snapshot, this run restores it."
+            echo "    Pass fresh_start (initial-setup) or s3_persistence=false (spin-up)"
+            echo "    to start empty instead."
+          else
+            # "R2 snapshot", not "snapshot". spin-up-snapshot.yml calls this
+            # same workflow with a Hetzner disk image as server_image and
+            # s3_persistence=false, because the disk carries newer data than
+            # R2 does. An unqualified "no snapshot will be restored" would
+            # print in the middle of a run that is restoring one.
+            echo "🧹 S3 persistence is off for this run: no R2 snapshot will be restored."
+            echo "    This says nothing about a Hetzner disk image — a snapshot"
+            echo "    spin-up restores that separately, and switches this off on"
+            echo "    purpose because the disk is the newer copy."
+            echo "    Anything already in R2 is left untouched. This flag does not"
+            echo "    reach teardown: that side reads the NEXUS_S3_PERSISTENCE"
+            echo "    repository secret, so whether it snapshots is unchanged by"
+            echo "    this run — not necessarily yes."
+          fi
+
+          # Derive PERSISTENCE_S3_BUCKET inline — YAML expressions
+          # can't `tr '.' '-'` but bash can. Same convention as the
+          # data bucket (nexus-<domain-slug>-data) → persistence
+          # bucket is nexus-<domain-slug>-persistence. The bucket
+          # itself is created by setup-control-plane.yaml.
+          DOMAIN_SLUG=$(echo "${{ secrets.DOMAIN }}" | tr '.' '-')
+          export PERSISTENCE_S3_BUCKET="nexus-${DOMAIN_SLUG}-persistence"
+
+          # Lowercase PERSISTENCE_STACK_SLUG — the env-var value
+          # falls back to github.event.repository.name (e.g.
+          # "Nexus-Stack" with capital N), but the s3_persistence
+          # validator enforces S3 bucket-name shape on the slug
+          # (lowercase only). GitHub Actions has no lowercase
+          # filter on workflow-expression interpolations, so the
+          # cast happens here in the shell. Restore today doesn't
+          # validate stack_slug so this would only surface on
+          # teardown — but keeping the two sides symmetric is
+          # cheap insurance.
+          PERSISTENCE_STACK_SLUG=$(echo "$PERSISTENCE_STACK_SLUG" | tr '[:upper:]' '[:lower:]')
+          export PERSISTENCE_STACK_SLUG
+
+          uv run --quiet --project "$GITHUB_WORKSPACE" \
+            python -m nexus_deploy run-pipeline
+
+          # Read Infisical credentials from server for use in later steps
+          echo "  Reading Infisical credentials from server..."
+          ssh nexus "cat /opt/docker-server/.infisical-token 2>/dev/null" > /tmp/infisical-token || true
+          ssh nexus "cat /opt/docker-server/.infisical-project-id 2>/dev/null" > /tmp/infisical-project-id || true
+          echo "  Infisical token: $([ -s /tmp/infisical-token ] && echo 'found' || echo 'not found')"
+          echo "  Infisical project ID: $([ -s /tmp/infisical-project-id ] && echo 'found' || echo 'not found')"
+
+      - name: Write infrastructure config to D1
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          DOMAIN: ${{ secrets.DOMAIN }}
+        run: |
+          echo "📝 Writing infrastructure config to D1..."
+
+          # Get D1 database name from control-plane state
+          cd tofu/control-plane
+          source ../.r2-credentials
+          export AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
+          export AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
+
+          # Initialize control-plane state to read D1 database name
+          tofu init -backend-config=../backend.hcl >/dev/null 2>&1 || true
+          D1_DATABASE_NAME=$(tofu output -raw d1_database_name 2>/dev/null || echo "")
+          cd ../..
+
+          if [ -z "$D1_DATABASE_NAME" ]; then
+            echo "⚠️  Could not get D1 database name - skipping config write"
+            exit 0
+          fi
+
+          # Read what was actually provisioned, not what was requested.
+          # `select-capacity` rewrites server_type / server_location in
+          # config.tfvars when the preferred pair is sold out — a repo
+          # variable cannot reflect that, so the panel would keep showing
+          # the preference while the box was something else. The tfvars
+          # file is the only place that knows the outcome.
+          TFVARS=tofu/stack/config.tfvars
+          SERVER_TYPE=""
+          SERVER_LOCATION=""
+          # Readability is checked rather than left to sed. Today a missing
+          # file happens to be survivable: the step runs under GitHub's
+          # default `bash -e` without pipefail, so `sed ... | head -1`
+          # carries head's zero status and the fallback below is reached.
+          # That is an accident of the pipe, not a decision — adding
+          # `set -o pipefail` later would silently turn the fallback into
+          # dead code. The guard makes the intent explicit and keeps sed's
+          # "No such file" out of the log.
+          if [ -r "$TFVARS" ]; then
+            SERVER_TYPE=$(sed -n 's/^[[:space:]]*server_type[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$TFVARS" | head -1)
+            SERVER_LOCATION=$(sed -n 's/^[[:space:]]*server_location[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$TFVARS" | head -1)
+          else
+            echo "⚠️  $TFVARS is not readable — the panel will show what was requested, not what was provisioned"
+          fi
+          # Fall back to the request only if the file could not be read — an
+          # approximate value beats an empty panel, but say so. Both values
+          # warn: capacity selection rewrites the location as readily as the
+          # type, so a silent fallback there is just as misleading.
+          if [ -z "$SERVER_TYPE" ]; then
+            echo "⚠️  Could not read server_type from $TFVARS — falling back to the requested value"
+            SERVER_TYPE="${{ vars.SERVER_TYPE || 'cx43' }}"
+          fi
+          if [ -z "$SERVER_LOCATION" ]; then
+            echo "⚠️  Could not read server_location from $TFVARS — falling back to the requested value"
+            SERVER_LOCATION="${{ vars.SERVER_LOCATION || 'hel1' }}"
+          fi
+
+          # Escape values for safe SQL insertion (single quotes doubled)
+          ESCAPED_SERVER_TYPE=${SERVER_TYPE//\'/\'\'}
+          ESCAPED_SERVER_LOCATION=${SERVER_LOCATION//\'/\'\'}
+          ESCAPED_DOMAIN=${DOMAIN//\'/\'\'}
+
+          # Host facts, in one round trip. Best-effort by construction:
+          # the panel is a convenience and a broken ssh must not fail a
+          # deploy that otherwise worked. A failure here leaves the
+          # previous values in D1 rather than blanking them — a stale
+          # reading is more useful than none, and the panel shows when
+          # each value was written.
+          #
+          # The OS is read from the box rather than from server_image
+          # because under the snapshot lifecycle that variable holds a
+          # Hetzner snapshot ID (e.g. 423792562), which is not an OS name.
+          # Reading /etc/os-release works under either lifecycle with no
+          # special-casing.
+          HOST_OS=""
+          HOST_DISK=""
+          HOST_DOCKER=""
+          # The remote script is single-quoted on purpose: $PRETTY_NAME and
+          # the command substitutions must be evaluated by the shell on the
+          # server, not by this one. Double quotes would expand them here,
+          # against the runner's empty environment, and ship three blanks.
+          # shellcheck disable=SC2016
+          if HOST_FACTS=$(timeout 60 ssh -o BatchMode=yes -o ConnectTimeout=15 nexus \
+                '. /etc/os-release 2>/dev/null && printf "OS=%s\n" "$PRETTY_NAME";
+                 printf "DISK=%s\n" "$(df -BG --output=size / 2>/dev/null | tail -1 | tr -d " G")";
+                 printf "DOCKER=%s\n" "$(docker --version 2>/dev/null | sed -n "s/^Docker version \([^,]*\),.*/\1/p")"' 2>/dev/null); then
+            HOST_OS=$(printf '%s' "$HOST_FACTS" | sed -n 's/^OS=//p' | head -1)
+            HOST_DISK=$(printf '%s' "$HOST_FACTS" | sed -n 's/^DISK=//p' | head -1)
+            HOST_DOCKER=$(printf '%s' "$HOST_FACTS" | sed -n 's/^DOCKER=//p' | head -1)
+            echo "🖥️  Host: ${HOST_OS:-?} · ${HOST_DISK:-?} GB disk · Docker ${HOST_DOCKER:-?}"
+          else
+            echo "⚠️  Could not read host facts over ssh — keeping the previous values in D1"
+          fi
+
+          # Write config to D1
+          npx wrangler@4.129.0 d1 execute "$D1_DATABASE_NAME" --remote --command "INSERT OR REPLACE INTO config (key, value, updated_at) VALUES ('server_type', '$ESCAPED_SERVER_TYPE', datetime('now'))"
+          npx wrangler@4.129.0 d1 execute "$D1_DATABASE_NAME" --remote --command "INSERT OR REPLACE INTO config (key, value, updated_at) VALUES ('server_location', '$ESCAPED_SERVER_LOCATION', datetime('now'))"
+          npx wrangler@4.129.0 d1 execute "$D1_DATABASE_NAME" --remote --command "INSERT OR REPLACE INTO config (key, value, updated_at) VALUES ('domain', '$ESCAPED_DOMAIN', datetime('now'))"
+          npx wrangler@4.129.0 d1 execute "$D1_DATABASE_NAME" --remote --command "INSERT OR REPLACE INTO config (key, value, updated_at) VALUES ('last_spin_up', datetime('now'), datetime('now'))"
+
+          # Only write what was actually read. An empty string would
+          # replace a good previous reading with a blank field.
+          for pair in "host_os:$HOST_OS" "host_disk_gb:$HOST_DISK" "host_docker:$HOST_DOCKER"; do
+            key=${pair%%:*}
+            value=${pair#*:}
+            [ -n "$value" ] || continue
+            escaped=${value//\'/\'\'}
+            npx wrangler@4.129.0 d1 execute "$D1_DATABASE_NAME" --remote --command "INSERT OR REPLACE INTO config (key, value, updated_at) VALUES ('$key', '$escaped', datetime('now'))"
+          done
+
+          if [ "${{ inputs.silent_mode }}" = "true" ]; then
+            npx wrangler@4.129.0 d1 execute "$D1_DATABASE_NAME" --remote --command "INSERT OR REPLACE INTO config (key, value, updated_at) VALUES ('silent_mode', 'true', datetime('now'))"
+            echo "🔇 Silent mode enabled - automated emails suppressed"
+          fi
+
+          echo "✅ Infrastructure config written to D1"
+
+      - name: Log infrastructure provisioned
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          DOMAIN: ${{ secrets.DOMAIN }}
+        run: |
+          # Get container status for logging
+          CONTAINER_COUNT=$(cd tofu/stack && source ../.r2-credentials && export AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID" && export AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY" && tofu output -json enabled_services 2>/dev/null | jq 'length' || echo "0")
+          if [ -f .github/scripts/log-to-d1.sh ]; then
+            .github/scripts/log-to-d1.sh info "Infrastructure deployed" "{\"containers\":$CONTAINER_COUNT}"
+          fi
+
+      - name: Store credentials as Cloudflare Secrets
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          DOMAIN: ${{ secrets.DOMAIN }}
+        run: |
+          echo "📦 Storing credentials as Cloudflare Secrets..."
+
+          cd tofu/stack
+          source ../.r2-credentials
+          export AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
+          export AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
+
+          # Get secrets from OpenTofu output (for email credentials feature)
+          SECRETS_JSON=$(tofu output -json secrets 2>/dev/null || echo "{}")
+
+          # Get Pages project name from control-plane state
+          cd ../control-plane
+          tofu init -backend-config=../backend.hcl >/dev/null 2>&1 || true
+          PAGES_PROJECT=$(tofu output -raw pages_project_name 2>/dev/null || echo "")
+          cd ../..
+
+          if [ -z "$PAGES_PROJECT" ]; then
+            echo "⚠️  Pages project name not found - skipping credential storage"
+            exit 0
+          fi
+
+          # Store CREDENTIALS_JSON for email credentials feature (send-credentials.js)
+          if [ "$SECRETS_JSON" != "{}" ]; then
+            # Three keys are dropped deliberately. This bundle is stored as a
+            # Pages secret for send-credentials.js, whose subject is credentials
+            # a human logs in with. All three are machine-to-machine and have no
+            # consumer in the bundle:
+            #
+            #   forgejo_runner_secret — the deploy pipeline takes it from the
+            #     tofu output and the runner container from its rendered .env.
+            #     Kept out of Infisical for the same reason; without this line
+            #     that exclusion would simply be undone here.
+            #   forgejo_service_token_{id,secret} — the operator reads them from
+            #     Infisical and copies them into the management plane's secret
+            #     store. Nothing reads them from here.
+            #
+            # On what send-credentials.js does with this bundle: it interpolates
+            # `credentials.infisical_admin_password` and nothing else, then points
+            # at Infisical for the rest. So reaching this bundle is not the same as
+            # being emailed — an earlier version of this comment said it was, and a
+            # reviewer reasonably drew the wrong conclusion from it. The bundle is
+            # still a Pages secret, and a credential nothing reads from it does not
+            # belong in it.
+            CREDENTIALS=$(echo "$SECRETS_JSON" | jq -c 'del(.forgejo_runner_secret, .forgejo_service_token_id, .forgejo_service_token_secret) | to_entries | map(select(.value != null and .value != "")) | from_entries')
+            if echo "$CREDENTIALS" | npx wrangler@4.129.0 pages secret put CREDENTIALS_JSON --project-name "$PAGES_PROJECT" 2>/dev/null; then
+              echo "  ✅ CREDENTIALS_JSON stored"
+            else
+              echo "  ⚠️  Failed to store CREDENTIALS_JSON"
+            fi
+          fi
+
+          # Store Infisical token + project ID for live Secrets page
+          # Both were read from server before SSH port was closed (see Deploy stacks step)
+          INFISICAL_TOKEN_VALUE=$(cat /tmp/infisical-token 2>/dev/null || echo "")
+          INFISICAL_PROJECT_ID=$(cat /tmp/infisical-project-id 2>/dev/null || echo "")
+
+          if [ -n "$INFISICAL_TOKEN_VALUE" ] && [ -n "$INFISICAL_PROJECT_ID" ]; then
+            echo "$INFISICAL_TOKEN_VALUE" | npx wrangler@4.129.0 pages secret put INFISICAL_TOKEN --project-name "$PAGES_PROJECT" 2>/dev/null && \
+              echo "  ✅ INFISICAL_TOKEN stored" || echo "  ⚠️  Failed to store INFISICAL_TOKEN"
+
+            echo "$INFISICAL_PROJECT_ID" | npx wrangler@4.129.0 pages secret put INFISICAL_PROJECT_ID --project-name "$PAGES_PROJECT" 2>/dev/null && \
+              echo "  ✅ INFISICAL_PROJECT_ID stored" || echo "  ⚠️  Failed to store INFISICAL_PROJECT_ID"
+          else
+            echo "  ⚠️  Infisical token or project ID not available - Secrets page will not work"
+          fi
+
+          # Store Infisical CF Access Service Token for server-to-server API calls
+          cd tofu/stack
+          INFISICAL_ST_JSON=$(tofu output -json infisical_service_token 2>/dev/null || echo "{}")
+          INFISICAL_CF_CLIENT_ID=$(echo "$INFISICAL_ST_JSON" | jq -r '.client_id // empty')
+          INFISICAL_CF_CLIENT_SECRET=$(echo "$INFISICAL_ST_JSON" | jq -r '.client_secret // empty')
+          cd ../..
+
+          if [ -n "$INFISICAL_CF_CLIENT_ID" ] && [ -n "$INFISICAL_CF_CLIENT_SECRET" ]; then
+            echo "$INFISICAL_CF_CLIENT_ID" | npx wrangler@4.129.0 pages secret put CF_ACCESS_CLIENT_ID --project-name "$PAGES_PROJECT" 2>/dev/null && \
+              echo "  ✅ CF_ACCESS_CLIENT_ID stored" || echo "  ⚠️  Failed to store CF_ACCESS_CLIENT_ID"
+
+            echo "$INFISICAL_CF_CLIENT_SECRET" | npx wrangler@4.129.0 pages secret put CF_ACCESS_CLIENT_SECRET --project-name "$PAGES_PROJECT" 2>/dev/null && \
+              echo "  ✅ CF_ACCESS_CLIENT_SECRET stored" || echo "  ⚠️  Failed to store CF_ACCESS_CLIENT_SECRET"
+          else
+            echo "  ⚠️  Infisical service token not available - Secrets page may not work if Cloudflare Access blocks API calls"
+          fi
+
+          echo "✅ Credentials stored"
+          if [ -f .github/scripts/log-to-d1.sh ]; then
+            .github/scripts/log-to-d1.sh info "Credentials stored in Cloudflare Secrets"
+          fi
+
+      - name: Redeploy Control Plane to activate secrets
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          # Baked into the page by `npm run build` below. Passed as env
+          # rather than interpolated into the command, so the value is
+          # data to bash instead of text substituted before bash reads it.
+          # Unset means the panel looks exactly as it always has.
+          STACK_LABEL: ${{ vars.STACK_LABEL }}
+          STACK_ACCENT: ${{ vars.STACK_ACCENT }}
+        run: |
+          echo "🔄 Redeploying Control Plane to activate new secrets..."
+
+          cd tofu/control-plane
+          source ../.r2-credentials
+          export AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
+          export AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
+          D1_DATABASE_ID=$(tofu output -raw d1_database_id 2>/dev/null || echo "")
+          KV_NAMESPACE_ID=$(tofu output -raw kv_namespace_id 2>/dev/null || echo "")
+          PAGES_PROJECT=$(tofu output -raw pages_project_name 2>/dev/null || echo "")
+          cd ../..
+
+          if [ -z "$PAGES_PROJECT" ] || [ -z "$D1_DATABASE_ID" ]; then
+            echo "⚠️  Could not get Pages project info - skipping redeploy"
+            exit 0
+          fi
+
+          cd control-plane
+
+          # Build Astro frontend
+          npm ci
+          npm run build
+
+          # Copy functions into dist/ for Cloudflare Pages deployment
+          cp -r functions dist/functions
+
+          # Generate wrangler.toml with D1 + KV bindings
+          cat > wrangler.toml << EOF
+          name = "$PAGES_PROJECT"
+          compatibility_date = "2024-01-01"
+          pages_build_output_dir = "dist"
+
+          [[d1_databases]]
+          binding = "NEXUS_DB"
+          database_id = "$D1_DATABASE_ID"
+          EOF
+
+          if [ -n "$KV_NAMESPACE_ID" ]; then
+            cat >> wrangler.toml << EOF
+
+          [[kv_namespaces]]
+          binding = "NEXUS_KV"
+          id = "$KV_NAMESPACE_ID"
+          EOF
+          fi
+
+          sed -i 's/^          //' wrangler.toml
+
+          # Redeploy to production (with retry for Cloudflare API timeouts)
+          # --commit-message prevents UTF-8 issues with git commit messages
+          DEPLOY_OK=false
+          for ATTEMPT in 1 2 3; do
+            DEPLOY_OUTPUT=$(npx wrangler@4.129.0 pages deploy dist \
+              --project-name="$PAGES_PROJECT" \
+              --branch=main \
+              --commit-dirty=true \
+              --commit-message="Redeploy with secrets" 2>&1) && {
+              DEPLOY_OK=true
+              break
+            }
+            echo "$DEPLOY_OUTPUT"
+            if echo "$DEPLOY_OUTPUT" | grep -q "504\|Gateway Timeout\|upstream request timeout"; then
+              if [ "$ATTEMPT" -lt 3 ]; then
+                echo "⚠️  Cloudflare timeout on attempt $ATTEMPT - retrying in 15s..."
+                sleep 15
+              fi
+            else
+              echo "❌ Deploy failed (non-timeout error) - not retrying"
+              break
+            fi
+          done
+
+          rm wrangler.toml
+
+          if [ "$DEPLOY_OK" = "true" ]; then
+            echo "✅ Control Plane redeployed with new secrets!"
+          else
+            echo "❌ Control Plane redeploy failed after 3 attempts"
+            exit 1
+          fi
+
+      - name: Collect debug logs
+        if: always()
+        run: |
+          echo "📋 Collecting debug logs..."
+          if [ -f /tmp/debug.log ]; then
+            mkdir -p .cursor
+            cp /tmp/debug.log .cursor/debug.log
+            echo "✅ Debug logs saved to .cursor/debug.log"
+            echo "--- Debug Log Contents ---"
+            cat .cursor/debug.log || true
+          fi
+          if [ -f /tmp/docker-start.log ]; then
+            echo "--- Docker Start Log ---"
+            cat /tmp/docker-start.log || true
+          fi
+
+      # Runs after the deploy, so a failure here means "the deploy
+      # finished and something is not answering" — never "the deploy
+      # failed". It therefore does not fail the job: the server is up,
+      # and one silent side service should not look like a broken
+      # spin-up. Failures surface as annotations instead, the same way
+      # degraded phases have since #688.
+      - name: Check services answer
+        if: inputs.smoke_check
+        continue-on-error: true
+        env:
+          # Single-quoted on the way in so THIS shell does not touch it —
+          # every expansion below belongs to the shell on the server.
+          #
+          # `docker ps -a`, not `docker ps`: a container that crashed on
+          # boot is no longer running, so listing only running containers
+          # would hide the exact condition this step exists to catch.
+          #
+          # The port is taken from any `<addr>:<port>-><cport>` binding
+          # rather than `0.0.0.0:` alone — Docker also publishes on
+          # `[::]:` and, where a compose file says so, on `127.0.0.1:`.
+          # Matching one address form silently skipped the others.
+          #
+          # Every published host port is probed, not just the first. Three
+          # stacks publish several — garage, risingwave, seaweedfs — and
+          # RisingWave shows why it matters: its first port is the Postgres
+          # wire protocol and its dashboard is on the second, so stopping at
+          # the first would have left the dashboard permanently unchecked.
+          # Ports are deduplicated because Docker lists the same one twice
+          # when it binds both 0.0.0.0 and [::].
+          #
+          # docker's stderr is deliberately NOT suppressed: if the daemon is
+          # down, that message travels back over the ssh channel and lands in
+          # the captured stderr, which is the difference between reporting
+          # "docker failed" and inventing "no containers".
+          #
+          # The HTTP code alone cannot tell a dead port from a healthy
+          # non-HTTP one: both report 000. The decisive signal is
+          # %{time_connect}, which is exactly zero when no TCP handshake
+          # completed — stripping "." and "0" from it leaves an empty string
+          # in precisely that case. Measured:
+          #
+          #   nothing listening       rc=7   time_connect=0.000000
+          #   listening, non-HTTP     rc=1   time_connect=0.000535
+          #   listening, then silent  rc=52  time_connect=0.000542
+          #   unroutable, hangs       rc=28  time_connect=0.000000
+          #
+          # The exit code alone would misfile the last row, because 28 occurs
+          # both when the handshake never completed and when a connected peer
+          # goes quiet. This matters because the
+          # generated docker-compose.firewall.yml publishes the tcp_ports from
+          # services.yaml — Postgres 5432, Redpanda 9092, ClickHouse 9004,
+          # SFTP 2022 and more — so without this a dozen healthy databases
+          # would be reported as broken on every run.
+          #
+          # The whole loop is inside `{ ...; wait; }` so that `wait` runs
+          # in the same subshell that spawned the probes. A pipeline's
+          # right-hand side is its own subshell; a `wait` placed after
+          # `done` belongs to the parent and would not wait for anything,
+          # leaving the probes orphaned and their output lost.
+          # shellcheck disable=SC2016
+          REMOTE_PROBE: 'docker ps -a --format "{{.Names}}\t{{.State}}\t{{.Status}}\t{{.Ports}}" | { while IFS="$(printf "\t")" read -r n st stat pts; do case "$st" in running) ;; restarting) printf "%s\t-\tRESTARTING\n" "$n"; continue ;; exited) printf "%s\t-\tEXITED:%s\n" "$n" "$(printf "%s" "$stat" | grep -oE "\([0-9]+\)" | tr -cd "0-9")"; continue ;; *) printf "%s\t-\tSTATE:%s\n" "$n" "$st"; continue ;; esac; plist=$(printf "%s" "$pts" | grep -oE ":[0-9]+->" | sed "s/[^0-9]//g" | sort -un); if [ -z "$plist" ]; then printf "%s\t-\tNOPORT\n" "$n"; else for pt in $plist; do ( o=$(curl -s -o /dev/null -w "%{http_code} %{time_connect}" --max-time 4 "http://localhost:$pt/" 2>/dev/null); rc=$?; c=${o%% *}; tc=$(printf "%s" "${o##* }" | tr -d ".0"); if [ "$rc" = "0" ]; then printf "%s\t%s\t%s\n" "$n" "$pt" "${c:-000}"; elif [ -z "$tc" ]; then printf "%s\t%s\tDEAD\n" "$n" "$pt"; elif [ "$rc" = "28" ]; then printf "%s\t%s\tHUNG\n" "$n" "$pt"; else printf "%s\t%s\tNOHTTP:%s\n" "$n" "$pt" "$rc"; fi ) & done; fi; done; wait; }'
+        run: |
+          set -uo pipefail
+
+          # Container state comes from Docker rather than services.yaml:
+          # the YAML says what should have been bound, Docker reports what
+          # was. A disagreement between the two is exactly the defect
+          # worth catching, and consulting the YAML would hide it.
+          #
+          # Probes run ON the server and in parallel, so wall-clock is the
+          # slowest single probe rather than their sum. That matters when
+          # things are broken: twenty dead services sequentially at
+          # --max-time 4 would cost 80s; in parallel it stays at 4.
+          #
+          # Status and output are kept apart: an empty report has three
+          # possible causes and the annotation must not guess which.
+          SSH_FAILED=0
+          REPORT=""
+          if ! REPORT=$(ssh -o BatchMode=yes -o ConnectTimeout=15 nexus "$REMOTE_PROBE" 2>/tmp/smoke-ssh.err); then
+            SSH_FAILED=1
+          fi
+
+          if [ "$SSH_FAILED" -ne 0 ]; then
+            # ssh exits non-zero both when the connection fails and when the
+            # remote command does, and this step cannot tell which. Saying
+            # "could not reach the server" would be a guess. Newlines are
+            # folded out because a multi-line ::warning payload silently
+            # truncates at the first one.
+            SSH_ERR=$(tr '\n\r' '  ' < /tmp/smoke-ssh.err 2>/dev/null | head -c 300)
+            echo "::warning title=smoke-check::No service check ran: ssh exited non-zero, which means either the server was unreachable or the probe itself failed on it. stderr: ${SSH_ERR:-(empty)}"
+            exit 0
+          fi
+
+          if [ -z "$REPORT" ]; then
+            # ssh succeeded but nothing came back. `docker ps` keeps its
+            # stderr now, so if the daemon is down its message is in the
+            # captured file — quote it rather than assert an empty list.
+            EMPTY_ERR=$(tr '\n\r' '  ' < /tmp/smoke-ssh.err 2>/dev/null | head -c 300)
+            echo "::warning title=smoke-check::The server was reachable but the probe returned nothing. Docker reported: ${EMPTY_ERR:-(nothing on stderr, so it genuinely listed no containers)}"
+            exit 0
+          fi
+
+          healthy=0; faulty=0; quiet=0
+          while IFS="$(printf '\t')" read -r name port code; do
+            [ -n "$name" ] || continue
+            case "$code" in
+              # Any HTTP status means the application answered. A 401 or
+              # 403 is a service that is up and wants a login — success,
+              # not a failure. Only refused connections and 5xx are faults.
+              2??|3??|4??)
+                healthy=$((healthy + 1))
+                printf '  ok    %-26s :%-6s %s\n' "$name" "$port" "$code"
+                ;;
+              NOPORT)
+                quiet=$((quiet + 1))
+                printf '  --    %-26s %-7s no published port (internal-only)\n' "$name" ""
+                ;;
+              # A one-shot container that finished cleanly. The stacks do
+              # contain these (lakekeeper-bootstrap, openmetadata-migrate),
+              # so a zero exit is the job being done, not a failure.
+              EXITED:0)
+                quiet=$((quiet + 1))
+                printf '  --    %-26s %-7s ran once and exited cleanly\n' "$name" ""
+                ;;
+              EXITED:*)
+                faulty=$((faulty + 1))
+                printf '  FAIL  %-26s %-7s %s\n' "$name" "" "$code"
+                echo "::warning title=smoke-check: $name::Container exited with a non-zero status (${code#EXITED:}). The deploy finished; this service is not running."
+                ;;
+              RESTARTING)
+                faulty=$((faulty + 1))
+                printf '  FAIL  %-26s %-7s restart loop\n' "$name" ""
+                echo "::warning title=smoke-check: $name::Container is in a restart loop — it starts, fails, and is restarted. Check its logs for the crash reason."
+                ;;
+              # A listener that answered something other than HTTP. Healthy
+              # by every measure this step can take: the port accepted the
+              # connection. Databases, brokers and SFTP land here.
+              NOHTTP:*)
+                quiet=$((quiet + 1))
+                printf '  --    %-26s :%-6s listening, not an HTTP service\n' "$name" "$port"
+                ;;
+              # Connected, then nothing for the whole timeout. Every non-HTTP
+              # service on this box answers or closes immediately, so a peer
+              # that accepts and goes quiet is anomalous rather than exotic.
+              # Reported as what was observed, without naming a cause.
+              HUNG)
+                faulty=$((faulty + 1))
+                printf '  FAIL  %-26s :%-6s accepted, then silent\n' "$name" "$port"
+                echo "::warning title=smoke-check: $name::Port $port accepted the connection and then sent nothing for 4s. Something is listening but not responding."
+                ;;
+              # Nothing accepted the connection (curl exit 7). The container
+              # runs but the process inside never started listening.
+              DEAD)
+                faulty=$((faulty + 1))
+                printf '  FAIL  %-26s :%-6s nothing listening\n' "$name" "$port"
+                echo "::warning title=smoke-check: $name::Container is running but nothing is listening on port $port. The deploy finished; this service did not come up."
+                ;;
+              # The service answered — it is up, and it is erroring. A
+              # different problem from silence, so a different message.
+              5??)
+                faulty=$((faulty + 1))
+                printf '  FAIL  %-26s :%-6s %s\n' "$name" "$port" "$code"
+                echo "::warning title=smoke-check: $name::Answered with HTTP $code on port $port, so the process is up but failing — usually a bad config or an unreachable dependency."
+                ;;
+              # created / paused / dead. Never normal after a deploy, but
+              # the state is all this step knows — it must not claim a
+              # port was probed when none was.
+              STATE:*)
+                faulty=$((faulty + 1))
+                printf '  FAIL  %-26s %-7s %s\n' "$name" "" "$code"
+                echo "::warning title=smoke-check: $name::Container is in Docker state '${code#STATE:}', neither running nor cleanly exited. No port was probed."
+                ;;
+              # Everything above is accounted for, so this is a result the
+              # probe did not anticipate. Report it as unclassified rather
+              # than assert a cause.
+              *)
+                faulty=$((faulty + 1))
+                printf '  FAIL  %-26s :%-6s %s\n' "$name" "$port" "$code"
+                echo "::warning title=smoke-check: $name::Unclassified probe result '$code' on port $port. This is a gap in the check rather than a diagnosis — please report it."
+                ;;
+            esac
+          done <<< "$REPORT"
+
+          echo ""
+          echo "[smoke] $healthy answering HTTP, $faulty faulty, $quiet with no HTTP endpoint to check"
+
+      - name: Show spin-up info
+        run: |
+          echo ""
+          echo "✅ Spin-up complete!"
+          echo ""
+          echo "📋 Control Panel: https://control.${{ secrets.DOMAIN }}"
+          echo "   (Manage services, view URLs, and access settings)"
+          echo ""
+
+      - name: Sync deployed state to D1
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          DOMAIN: ${{ secrets.DOMAIN }}
+        run: |
+          # Sync deployed = enabled in D1 after successful deployment
+          if [ -f .github/scripts/sync-deployed-state.sh ]; then
+            .github/scripts/sync-deployed-state.sh
+          fi
+
+      - name: Log spin-up completed
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          DOMAIN: ${{ secrets.DOMAIN }}
+        run: |
+          if [ -f .github/scripts/log-to-d1.sh ]; then
+            .github/scripts/log-to-d1.sh info "Spin-up workflow completed successfully"
+          fi
+
+      - name: Send stack online email via Resend
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          ADMIN_EMAIL: ${{ secrets.TF_VAR_admin_email }}
+          USER_EMAIL: ${{ secrets.TF_VAR_user_email }}
+          DOMAIN: ${{ secrets.DOMAIN }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          if [ -n "$RESEND_API_KEY" ]; then
+            D1_DB_NAME="nexus-${DOMAIN//./-}-db"
+
+            # Check if silent mode is enabled (suppresses all automated emails)
+            SILENT_MODE=$(npx wrangler@4.129.0 d1 execute "$D1_DB_NAME" --remote --json \
+              --command "SELECT value FROM config WHERE key = 'silent_mode'" 2>/dev/null \
+              | jq -r '.[0].results[0].value // "false"' 2>/dev/null || echo "false")
+            if [ "$SILENT_MODE" = "true" ]; then
+              echo "🔇 Silent mode enabled - skipping stack online email"
+              exit 0
+            fi
+
+            # Check if stack-online email is enabled in D1
+            NOTIFY_ON_SPINUP=$(npx wrangler@4.129.0 d1 execute "$D1_DB_NAME" --remote --json \
+              --command "SELECT value FROM config WHERE key = 'notify_on_spinup'" 2>/dev/null \
+              | jq -r '.[0].results[0].value // "true"' 2>/dev/null || echo "true")
+            if [ "$NOTIFY_ON_SPINUP" != "true" ]; then
+              echo "📧 Stack online email disabled by user - skipping"
+              exit 0
+            fi
+
+            echo "📧 Sending stack online email..."
+
+            EMAIL_HTML='<div style="font-family:monospace;background:#0a0a0f;color:#00ff88;padding:20px"><h1 style="color:#00ff88">✅ Nexus-Stack is Online</h1><p>Your stack is back online at <strong>DOMAIN_PLACEHOLDER</strong></p><h2>🔗 Quick Links</h2><ul><li><a href="https://control.DOMAIN_PLACEHOLDER" style="color:#00ff88">Control Panel</a> - Manage services &amp; view URLs</li></ul><p style="color:#999;font-size:12px;margin-top:1rem">Need credentials? Click "Send Credentials" in the Control Panel.</p></div>'
+
+            EMAIL_HTML="${EMAIL_HTML//DOMAIN_PLACEHOLDER/$DOMAIN}"
+
+            # Build email: User as primary recipient, Admin in CC
+            if [ -n "$USER_EMAIL" ]; then
+              JSON_PAYLOAD=$(jq -n \
+                --arg from "Nexus-Stack <nexus@$DOMAIN>" \
+                --arg to "$USER_EMAIL" \
+                --arg cc "$ADMIN_EMAIL" \
+                --arg subject "✅ Nexus-Stack Online" \
+                --arg html "$EMAIL_HTML" \
+                '{from: $from, to: [$to], cc: [$cc], subject: $subject, html: $html}')
+            else
+              JSON_PAYLOAD=$(jq -n \
+                --arg from "Nexus-Stack <nexus@$DOMAIN>" \
+                --arg to "$ADMIN_EMAIL" \
+                --arg subject "✅ Nexus-Stack Online" \
+                --arg html "$EMAIL_HTML" \
+                '{from: $from, to: [$to], subject: $subject, html: $html}')
+            fi
+
+            HTTP_STATUS=$(curl -s -o /tmp/resend_response.txt -w "%{http_code}" -X POST 'https://api.resend.com/emails' \
+              -H "Authorization: Bearer $RESEND_API_KEY" \
+              -H "Content-Type: application/json" \
+              -d "$JSON_PAYLOAD")
+
+            if [ "$HTTP_STATUS" -ge 200 ] && [ "$HTTP_STATUS" -lt 300 ]; then
+              if [ -n "$USER_EMAIL" ]; then
+                echo "✅ Stack online email sent to $USER_EMAIL (cc: $ADMIN_EMAIL)"
+              else
+                echo "✅ Stack online email sent to $ADMIN_EMAIL"
+              fi
+            else
+              echo "⚠️  Failed to send email (HTTP $HTTP_STATUS) - spin-up continues"
+              cat /tmp/resend_response.txt 2>/dev/null || true
+            fi
+          else
+            echo "⚠️  RESEND_API_KEY not configured - skipping email"
+          fi

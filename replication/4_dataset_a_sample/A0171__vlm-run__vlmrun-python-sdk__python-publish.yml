@@ -1,0 +1,138 @@
+name: Python Publish
+
+on:
+  push:
+    paths:
+      - "vlmrun/version.py"
+    branches:
+      - main
+
+env:
+  CACHE_NUMBER: 1 # increase to reset cache manually
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: dev
+    steps:
+      - name: Checkout git repo
+        uses: actions/checkout@v3
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/uv
+            ~/.cache/pip
+          key: uv-py310-${{ hashFiles('pyproject.toml') }}-${{ hashFiles('MANIFEST.in') }}-${{ env.CACHE_NUMBER }}
+          restore-keys: |
+            uv-py310-
+
+      - name: Install dependencies
+        run: |
+          pip install uv
+          uv pip install --system -e '.[test,all]'
+
+      - name: Quality Check
+        uses: pre-commit/action@v3.0.1
+        continue-on-error: true
+
+      - name: Run tests
+        run: |
+          make test
+
+  publish:
+    name: Publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: prod
+    needs: test
+    steps:
+      - name: Checkout git repo
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GH_TOKEN }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/uv
+            ~/.cache/pip
+          key: uv-${{ hashFiles('pyproject.toml') }}-${{ hashFiles('MANIFEST.in') }}-${{ env.CACHE_NUMBER }}
+          restore-keys: |
+            uv-
+
+      - name: Install dependencies
+        run: |
+          pip install uv
+          uv pip install --system -e '.[test,build,all]'
+
+      - name: Bump version
+        if: success()
+        run: |
+          version=$(grep -oP '__version__ = "\K[^"]+' vlmrun/version.py)
+          echo "Current version: ${version}"
+          echo "VERSION=${version}" >> $GITHUB_ENV
+
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+
+          git tag -a "v${version}" -m "Version ${version}"
+          git push origin main
+          git push origin "v${version}"
+
+      - name: Build package
+        run: |
+          python -m build
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_TOKEN }}
+
+      - name: Notify Slack on Success
+        if: success()
+        uses: slackapi/slack-github-action@v2.0.0
+        with:
+          webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload: |
+            {
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":white_check_mark: :python: *vlmrun-python-sdk v${{ env.VERSION }} Published to PyPI*\n\n*Version:* `v${{ env.VERSION }}`\n*Commit:* <${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}|${{ github.sha }}>"
+                  }
+                }
+              ]
+            }
+
+      - name: Notify Slack on Failure
+        if: failure()
+        uses: slackapi/slack-github-action@v2.0.0
+        with:
+          webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload: |
+            {
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":x: :python: *vlmrun-python-sdk Publish Failed*\n\n*Tag:* `${{ github.ref_name }}`\n*Workflow:* <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Run>"
+                  }
+                }
+              ]
+            }

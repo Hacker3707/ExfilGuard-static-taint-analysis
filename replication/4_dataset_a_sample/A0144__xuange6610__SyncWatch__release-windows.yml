@@ -1,0 +1,615 @@
+name: Build Windows and Android release artifacts
+
+on:
+  workflow_call:
+    inputs:
+      phase:
+        description: android, base, or full
+        required: true
+        type: string
+      tag:
+        required: true
+        type: string
+      version:
+        required: true
+        type: string
+      commit_sha:
+        required: true
+        type: string
+      source_tree:
+        required: true
+        type: string
+      artifact_prefix:
+        required: true
+        type: string
+      node_mobile_runtime_run_id:
+        required: false
+        default: ''
+        type: string
+      node_mobile_runtime_artifact_name:
+        required: false
+        default: ''
+        type: string
+    secrets:
+      android_keystore_base64:
+        required: false
+      android_key_properties_base64:
+        required: false
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  validate:
+    name: Validate immutable Windows build inputs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate caller inputs
+        shell: bash
+        env:
+          RELEASE_PHASE: ${{ inputs.phase }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_VERSION: ${{ inputs.version }}
+          RELEASE_COMMIT: ${{ inputs.commit_sha }}
+          RELEASE_TREE: ${{ inputs.source_tree }}
+          NODE_MOBILE_RUNTIME_RUN_ID: ${{ inputs.node_mobile_runtime_run_id }}
+          NODE_MOBILE_RUNTIME_ARTIFACT_NAME: ${{ inputs.node_mobile_runtime_artifact_name }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_PHASE" =~ ^(android|base|full)$ ]]
+          [[ "$RELEASE_TAG" == "v${RELEASE_VERSION}" ]]
+          [[ "$RELEASE_COMMIT" =~ ^[a-f0-9]{40}$ ]]
+          [[ "$RELEASE_TREE" =~ ^[a-f0-9]{40}$ ]]
+          if [[ -n "$NODE_MOBILE_RUNTIME_RUN_ID" || -n "$NODE_MOBILE_RUNTIME_ARTIFACT_NAME" ]]; then
+            [[ "$RELEASE_PHASE" == "android" ]]
+            [[ "$NODE_MOBILE_RUNTIME_RUN_ID" =~ ^[0-9]+$ ]]
+            [[ "$NODE_MOBILE_RUNTIME_ARTIFACT_NAME" =~ ^[A-Za-z0-9._-]+$ ]]
+          fi
+
+  node_mobile_build:
+    name: Build official Node.js Mobile 16 KB runtime (${{ matrix.target_arch }})
+    if: inputs.phase == 'android' && inputs.node_mobile_runtime_run_id == ''
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        target_arch: [arm, arm64, x86_64]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout pinned Node.js Mobile source
+        uses: actions/checkout@v4
+        with:
+          repository: nodejs-mobile/nodejs-mobile
+          ref: ff4e063f1f1911047c067335ad0a3d81336236ca
+          fetch-depth: 1
+      - name: Install build utils
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y gcc-multilib g++-multilib
+      - name: Setup Android NDK
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r24
+          add-to-path: false
+      - name: Build pinned 16 KB Node.js Mobile library
+        shell: bash
+        env:
+          MY_ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          TARGET_ARCH: ${{ matrix.target_arch }}
+          LDFLAGS: -Wl,-z,max-page-size=16384
+        run: |
+          set -euo pipefail
+          ./tools/android_build.sh "$MY_ANDROID_NDK_HOME" 24 "$TARGET_ARCH"
+          rm -rf ./out_android/libnode
+          test -s "./out_android/$(case "$TARGET_ARCH" in arm) echo armeabi-v7a;; arm64) echo arm64-v8a;; x86_64) echo x86_64;; esac)/libnode.so"
+      - name: Upload Node.js Mobile ABI candidate
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact_prefix }}-node-mobile-${{ matrix.target_arch }}
+          path: out_android
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 3
+
+  node_mobile_combine:
+    name: Combine official Node.js Mobile 16 KB runtime
+    if: ${{ always() && inputs.phase == 'android' && needs.validate.result == 'success' && (inputs.node_mobile_runtime_run_id != '' || needs.node_mobile_build.result == 'success') }}
+    needs: [validate, node_mobile_build]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout pinned Node.js Mobile source
+        if: inputs.node_mobile_runtime_run_id == ''
+        uses: actions/checkout@v4
+        with:
+          repository: nodejs-mobile/nodejs-mobile
+          ref: ff4e063f1f1911047c067335ad0a3d81336236ca
+          fetch-depth: 1
+      - name: Download previously built pinned Node.js Mobile runtime
+        if: inputs.node_mobile_runtime_run_id != ''
+        uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.node_mobile_runtime_run_id }}
+          name: ${{ inputs.node_mobile_runtime_artifact_name }}
+          path: node-mobile-runtime
+      - name: Download Node.js Mobile ABI candidates
+        if: inputs.node_mobile_runtime_run_id == ''
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ${{ inputs.artifact_prefix }}-node-mobile-*
+          path: out_android
+          merge-multiple: true
+      - name: Assemble runtime and provenance
+        if: inputs.node_mobile_runtime_run_id == ''
+        shell: bash
+        env:
+          RELEASE_SOURCE_REVISION: ff4e063f1f1911047c067335ad0a3d81336236ca
+        run: |
+          set -euo pipefail
+          test -s out_android/arm64-v8a/libnode.so
+          test -s out_android/armeabi-v7a/libnode.so
+          test -s out_android/x86_64/libnode.so
+          ./configure
+          rm -rf node-mobile-runtime
+          mkdir -p node-mobile-runtime/bin node-mobile-runtime/include
+          cp -R out_android/* node-mobile-runtime/bin/
+          ./tools/copy_libnode_headers.sh android
+          cp -R out_android/libnode/include/* node-mobile-runtime/include/
+          test -s node-mobile-runtime/include/node/node.h
+          sha256sum node-mobile-runtime/bin/*/libnode.so > node-mobile-runtime/libnode-sha256.txt
+          printf '{"schema":"nodejs-mobile-runtime-v1","sourceRepository":"https://github.com/nodejs-mobile/nodejs-mobile","sourceRevision":"%s","pageSize":16384}\n' "$RELEASE_SOURCE_REVISION" > node-mobile-runtime/provenance.json
+      - name: Verify pinned runtime provenance and exact digests
+        shell: bash
+        env:
+          EXPECTED_SOURCE_REVISION: ff4e063f1f1911047c067335ad0a3d81336236ca
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          actual = json.loads(Path('node-mobile-runtime/provenance.json').read_text(encoding='utf-8'))
+          expected = {
+              'schema': 'nodejs-mobile-runtime-v1',
+              'sourceRepository': 'https://github.com/nodejs-mobile/nodejs-mobile',
+              'sourceRevision': os.environ['EXPECTED_SOURCE_REVISION'],
+              'pageSize': 16384,
+          }
+          if actual != expected or type(actual.get('pageSize')) is not int:
+              raise SystemExit(f'Node.js Mobile provenance mismatch: {actual!r}')
+          print('Node.js Mobile provenance: OK')
+          PY
+          printf '%s  %s\n' \
+            '6b7970057e8382e6e8cabeecb8637929054c28d168c3755cb1160b0062fac4c9' 'node-mobile-runtime/include/node/node.h' \
+            | sha256sum --check --strict
+          test "$(find node-mobile-runtime/bin -mindepth 2 -maxdepth 2 -type f -name libnode.so | wc -l | tr -d ' ')" = "3"
+          sha256sum --check --strict node-mobile-runtime/libnode-sha256.txt
+          for so in node-mobile-runtime/bin/*/libnode.so; do
+            alignments=$(readelf -lW "$so" | awk '$1 == "LOAD" { print $NF }')
+            test -n "$alignments"
+            if printf '%s\n' "$alignments" | grep -qv '^0x4000$'; then
+              echo "Unexpected ELF LOAD alignment in $so: $alignments" >&2
+              exit 1
+            fi
+          done
+      - name: Upload combined Node.js Mobile runtime
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact_prefix }}-node-mobile-runtime
+          path: node-mobile-runtime
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 3
+
+  android:
+    name: Build signed Android artifact
+    # The optional node_mobile_build matrix is intentionally skipped when a
+    # previously verified runtime is supplied. Keep the signing job eligible
+    # in that case instead of inheriting the skipped matrix dependency.
+    if: ${{ always() && inputs.phase == 'android' && needs.validate.result == 'success' && needs.node_mobile_combine.result == 'success' }}
+    needs: [validate, node_mobile_combine]
+    runs-on: windows-2022
+    timeout-minutes: 75
+    env:
+      RELEASE_VERSION: ${{ inputs.version }}
+      RELEASE_COMMIT: ${{ inputs.commit_sha }}
+      RELEASE_TREE: ${{ inputs.source_tree }}
+      ARTIFACT_PREFIX: ${{ inputs.artifact_prefix }}
+      SYNCWATCH_ALLOW_GENERATED_NODE_MOBILE: '1'
+    steps:
+      - name: Checkout immutable source commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit_sha }}
+          fetch-depth: 0
+      - name: Verify source commit and tree
+        shell: pwsh
+        run: |
+          if ((git rev-parse HEAD).Trim() -ne $env:RELEASE_COMMIT) { throw 'Android checkout commit mismatch.' }
+          if ((git rev-parse 'HEAD^{tree}').Trim() -ne $env:RELEASE_TREE) { throw 'Android checkout tree mismatch.' }
+      - name: Setup Java 17 for Android Gradle Plugin
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.19.0
+          cache: npm
+      - name: Install locked dependencies
+        run: npm ci --no-audit --no-fund
+      - name: Download official Node.js Mobile 16 KB runtime
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.artifact_prefix }}-node-mobile-runtime
+          path: mobile/app/libnode
+      - name: Verify downloaded Node.js Mobile runtime
+        shell: pwsh
+        run: |
+          if (-not (Test-Path -LiteralPath .\mobile\app\libnode\bin\arm64-v8a\libnode.so -PathType Leaf)) { throw 'Missing arm64-v8a Node.js Mobile runtime.' }
+          if (-not (Test-Path -LiteralPath .\mobile\app\libnode\bin\armeabi-v7a\libnode.so -PathType Leaf)) { throw 'Missing armeabi-v7a Node.js Mobile runtime.' }
+          if (-not (Test-Path -LiteralPath .\mobile\app\libnode\bin\x86_64\libnode.so -PathType Leaf)) { throw 'Missing x86_64 Node.js Mobile runtime.' }
+          if (-not (Test-Path -LiteralPath .\mobile\app\libnode\include\node\node.h -PathType Leaf)) { throw 'Missing Node.js Mobile headers.' }
+      - name: Restore ephemeral Android release signing material
+        shell: pwsh
+        env:
+          KEYSTORE_BASE64: ${{ secrets.android_keystore_base64 }}
+          KEY_PROPERTIES_BASE64: ${{ secrets.android_key_properties_base64 }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:KEYSTORE_BASE64) -or [string]::IsNullOrWhiteSpace($env:KEY_PROPERTIES_BASE64)) {
+            throw 'Android release signing secrets are required.'
+          }
+          New-Item -ItemType Directory -Force -Path .\mobile\.keys | Out-Null
+          [IO.File]::WriteAllBytes((Join-Path $PWD 'mobile\.keys\syncwatch-release.jks'), [Convert]::FromBase64String($env:KEYSTORE_BASE64))
+          [IO.File]::WriteAllBytes((Join-Path $PWD 'mobile\.keys\release.properties'), [Convert]::FromBase64String($env:KEY_PROPERTIES_BASE64))
+      - name: Build and verify signed Android artifact
+        shell: pwsh
+        run: |
+          & .\mobile\build-apk.ps1
+          $buildExitCode = $LASTEXITCODE
+          Set-Location -LiteralPath $env:GITHUB_WORKSPACE
+          if ($buildExitCode -ne 0) { throw 'Android release build failed.' }
+          $apk = ".\dist\SyncWatch-Android-v$env:RELEASE_VERSION-universal.apk"
+          if (-not (Test-Path -LiteralPath $apk -PathType Leaf)) { throw "Missing exact Android output: $apk" }
+          node tests/android-package.test.js $apk
+          if ($LASTEXITCODE -ne 0) { throw 'Android package verification failed.' }
+          node scripts/release-candidate-gate.js --selection android --version $env:RELEASE_VERSION --directory .\dist --evidence .\.build\evidence\android.json --source-commit $env:RELEASE_COMMIT --source-tree $env:RELEASE_TREE --run-id $env:GITHUB_RUN_ID --run-attempt $env:GITHUB_RUN_ATTEMPT
+          if ($LASTEXITCODE -ne 0) { throw 'Android release gate failed.' }
+      - name: Remove ephemeral Android signing material
+        if: always()
+        shell: pwsh
+        run: Remove-Item -LiteralPath .\mobile\.keys -Recurse -Force -ErrorAction SilentlyContinue
+      - name: Upload Android candidate artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact_prefix }}-android
+          path: dist/SyncWatch-Android-v${{ inputs.version }}-universal.apk
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 3
+      - name: Upload Android build evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact_prefix }}-evidence-android
+          path: .build/evidence/android.json
+          if-no-files-found: error
+          retention-days: 3
+
+  android_startup:
+    name: Install and launch Android artifact in an emulator
+    if: ${{ always() && inputs.phase == 'android' && needs.validate.result == 'success' && needs.android.result == 'success' }}
+    needs: [validate, android]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    env:
+      RELEASE_VERSION: ${{ inputs.version }}
+      RELEASE_COMMIT: ${{ inputs.commit_sha }}
+      RELEASE_TREE: ${{ inputs.source_tree }}
+    steps:
+      - name: Checkout immutable source commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit_sha }}
+          fetch-depth: 0
+      - name: Verify source commit and tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$RELEASE_COMMIT"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$RELEASE_TREE"
+      - name: Download same-run signed Android artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.artifact_prefix }}-android
+          path: .build/android-smoke
+      - name: Install, launch, and verify Android release APK
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          emulator-boot-timeout: 900
+          disable-animations: false
+          pre-emulator-launch-script: bash scripts/android-emulator-prepare.sh
+          script: bash scripts/android-emulator-smoke.sh
+      - name: Preserve Android startup evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact_prefix }}-android-startup-evidence
+          path: |
+            .build/android-smoke/activities.txt
+            .build/android-smoke/crash-log.txt
+            .build/android-smoke/launch.txt
+            .build/android-smoke/startup.png
+          if-no-files-found: warn
+          retention-days: 30
+
+  base:
+    name: Build Windows base artifacts
+    if: inputs.phase == 'base'
+    needs: validate
+    runs-on: windows-2022
+    timeout-minutes: 60
+    env:
+      RELEASE_VERSION: ${{ inputs.version }}
+      RELEASE_COMMIT: ${{ inputs.commit_sha }}
+      RELEASE_TREE: ${{ inputs.source_tree }}
+    steps:
+      - name: Checkout immutable source commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit_sha }}
+          fetch-depth: 0
+      - name: Verify source commit and tree
+        shell: pwsh
+        run: |
+          if ((git rev-parse HEAD).Trim() -ne $env:RELEASE_COMMIT) { throw 'Windows base checkout commit mismatch.' }
+          if ((git rev-parse 'HEAD^{tree}').Trim() -ne $env:RELEASE_TREE) { throw 'Windows base checkout tree mismatch.' }
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.19.0
+          cache: npm
+      - name: Install locked package manager
+        run: npm install --global pnpm@11.9.0
+      - name: Install locked dependencies
+        run: npm ci --no-audit --no-fund
+      - name: Restore verified third-party release cache
+        uses: actions/cache@v4
+        with:
+          path: .cache/release-third-party
+          key: syncwatch-third-party-${{ hashFiles('scripts/release-third-party-assets.js') }}
+          restore-keys: |
+            syncwatch-third-party-
+      - name: Download same-run verified official assets
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.artifact_prefix }}-official
+          path: .cache/release-third-party
+      - name: Prepare pinned Cloudflare Tunnel binary
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          node scripts/release-third-party-assets.js --output .\.build\embedded-cloudflared --cache-directory .\.cache\release-third-party --only cloudflared-windows-x64.exe
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned cloudflared verification failed.' }
+          New-Item -ItemType Directory -Force -Path .\vendor | Out-Null
+          Copy-Item -LiteralPath .\.build\embedded-cloudflared\cloudflared-windows-x64.exe -Destination .\vendor\cloudflared.exe
+      - name: Verify Windows desktop audio capture
+        shell: pwsh
+        env:
+          # Hosted Windows runners can lack an audio output device. The smoke
+          # still requires desktop video capture; local and self-hosted runs
+          # continue to require a real loopback audio track.
+          SYNCWATCH_ALLOW_MISSING_AUDIO_LOOPBACK: '1'
+        run: |
+          npm run test:audio-source:electron
+          if ($LASTEXITCODE -ne 0) { throw 'Windows desktop audio capture smoke failed.' }
+      - name: Verify Windows broken-pipe shutdown handling
+        shell: pwsh
+        run: |
+          node tests/epipe-smoke.js
+          if ($LASTEXITCODE -ne 0) { throw 'Windows broken-pipe shutdown smoke failed.' }
+      - name: Verify source and desktop contracts
+        shell: pwsh
+        run: |
+          npm run test:privacy
+          node tests/server-package-contract.test.js
+          node tests/desktop-release-contract.test.js
+          node tests/cloudflared-bundle.test.js
+      - name: Build Windows base artifacts
+        shell: pwsh
+        run: |
+          npm run build:client -- --publish never
+          if ($LASTEXITCODE -ne 0) { throw 'Windows Experience build failed.' }
+      - name: Launch and verify Windows base artifacts
+        shell: pwsh
+        run: |
+          $client = ".\dist\SyncWatch-Experience-Client-Portable-v$env:RELEASE_VERSION-x64.exe"
+          $profile = Join-Path $env:RUNNER_TEMP 'syncwatch-client-smoke'
+          $process = Start-Process -FilePath $client -ArgumentList "--user-data-dir=$profile" -PassThru -WindowStyle Hidden
+          Start-Sleep -Seconds 12
+          if ($process.HasExited) { throw "Windows Experience client exited during startup smoke ($($process.ExitCode))." }
+          taskkill.exe /PID $process.Id /T /F | Out-Null
+          npm run test:privacy:release
+          Remove-Item -Path .\dist\*.blockmap, .\dist\latest*.yml, .\dist\builder-debug.yml -Force -ErrorAction SilentlyContinue
+          node scripts/release-candidate-gate.js --selection windows-base --version $env:RELEASE_VERSION --directory .\dist --evidence .\.build\evidence\windows-base.json --source-commit $env:RELEASE_COMMIT --source-tree $env:RELEASE_TREE --run-id $env:GITHUB_RUN_ID --run-attempt $env:GITHUB_RUN_ATTEMPT
+          if ($LASTEXITCODE -ne 0) { throw 'Windows base release gate failed.' }
+      - name: Upload Windows base candidate artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact_prefix }}-windows-base
+          path: |
+            dist/SyncWatch-Experience-Client-Portable-v${{ inputs.version }}-x64.exe
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 3
+      - name: Upload Windows base build evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact_prefix }}-evidence-windows-base
+          path: .build/evidence/windows-base.json
+          if-no-files-found: error
+          retention-days: 3
+
+  full:
+    name: Build Windows Full Offline artifacts
+    if: inputs.phase == 'full'
+    needs: validate
+    runs-on: windows-2022
+    timeout-minutes: 120
+    env:
+      RELEASE_VERSION: ${{ inputs.version }}
+      RELEASE_COMMIT: ${{ inputs.commit_sha }}
+      RELEASE_TREE: ${{ inputs.source_tree }}
+    steps:
+      - name: Checkout immutable source commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit_sha }}
+          fetch-depth: 0
+      - name: Verify source commit and tree
+        shell: pwsh
+        run: |
+          if ((git rev-parse HEAD).Trim() -ne $env:RELEASE_COMMIT) { throw 'Windows Full checkout commit mismatch.' }
+          if ((git rev-parse 'HEAD^{tree}').Trim() -ne $env:RELEASE_TREE) { throw 'Windows Full checkout tree mismatch.' }
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.19.0
+          cache: npm
+      - name: Install locked package manager
+        run: npm install --global pnpm@11.9.0
+      - name: Install locked dependencies
+        run: npm ci --no-audit --no-fund
+      - name: Restore verified third-party release cache
+        uses: actions/cache@v4
+        with:
+          path: .cache/release-third-party
+          key: syncwatch-third-party-${{ hashFiles('scripts/release-third-party-assets.js') }}
+          restore-keys: |
+            syncwatch-third-party-
+      - name: Restore same-run verified official asset cache
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.artifact_prefix }}-official
+          path: .cache/release-third-party
+      - name: Prepare pinned Cloudflare Tunnel binary
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          node scripts/release-third-party-assets.js --output .\.build\embedded-cloudflared --cache-directory .\.cache\release-third-party --only cloudflared-windows-x64.exe
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned cloudflared verification failed.' }
+          New-Item -ItemType Directory -Force -Path .\vendor | Out-Null
+          Copy-Item -LiteralPath .\.build\embedded-cloudflared\cloudflared-windows-x64.exe -Destination .\vendor\cloudflared.exe
+      - name: Download same-run base artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.artifact_prefix }}-windows-base
+          path: .build/full-inputs/windows
+      - name: Download same-run Android artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.artifact_prefix }}-android
+          path: .build/full-inputs/android
+      - name: Verify Full Offline inputs and source contracts
+        shell: pwsh
+        run: |
+          node scripts/prepare-full-offline-bundle.js
+          if ($LASTEXITCODE -ne 0) { throw 'Full Offline input selection failed.' }
+          node scripts/verify-full-offline-bundle.js
+          if ($LASTEXITCODE -ne 0) { throw 'Full Offline inputs failed verification.' }
+          npm run test:privacy
+          node tests/server-package-contract.test.js
+          node tests/desktop-release-contract.test.js
+          node tests/cloudflared-bundle.test.js
+      - name: Build Windows Full Offline artifacts
+        shell: pwsh
+        run: |
+          npx electron-builder --config electron-builder-windows-full-portable.json --win portable --x64 --publish never
+          if ($LASTEXITCODE -ne 0) { throw 'Windows Full Offline portable build failed.' }
+      - name: Scan Windows Full Offline portable with Microsoft Defender
+        shell: pwsh
+        run: |
+          $portable = (Resolve-Path ".\dist\SyncWatch-v$env:RELEASE_VERSION-Full-Offline-Portable-x64.exe").Path
+          $status = Get-MpComputerStatus -ErrorAction Stop
+          if (-not $status.AMServiceEnabled -or -not $status.AntivirusEnabled) {
+            throw 'Microsoft Defender antivirus service is unavailable; refusing to publish an unscanned portable.'
+          }
+          Start-MpScan -ScanType CustomScan -ScanPath $portable -ErrorAction Stop
+          if (-not (Test-Path -LiteralPath $portable -PathType Leaf)) {
+            throw 'Microsoft Defender removed or quarantined the Full Offline portable.'
+          }
+          $detections = @(Get-MpThreatDetection -ErrorAction SilentlyContinue | Where-Object {
+            ($_.Resources -join "`n") -match [Regex]::Escape($portable)
+          })
+          if ($detections.Count -gt 0) {
+            $names = ($detections | ForEach-Object ThreatName | Where-Object { $_ } | Sort-Object -Unique) -join ', '
+            throw "Microsoft Defender detected the Full Offline portable: $names"
+          }
+          $hash = (Get-FileHash -LiteralPath $portable -Algorithm SHA256).Hash
+          "Microsoft Defender scan passed: $portable`nSHA-256: $hash"
+      - name: Install, launch, and verify Windows Full Offline artifacts
+        shell: pwsh
+        run: |
+          function Reserve-Port {
+            $listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
+            $listener.Start(); $port = ([Net.IPEndPoint]$listener.LocalEndpoint).Port; $listener.Stop(); return $port
+          }
+          function Test-ServerExecutable([string]$executable, [string]$label) {
+            $port = Reserve-Port
+            $root = Join-Path $env:RUNNER_TEMP ("syncwatch-full-" + [Guid]::NewGuid().ToString('N'))
+            New-Item -ItemType Directory -Path $root | Out-Null
+            $env:PORT = [string]$port
+            $env:SYNCWATCH_DATA_DIR = Join-Path $root 'data'
+            $env:SYNCWATCH_SMOKE_MODE = '1'
+            $env:SYNCWATCH_SMOKE_EXIT_MS = '120000'
+            $process = Start-Process -FilePath $executable -ArgumentList "--user-data-dir=$(Join-Path $root 'profile')" -PassThru -WindowStyle Hidden
+            try {
+              $config = $null
+              for ($attempt = 0; $attempt -lt 180 -and -not $config; $attempt++) {
+                if ($process.HasExited) { throw "$label exited before HTTP startup ($($process.ExitCode))." }
+                try { $config = Invoke-RestMethod -Uri "http://127.0.0.1:$port/api/public-config" -TimeoutSec 2 } catch { Start-Sleep -Milliseconds 500 }
+              }
+              if (-not $config) { throw "$label did not start its HTTP service." }
+              if ($config.version -ne "v$env:RELEASE_VERSION" -or -not $config.androidApkAvailable -or -not $config.clientDownloadAvailable) {
+                throw "$label Full Offline closure/version verification failed."
+              }
+            } finally {
+              if (-not $process.HasExited) { taskkill.exe /PID $process.Id /T /F | Out-Null }
+              Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+            }
+          }
+          $portable = ".\dist\SyncWatch-v$env:RELEASE_VERSION-Full-Offline-Portable-x64.exe"
+          Test-ServerExecutable $portable 'Portable Full Offline server'
+          npm run test:privacy:release
+          Remove-Item -Path .\dist\*.blockmap, .\dist\latest*.yml, .\dist\builder-debug.yml -Force -ErrorAction SilentlyContinue
+          node scripts/release-candidate-gate.js --selection windows-full --version $env:RELEASE_VERSION --directory .\dist --evidence .\.build\evidence\windows-full.json --source-commit $env:RELEASE_COMMIT --source-tree $env:RELEASE_TREE --run-id $env:GITHUB_RUN_ID --run-attempt $env:GITHUB_RUN_ATTEMPT
+          if ($LASTEXITCODE -ne 0) { throw 'Windows Full Offline release gate failed.' }
+      - name: Upload Windows Full Offline candidate artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact_prefix }}-windows-full
+          path: |
+            dist/SyncWatch-v${{ inputs.version }}-Full-Offline-Portable-x64.exe
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 3
+      - name: Upload Windows Full Offline build evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact_prefix }}-evidence-windows-full
+          path: .build/evidence/windows-full.json
+          if-no-files-found: error
+          retention-days: 3

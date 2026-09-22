@@ -1,0 +1,38 @@
+name: NIS2 Compliance Scan
+
+# WARNING: Do not run Nmap scans from public GitHub Runners.
+# It violates GitHub's AUP. Use Self-Hosted Runners or a VPN.
+# This workflow is configured for manual trigger only for safety.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Install scanner package
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e packages/scanner
+
+      - name: Run scanner tests
+        run: |
+          cd packages/scanner && python -m pytest tests/ -v
+
+      - name: Manual scan placeholder
+        env:
+          INTERNAL_API_CREDS: ${{ secrets.INTERNAL_API_CREDS }}
+        run: |
+          echo "Manual scan workflow. Run targeted scans via:"
+          echo "  nis2scan --target example.com"

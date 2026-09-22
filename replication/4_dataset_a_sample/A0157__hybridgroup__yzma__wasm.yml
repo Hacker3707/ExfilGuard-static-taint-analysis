@@ -1,0 +1,101 @@
+name: WebAssembly
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      TINYGO_VERSION: '0.41.1'
+      WASM_DIR: build/wasm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      # TinyGo 0.41.1 works with Go 1.26 and not with Go 1.27. Go back to
+      # 'stable' after the release of TinyGo that adds Go 1.27.
+      - name: Install Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.26'
+      - name: Check the WebAssembly code
+        run: make vet-wasm
+      - name: Test the WebAssembly code
+        run: make test-wasm-unit
+      - name: Install TinyGo
+        run: |
+          set -e
+          curl -sSL -o tinygo.deb https://github.com/tinygo-org/tinygo/releases/download/v${TINYGO_VERSION}/tinygo_${TINYGO_VERSION}_amd64.deb
+          sudo dpkg -i tinygo.deb
+          tinygo version
+      - name: Get latest llama.cpp version
+        id: llama-version
+        run: |
+          VERSION=$(curl -s https://hybridgroup.github.io/llama-cpp-builder/version.json | jq -r '.tag_name')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Latest llama.cpp version: $VERSION"
+      - name: Install yzma command
+        run: go install .
+      - name: Install the WebAssembly build of llama.cpp
+        run: |
+          set -e
+          yzma install -lib $GITHUB_WORKSPACE/$WASM_DIR -os wasm -version ${{ steps.llama-version.outputs.version }}
+      - name: Build the examples with TinyGo
+        run: |
+          make wasm-example
+          make wasm-vlm-example
+          make wasm-tools-example
+      - name: Cache test models
+        id: cache-model
+        uses: actions/cache@v4
+        with:
+          path: models
+          key: ${{ runner.os }}-wasm-models-v2
+      - name: Download the test models
+        if: steps.cache-model.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ./models
+          yzma model get -y --show-progress=false -o $GITHUB_WORKSPACE/models -u https://huggingface.co/QuantFactory/SmolLM-135M-GGUF/resolve/main/SmolLM-135M.Q2_K.gguf
+          yzma model get -y --show-progress=false -o $GITHUB_WORKSPACE/models -u https://huggingface.co/ggml-org/SmolVLM-256M-Instruct-GGUF/resolve/main/SmolVLM-256M-Instruct-Q8_0.gguf
+          yzma model get -y --show-progress=false -o $GITHUB_WORKSPACE/models -u https://huggingface.co/ggml-org/SmolVLM-256M-Instruct-GGUF/resolve/main/mmproj-SmolVLM-256M-Instruct-Q8_0.gguf
+      - name: Run inference in Node
+        run: |
+          node wasm/node/run.js \
+            --dir $GITHUB_WORKSPACE/$WASM_DIR \
+            --model $GITHUB_WORKSPACE/models/SmolLM-135M.Q2_K.gguf \
+            --tokens 12
+      # Node has no WebGPU, so this checks the other half of that story: asking
+      # for WebGPU where there is none must quietly take a build on the CPU and
+      # still make text. Only a browser can run the WebGPU build itself.
+      - name: Check the fallback from WebGPU
+        run: |
+          node wasm/node/run.js \
+            --dir $GITHUB_WORKSPACE/$WASM_DIR \
+            --model $GITHUB_WORKSPACE/models/SmolLM-135M.Q2_K.gguf \
+            --tokens 12 --webgpu
+      # Node has no canvas, so the harness makes its own pixels. This checks the
+      # whole path: the pixels, the projector, and the tokens that come out.
+      - name: Ask about an image in Node
+        run: |
+          node wasm/node/vlm.js \
+            --dir $GITHUB_WORKSPACE/$WASM_DIR \
+            --model $GITHUB_WORKSPACE/models/SmolVLM-256M-Instruct-Q8_0.gguf \
+            --mmproj $GITHUB_WORKSPACE/models/mmproj-SmolVLM-256M-Instruct-Q8_0.gguf \
+            --tokens 24 --mt
+      # A model of this size makes no tool call, thus this checks the round trip
+      # only: the chat template renders, tokens come out, and the program ends.
+      - name: Call tools in Node
+        run: |
+          node wasm/node/tools.js \
+            --dir $GITHUB_WORKSPACE/$WASM_DIR \
+            --model $GITHUB_WORKSPACE/models/SmolLM-135M.Q2_K.gguf \
+            --tokens 32
+      - name: Build the examples with the standard toolchain
+        run: make wasm-example-go

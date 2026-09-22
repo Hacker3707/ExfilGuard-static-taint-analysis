@@ -1,0 +1,1326 @@
+name: Integration Test
+
+on:
+  # Manual trigger
+  workflow_dispatch:
+    inputs:
+      source:
+        description: 'Plugin source: "npm" for published version, "artifact" for PR build'
+        required: true
+        default: "artifact"
+        type: choice
+        options:
+          - artifact
+          - npm
+      dist-tag:
+        description: "NPM dist-tag (only used when source is npm)"
+        required: false
+        default: "alpha"
+        type: string
+      projects:
+        description: 'Projects to test (comma-separated, or "all" for default set)'
+        required: false
+        default: "all"
+        type: string
+
+  # Called by release workflow
+  workflow_call:
+    inputs:
+      source:
+        description: "Plugin source"
+        required: true
+        type: string
+      dist-tag:
+        description: "NPM dist-tag"
+        required: false
+        type: string
+        default: "alpha"
+
+  # PR comment trigger (/integration)
+  issue_comment:
+    types: [created]
+
+concurrency:
+  group: integration-test-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+  checks: write
+
+jobs:
+  # Check if workflow should run (for PR comment trigger)
+  check-trigger:
+    name: Check Trigger
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    if: github.event_name == 'issue_comment'
+    outputs:
+      should-run: ${{ steps.check.outputs.should-run }}
+      pr-number: ${{ steps.check.outputs.pr-number }}
+      pr-sha: ${{ steps.check.outputs.pr-sha }}
+    steps:
+      - name: Check comment trigger
+        id: check
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const comment = context.payload.comment.body.toLowerCase();
+            const isPR = !!context.payload.issue.pull_request;
+            const hasIntegrationCommand = comment.includes('/integration');
+
+            if (!hasIntegrationCommand) {
+              console.log('Not a PR comment with /integration command');
+              core.setOutput('should-run', 'false');
+              return;
+            }
+
+            // Check if user has write permission
+            try {
+              const { data: permission } = await github.rest.repos.getCollaboratorPermissionLevel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                username: context.payload.comment.user.login
+              });
+              
+              const hasPermission = ['admin', 'write'].includes(permission.permission);
+              
+              if (!hasPermission) {
+                await github.rest.reactions.createForIssueComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  comment_id: context.payload.comment.id,
+                  content: '-1'
+                });
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: context.payload.issue.number,
+                  body: '❌ Only users with write permission can trigger integration tests.'
+                });
+                core.setOutput('should-run', 'false');
+                return;
+              }
+            } catch (error) {
+              console.log('Permission check failed:', error);
+              core.setOutput('should-run', 'false');
+              return;
+            }
+
+            // Get PR details
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.payload.issue.number
+            });
+
+            // React with eyes to acknowledge
+            await github.rest.reactions.createForIssueComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: context.payload.comment.id,
+              content: 'eyes'
+            });
+
+            core.setOutput('should-run', 'true');
+            core.setOutput('pr-number', context.payload.issue.number);
+            core.setOutput('pr-sha', pr.head.sha);
+
+  # Setup and build (if source is artifact)
+  setup:
+    name: Setup Verter
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    if: |
+      always() &&
+      (github.event_name != 'issue_comment' || 
+       (needs.check-trigger.result != 'skipped' && needs.check-trigger.outputs.should-run == 'true'))
+    needs: [check-trigger]
+    steps:
+      - name: Determine source
+        id: source
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "source=${{ inputs.source }}" >> $GITHUB_OUTPUT
+            echo "dist-tag=${{ inputs.dist-tag }}" >> $GITHUB_OUTPUT
+          elif [ "${{ github.event_name }}" = "workflow_call" ]; then
+            echo "source=${{ inputs.source }}" >> $GITHUB_OUTPUT
+            echo "dist-tag=${{ inputs.dist-tag }}" >> $GITHUB_OUTPUT
+          else
+            # PR comment trigger - build from artifact
+            echo "source=artifact" >> $GITHUB_OUTPUT
+            echo "dist-tag=alpha" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Checkout PR
+        if: github.event_name == 'issue_comment'
+        uses: actions/checkout@v5
+        with:
+          ref: refs/pull/${{ needs.check-trigger.outputs.pr-number }}/head
+
+      - name: Checkout
+        if: github.event_name != 'issue_comment'
+        uses: actions/checkout@v5
+
+      - name: Setup pnpm
+        if: steps.source.outputs.source == 'artifact'
+        uses: pnpm/action-setup@v6
+
+      - name: Setup Node.js
+        if: steps.source.outputs.source == 'artifact'
+        uses: actions/setup-node@v5
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+
+      - name: Install Rust
+        if: steps.source.outputs.source == 'artifact'
+        uses: dtolnay/rust-toolchain@1.97.1
+
+      - name: Cache Rust dependencies
+        if: steps.source.outputs.source == 'artifact'
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: napi-release
+
+      - name: Install dependencies
+        if: steps.source.outputs.source == 'artifact'
+        run: pnpm install --frozen-lockfile
+
+      - name: Build native (production)
+        if: steps.source.outputs.source == 'artifact'
+        run: pnpm run build:native
+
+      - name: Build unplugin
+        if: steps.source.outputs.source == 'artifact'
+        run: pnpm --filter @verter/unplugin build
+
+      - name: Build nuxt module
+        if: steps.source.outputs.source == 'artifact'
+        run: pnpm --filter @verter/nuxt build
+
+      - name: Create local registry tarball
+        if: steps.source.outputs.source == 'artifact'
+        run: |
+          mkdir -p dist
+          # Pack packages
+          cd packages/native && pnpm pack --pack-destination ../../dist && cd ../..
+          cd packages/unplugin && pnpm pack --pack-destination ../../dist && cd ../..
+          cd packages/nuxt && pnpm pack --pack-destination ../../dist && cd ../..
+
+          echo "✅ Packages packed:"
+          ls -lh dist/*.tgz
+
+      - name: Upload Verter packages artifact
+        if: steps.source.outputs.source == 'artifact'
+        uses: actions/upload-artifact@v6
+        with:
+          name: verter-packages
+          path: dist/*.tgz
+          if-no-files-found: error
+
+      - name: Save source info
+        run: |
+          echo "source=${{ steps.source.outputs.source }}" >> source-info.txt
+          echo "dist_tag=${{ steps.source.outputs.dist-tag }}" >> source-info.txt
+
+      - name: Upload source info
+        uses: actions/upload-artifact@v6
+        with:
+          name: source-info
+          path: source-info.txt
+
+  # Test matrix for real-world Vue projects
+  test-project:
+    name: Test ${{ matrix.project.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [setup]
+    if: always() && needs.setup.result == 'success'
+    strategy:
+      fail-fast: false
+      matrix:
+        project:
+          - name: vuetify
+            repo: vuetifyjs/vuetify
+            branch: master
+            build-cmd: pnpm --filter vuetify build && pnpm --filter vuetifyjs.com build
+            test-cmd: ""
+            e2e-cmd: ""
+            package-manager: pnpm
+            bundler: vite
+          - name: oku-primitives
+            repo: oku-ui/primitives
+            branch: main
+            build-cmd: pnpm run build
+            test-cmd: pnpm run test
+            e2e-cmd: ""
+            package-manager: pnpm
+            bundler: vite
+          - name: hoppscotch
+            repo: hoppscotch/hoppscotch
+            branch: main
+            build-cmd: pnpm --filter @hoppscotch/selfhost-web build
+            test-cmd: pnpm --filter @hoppscotch/common test
+            e2e-cmd: ""
+            package-manager: pnpm
+            bundler: vite
+          - name: element-plus
+            repo: element-plus/element-plus
+            branch: dev
+            build-cmd: pnpm run build
+            test-cmd: ""
+            e2e-cmd: ""
+            package-manager: pnpm
+            bundler: rollup
+          - name: coreui
+            repo: coreui/coreui-free-vue-admin-template
+            branch: main
+            build-cmd: npm run build
+            test-cmd: ""
+            e2e-cmd: ""
+            package-manager: npm
+            bundler: vite
+          - name: balancer-frontend-v2
+            repo: balancer/frontend-v2
+            branch: develop
+            build-cmd: npm run build:withouttokenlists
+            test-cmd: npm run test:unit
+            e2e-cmd: ""
+            package-manager: npm
+            bundler: vite
+          - name: shadcn-vue
+            repo: unovue/shadcn-vue
+            branch: dev
+            build-cmd: pnpm --filter shadcn-vue build
+            test-cmd: pnpm --filter shadcn-vue test
+            e2e-cmd: ""
+            package-manager: pnpm
+            bundler: vite
+          - name: slidev
+            repo: slidevjs/slidev
+            branch: main
+            build-cmd: pnpm -r --filter="./packages/**" --parallel run build
+            test-cmd: pnpm run test
+            e2e-cmd: DEV_LOG=/tmp/slidev-dev.log; pnpm -C cypress/fixtures/basic run dev > "$DEV_LOG" 2>&1 & DEV_PID=$!; sleep 15 && npx cypress run --headless; EXIT=$?; echo "--- Dev server log ---"; cat "$DEV_LOG" 2>/dev/null || true; kill $DEV_PID 2>/dev/null; wait $DEV_PID 2>/dev/null; exit $EXIT
+            package-manager: pnpm
+            bundler: vite
+          - name: zyronon-douyin
+            repo: zyronon/douyin
+            branch: master
+            build-cmd: pnpm run build
+            test-cmd: ""
+            e2e-cmd: ""
+            package-manager: pnpm
+            bundler: vite
+          - name: primevue
+            repo: primefaces/primevue
+            branch: master
+            build-cmd: pnpm run build:metadata && pnpm run build:resolver && pnpm run build:core && pnpm run build:lib
+            test-cmd: ""
+            e2e-cmd: ""
+            package-manager: pnpm
+            bundler: rollup
+          - name: ant-design-vue
+            repo: vueComponent/ant-design-vue
+            branch: main
+            build-cmd: npm run build
+            test-cmd: npm run test
+            e2e-cmd: ""
+            package-manager: npm
+            bundler: vite
+          - name: nuxt-ui
+            repo: nuxt/ui
+            branch: v4
+            build-cmd: pnpm nuxt-module-build prepare && pnpm build
+            test-cmd: pnpm test
+            e2e-cmd: ""
+            package-manager: pnpm
+            bundler: nuxt
+          - name: vue-vben-admin
+            repo: vbenjs/vue-vben-admin
+            branch: main
+            build-cmd: pnpm build
+            test-cmd: ""
+            e2e-cmd: npx playwright install chromium --with-deps && pnpm run test:e2e
+            package-manager: pnpm
+            bundler: vite
+          - name: vant
+            repo: youzan/vant
+            branch: main
+            build-cmd: pnpm build
+            test-cmd: pnpm test
+            e2e-cmd: ""
+            package-manager: pnpm
+            bundler: vite
+          - name: naive-ui
+            repo: tusen-ai/naive-ui
+            branch: main
+            build-cmd: pnpm build:package
+            test-cmd: pnpm vitest run
+            e2e-cmd: ""
+            package-manager: pnpm
+            bundler: vite
+          - name: tdesign-vue-next
+            repo: Tencent/tdesign-vue-next
+            branch: develop
+            build-cmd: pnpm run build:vue
+            test-cmd: pnpm run test:vue
+            e2e-cmd: ""
+            package-manager: pnpm
+            bundler: vite
+          - name: radix-vue
+            repo: unovue/radix-vue
+            branch: v2
+            build-cmd: pnpm --filter reka-ui build
+            test-cmd: pnpm --filter reka-ui test
+            e2e-cmd: ""
+            package-manager: pnpm
+            bundler: vite
+          - name: vitepress
+            repo: vuejs/vitepress
+            branch: main
+            build-cmd: pnpm build
+            test-cmd: pnpm test:unit
+            e2e-cmd: npx playwright install chromium --with-deps && pnpm test:e2e-dev
+            package-manager: pnpm
+            bundler: vite
+          - name: vue-router
+            repo: vuejs/router
+            branch: main
+            build-cmd: pnpm -C packages/router build
+            test-cmd: pnpm -C packages/router test:unit
+            e2e-cmd: ""
+            package-manager: pnpm
+            bundler: vite
+          - name: npmx
+            repo: npmx-dev/npmx.dev
+            branch: main
+            build-cmd: pnpm run build
+            test-cmd: pnpm run test:unit
+            e2e-cmd: npx playwright install chromium --with-deps && pnpm run test:browser
+            package-manager: pnpm
+            bundler: nuxt
+            shallow: false
+
+    steps:
+      - name: Download source info
+        uses: actions/download-artifact@v7
+        with:
+          name: source-info
+
+      - name: Read source info
+        id: source
+        run: |
+          source source-info.txt
+          echo "source=$source" >> $GITHUB_OUTPUT
+          echo "dist-tag=$dist_tag" >> $GITHUB_OUTPUT
+
+      - name: Checkout test project
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ matrix.project.repo }}
+          ref: ${{ matrix.project.branch }}
+          path: test-project
+          fetch-depth: ${{ matrix.project.shallow == false && 0 || 1 }}
+
+      - name: Setup pnpm
+        if: matrix.project.package-manager == 'pnpm'
+        uses: pnpm/action-setup@v6
+        with:
+          version: 9
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version-file: .nvmrc
+
+      - name: Configure hoist pattern for Verter
+        if: matrix.project.package-manager == 'pnpm'
+        working-directory: test-project
+        run: |
+          # Hoist @verter/* and unplugin to root node_modules so all workspace packages can resolve it
+          # Using public-hoist-pattern instead of node-linker=hoisted to preserve
+          # pnpm's per-package isolation (some projects use ./node_modules/ paths in build scripts)
+          echo 'public-hoist-pattern[]=@verter/*' >> .npmrc
+          echo 'public-hoist-pattern[]=unplugin' >> .npmrc
+
+      - name: Normalize packageManager and engines.pnpm fields
+        working-directory: test-project
+        run: |
+          # Rewrite packageManager to match local pnpm version (prevents corepack version switching).
+          # Keep the field (vs deleting) because turbo-based projects require it.
+          # Strip engines.pnpm to prevent ERR_PNPM_UNSUPPORTED_ENGINE.
+          LOCAL_PNPM=$(pnpm --version 2>/dev/null || echo "")
+          node -e "
+            const fs = require('fs');
+            const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+            let modified = false;
+            const localPnpm = '${LOCAL_PNPM}'.trim();
+            if (pkg.packageManager && localPnpm) { pkg.packageManager = 'pnpm@' + localPnpm; modified = true; }
+            if (pkg.engines?.pnpm) { delete pkg.engines.pnpm; if (!Object.keys(pkg.engines).length) delete pkg.engines; modified = true; }
+            if (modified) {
+              fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
+              console.log('Normalized packageManager/engines.pnpm fields');
+            }
+          "
+
+      - name: Install project dependencies
+        working-directory: test-project
+        run: |
+          set -o pipefail
+          if [ "${{ matrix.project.package-manager }}" = "pnpm" ]; then
+            if ! pnpm install --no-frozen-lockfile 2>&1 | tee /tmp/pnpm-install.log; then
+              # Handle ERR_PNPM_WORKSPACE_PKG_NOT_FOUND: strip the missing workspace
+              # dependency from the offending package.json and retry
+              # (e.g. tdesign-vue-next's chat/site references non-existent @tdesign/common)
+              OFFENDING_DIR=$(grep -oP 'In \K[^:]+' /tmp/pnpm-install.log | head -1 || true)
+              MISSING_PKG=$(grep -oP 'no package named "\K[^"]+' /tmp/pnpm-install.log | head -1 || true)
+              if [ -n "$OFFENDING_DIR" ] && [ -n "$MISSING_PKG" ] && [ -f "$OFFENDING_DIR/package.json" ]; then
+                echo "⚠️ Stripping broken workspace dep '$MISSING_PKG' from $OFFENDING_DIR/package.json"
+                node -e "
+                  const fs = require('fs');
+                  const p = '$OFFENDING_DIR/package.json';
+                  const pkg = JSON.parse(fs.readFileSync(p, 'utf8'));
+                  for (const f of ['dependencies','devDependencies','peerDependencies','optionalDependencies']) {
+                    if (pkg[f]?.['$MISSING_PKG']) delete pkg[f]['$MISSING_PKG'];
+                  }
+                  fs.writeFileSync(p, JSON.stringify(pkg, null, 2) + '\n');
+                "
+                pnpm install --no-frozen-lockfile
+              else
+                cat /tmp/pnpm-install.log
+                exit 1
+              fi
+            fi
+          else
+            # --legacy-peer-deps bypasses ERESOLVE errors from outdated peer dependencies
+            # in third-party projects (e.g. ant-design-vue)
+            npm install --legacy-peer-deps
+          fi
+
+      - name: Baseline build
+        id: baseline-build
+        working-directory: test-project
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          START=$(date +%s)
+          if ${{ matrix.project.build-cmd }} 2>&1 | tee ../baseline-build.log; then
+            echo "status=success" >> $GITHUB_OUTPUT
+          else
+            echo "status=failure" >> $GITHUB_OUTPUT
+          fi
+          echo "duration=$(($(date +%s) - START))" >> $GITHUB_OUTPUT
+
+      - name: Baseline tests
+        id: baseline-test
+        working-directory: test-project
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          if [ -z "${{ matrix.project.test-cmd }}" ]; then
+            echo "duration=0" >> $GITHUB_OUTPUT
+            echo "status=skipped" >> $GITHUB_OUTPUT
+            echo "test_passed=0" >> $GITHUB_OUTPUT
+            echo "test_failed=0" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          START=$(date +%s)
+          if ${{ matrix.project.test-cmd }} 2>&1 | tee ../baseline-test.log; then
+            echo "status=passed" >> $GITHUB_OUTPUT
+          else
+            echo "status=failed" >> $GITHUB_OUTPUT
+          fi
+          echo "duration=$(($(date +%s) - START))" >> $GITHUB_OUTPUT
+
+          # Extract test counts
+          TP=$(grep -oE '[0-9]+ passed' ../baseline-test.log | tail -1 | grep -oE '[0-9]+' || true)
+          TF=$(grep -oE '[0-9]+ failed' ../baseline-test.log | tail -1 | grep -oE '[0-9]+' || true)
+          echo "test_passed=${TP:-0}" >> $GITHUB_OUTPUT
+          echo "test_failed=${TF:-0}" >> $GITHUB_OUTPUT
+
+      - name: Download Verter packages
+        if: steps.source.outputs.source == 'artifact'
+        uses: actions/download-artifact@v7
+        with:
+          name: verter-packages
+          path: verter-packages
+
+      - name: Install Verter packages (from tarballs)
+        if: steps.source.outputs.source == 'artifact'
+        working-directory: test-project
+        run: |
+          echo "📦 Installing Verter from tarballs"
+          NATIVE_TGZ=$(ls ../verter-packages/verter-native-*.tgz)
+          UNPLUGIN_TGZ=$(ls ../verter-packages/verter-unplugin-*.tgz)
+          NUXT_TGZ=$(ls ../verter-packages/verter-nuxt-*.tgz 2>/dev/null || true)
+          echo "  native: $NATIVE_TGZ"
+          echo "  unplugin: $UNPLUGIN_TGZ"
+          echo "  nuxt: ${NUXT_TGZ:-n/a}"
+
+          BUNDLER="${{ matrix.project.bundler }}"
+          PKG_MGR="${{ matrix.project.package-manager }}"
+
+          # Build install list: always native + unplugin, add nuxt for Nuxt projects
+          INSTALL_PKGS="$NATIVE_TGZ $UNPLUGIN_TGZ"
+          if [ "$BUNDLER" = "nuxt" ] && [ -n "$NUXT_TGZ" ]; then
+            INSTALL_PKGS="$INSTALL_PKGS $NUXT_TGZ"
+          fi
+
+          if [ "$PKG_MGR" = "pnpm" ]; then
+            # 1. Install packages (use -w only for workspace projects)
+            PNPM_W=""
+            if [ -f "pnpm-workspace.yaml" ] || [ -f "pnpm-workspace.yml" ]; then
+              PNPM_W="-w"
+            fi
+
+            PNPM_ADD_OK=true
+            if ! pnpm add $PNPM_W $INSTALL_PKGS 2>&1; then
+              PNPM_ADD_OK=false
+            fi
+
+            if [ "$PNPM_ADD_OK" = "true" ]; then
+              # 2. Add pnpm overrides using file: protocol to the tarballs.
+              #    The $packageName syntax doesn't work with tarball-installed packages —
+              #    pnpm resolves the semver version separately, missing the native binary.
+              NUXT_OVERRIDE=""
+              if [ "$BUNDLER" = "nuxt" ] && [ -n "$NUXT_TGZ" ]; then
+                NUXT_OVERRIDE="pkg.pnpm.overrides['@verter/nuxt'] = 'file:${NUXT_TGZ}';"
+              fi
+              node -e "
+                const fs = require('fs');
+                const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+                pkg.pnpm = pkg.pnpm || {};
+                pkg.pnpm.overrides = pkg.pnpm.overrides || {};
+                pkg.pnpm.overrides['@verter/native'] = 'file:${NATIVE_TGZ}';
+                pkg.pnpm.overrides['@verter/unplugin'] = 'file:${UNPLUGIN_TGZ}';
+                ${NUXT_OVERRIDE}
+                fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
+              "
+
+              # 3. Reinstall to apply overrides to workspace packages.
+              #    Use --prefer-offline to avoid re-fetching metadata for unrelated deps.
+              #    If install fails (e.g. lockfile references a yanked npm version),
+              #    delete the lockfile and retry with fresh resolution.
+              if ! pnpm install --prefer-offline --no-frozen-lockfile 2>&1; then
+                echo "⚠️ Reinstall failed, retrying without lockfile..."
+                rm -f pnpm-lock.yaml
+                if ! pnpm install --prefer-offline 2>&1; then
+                  echo "⚠️ Full reinstall also failed, falling back to direct injection"
+                  PNPM_ADD_OK=false
+                fi
+              fi
+            fi
+
+            if [ "$PNPM_ADD_OK" = "false" ]; then
+              # Fallback: Direct node_modules injection bypassing pnpm resolution entirely.
+              # This avoids failures from upstream broken deps (yanked packages, jsr: protocol, etc.)
+              echo "⚠️ pnpm resolution failed (upstream dep issue), using direct injection"
+              for TGZ in $INSTALL_PKGS; do
+                PKG_NAME=$(tar xzf "$TGZ" -O package/package.json | node -e "
+                  let d='';process.stdin.on('data',c=>d+=c);
+                  process.stdin.on('end',()=>console.log(JSON.parse(d).name))
+                ")
+                TARGET="node_modules/$PKG_NAME"
+                mkdir -p "$TARGET"
+                tar xzf "$TGZ" -C "$TARGET" --strip-components=1
+                echo "  Injected $PKG_NAME → $TARGET"
+              done
+            fi
+          else
+            # 1. Install packages
+            npm install --legacy-peer-deps $INSTALL_PKGS
+
+            # 2. Add npm overrides using file: protocol
+            NUXT_OVERRIDE=""
+            if [ "$BUNDLER" = "nuxt" ] && [ -n "$NUXT_TGZ" ]; then
+              NUXT_OVERRIDE="pkg.overrides['@verter/nuxt'] = 'file:${NUXT_TGZ}';"
+            fi
+            node -e "
+              const fs = require('fs');
+              const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+              pkg.overrides = pkg.overrides || {};
+              pkg.overrides['@verter/native'] = 'file:${NATIVE_TGZ}';
+              pkg.overrides['@verter/unplugin'] = 'file:${UNPLUGIN_TGZ}';
+              ${NUXT_OVERRIDE}
+              fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
+            "
+
+            # 3. Reinstall to apply overrides
+            npm install --legacy-peer-deps
+          fi
+          echo "✅ Verter packages installed from tarballs"
+
+      - name: Install Verter packages (from npm)
+        if: steps.source.outputs.source == 'npm'
+        working-directory: test-project
+        run: |
+          echo "Installing from npm with dist-tag: ${{ steps.source.outputs.dist-tag }}"
+          BUNDLER="${{ matrix.project.bundler }}"
+          EXTRA_PKGS=""
+          if [ "$BUNDLER" = "nuxt" ]; then
+            EXTRA_PKGS="@verter/nuxt@${{ steps.source.outputs.dist-tag }}"
+          fi
+          if [ "${{ matrix.project.package-manager }}" = "pnpm" ]; then
+            PNPM_W=""
+            if [ -f "pnpm-workspace.yaml" ] || [ -f "pnpm-workspace.yml" ]; then
+              PNPM_W="-w"
+            fi
+            pnpm add $PNPM_W @verter/unplugin@${{ steps.source.outputs.dist-tag }} $EXTRA_PKGS
+          else
+            npm install --legacy-peer-deps @verter/unplugin@${{ steps.source.outputs.dist-tag }} $EXTRA_PKGS
+          fi
+
+      - name: Replace vue plugin with verter in build configs
+        working-directory: test-project
+        run: |
+          BUNDLER="${{ matrix.project.bundler }}"
+
+          if [ "$BUNDLER" = "nuxt" ]; then
+            # For Nuxt projects: inject @verter/nuxt module into nuxt.config
+            NUXT_CONFIGS=$(find . -name 'nuxt.config.*' -not -path '*/node_modules/*' -not -path '*/.git/*')
+            if [ -z "$NUXT_CONFIGS" ]; then
+              echo "❌ No nuxt.config files found"
+              exit 1
+            fi
+
+            for CONFIG_FILE in $NUXT_CONFIGS; do
+              # Inject @verter/nuxt module reference into nuxt.config
+              if grep -q 'modules\s*:' "$CONFIG_FILE"; then
+                sed -i "s|modules\s*:\s*\[|modules: [\n    '@verter/nuxt',|" "$CONFIG_FILE"
+              else
+                sed -i "s|defineNuxtConfig\s*(\s*{|defineNuxtConfig({\n  modules: ['@verter/nuxt'],|" "$CONFIG_FILE"
+              fi
+              echo "📝 Modified $CONFIG_FILE"
+            done
+
+          elif [ "$BUNDLER" = "rollup" ]; then
+            # For Rollup-based projects: replace in rollup configs and build scripts
+            CONFIG_FILES=$(grep -rlE "@vitejs/plugin-vue|rollup-plugin-vue" \
+              --include="*.config.*" --include="*.ts" --include="*.js" --include="*.mjs" \
+              --exclude-dir=node_modules --exclude-dir=.git \
+              --exclude="package.json" --exclude="*.lock" --exclude="*.yaml" \
+              . || true)
+
+            if [ -z "$CONFIG_FILES" ]; then
+              echo "⚠️ No config files with vue plugin found for rollup bundler"
+              exit 0
+            fi
+
+            echo "📝 Found config files to modify (rollup):"
+            echo "$CONFIG_FILES"
+            echo "---"
+
+            for CONFIG_FILE in $CONFIG_FILES; do
+              echo "📝 Modifying $CONFIG_FILE"
+
+              # Replace rollup-plugin-vue imports
+              sed -i "s|from 'rollup-plugin-vue'|from '@verter/unplugin/rollup'|g" "$CONFIG_FILE"
+              sed -i 's|from "rollup-plugin-vue"|from "@verter/unplugin/rollup"|g' "$CONFIG_FILE"
+
+              # Replace @vitejs/plugin-vue imports (some rollup projects use it)
+              sed -i "s|from '@vitejs/plugin-vue'|from '@verter/unplugin/rollup'|g" "$CONFIG_FILE"
+              sed -i 's|from "@vitejs/plugin-vue"|from "@verter/unplugin/rollup"|g' "$CONFIG_FILE"
+
+              # Rename the imported function
+              sed -i 's|import vue from|import verter from|g' "$CONFIG_FILE"
+              sed -i 's|import Vue from|import verter from|g' "$CONFIG_FILE"
+              sed -i 's|import vue,|import verter,|g' "$CONFIG_FILE"
+              sed -i 's|import Vue,|import verter,|g' "$CONFIG_FILE"
+              sed -i 's|\bvue(|verter(|g' "$CONFIG_FILE"
+              sed -i 's|\bVue(|verter(|g' "$CONFIG_FILE"
+
+              echo "📝 Modified:"
+              cat "$CONFIG_FILE"
+              echo "==="
+            done
+          else
+            # For Vite-based projects: replace in vite/vitest configs and source files
+            CONFIG_FILES=$(grep -rl "@vitejs/plugin-vue" \
+              --include="vite.config.*" --include="vitest.config.*" \
+              --include="*.ts" --include="*.js" --include="*.mjs" \
+              --exclude-dir=node_modules --exclude-dir=.git \
+              --exclude="package.json" --exclude="*.lock" --exclude="*.yaml" \
+              . || true)
+
+            if [ -z "$CONFIG_FILES" ]; then
+              echo "❌ No config files with @vitejs/plugin-vue found"
+              exit 1
+            fi
+
+            echo "📝 Found config files to modify (vite):"
+            echo "$CONFIG_FILES"
+            echo "---"
+
+            for CONFIG_FILE in $CONFIG_FILES; do
+              echo "📝 Modifying $CONFIG_FILE"
+              cat "$CONFIG_FILE"
+              echo "---"
+
+              sed -i "s|from '@vitejs/plugin-vue'|from '@verter/unplugin/vite'|g" "$CONFIG_FILE"
+              sed -i "s|from \"@vitejs/plugin-vue\"|from \"@verter/unplugin/vite\"|g" "$CONFIG_FILE"
+              sed -i 's|import vue from|import verter from|g' "$CONFIG_FILE"
+              sed -i 's|import Vue from|import verter from|g' "$CONFIG_FILE"
+              sed -i 's|import vue,|import verter,|g' "$CONFIG_FILE"
+              sed -i 's|import Vue,|import verter,|g' "$CONFIG_FILE"
+              sed -i 's|\bvue(|verter(|g' "$CONFIG_FILE"
+              sed -i 's|\bVue(|verter(|g' "$CONFIG_FILE"
+
+              echo "📝 Modified:"
+              cat "$CONFIG_FILE"
+              echo "==="
+            done
+          fi
+
+          # For monorepos: if we modified source files in workspace sub-packages,
+          # add @verter/unplugin as a dependency so the build tool externalizes it
+          # instead of bundling it (which would embed require("@verter/native") inline
+          # and generate wrong import paths like markdown-it/lib/token.js).
+          echo "📝 Patching workspace sub-package deps..."
+          for PKG_FILE in $(find . -name 'package.json' \
+            -not -path '*/node_modules/*' -not -path './.git/*' \
+            -not -path './package.json'); do
+            if node -e "
+              const fs = require('fs');
+              const pkg = JSON.parse(fs.readFileSync('$PKG_FILE', 'utf8'));
+              let changed = false;
+              for (const field of ['dependencies', 'devDependencies']) {
+                if (pkg[field]?.['@vitejs/plugin-vue']) {
+                  pkg[field]['@verter/unplugin'] = pkg[field]['@vitejs/plugin-vue'];
+                  changed = true;
+                }
+              }
+              if (changed) {
+                fs.writeFileSync('$PKG_FILE', JSON.stringify(pkg, null, 2) + '\n');
+                process.exit(0);
+              }
+              process.exit(1);
+            " 2>/dev/null; then
+              echo "  ✅ Patched $PKG_FILE (added @verter/unplugin)"
+            fi
+          done
+
+          # Reinstall to pick up new sub-package deps
+          if [ "${{ matrix.project.package-manager }}" = "pnpm" ]; then
+            pnpm install --no-frozen-lockfile
+          else
+            npm install --legacy-peer-deps
+          fi
+
+      - name: Verify Verter plugin replacement
+        working-directory: test-project
+        run: |
+          BUNDLER="${{ matrix.project.bundler }}"
+          if [ "$BUNDLER" = "nuxt" ]; then
+            # For Nuxt: verify @verter/nuxt is referenced in nuxt.config
+            FOUND=$(grep -rl "@verter/nuxt" \
+              --include="nuxt.config.*" \
+              --exclude-dir=node_modules --exclude-dir=.git . || true)
+            if [ -z "$FOUND" ]; then
+              echo "::error::No nuxt.config files reference @verter/nuxt!"
+              exit 1
+            fi
+            echo "✅ Verified @verter/nuxt in:"
+            echo "$FOUND"
+          elif [ "$BUNDLER" = "rollup" ]; then
+            FOUND=$(grep -rl "@verter/unplugin/rollup" \
+              --include="*.config.*" --include="*.ts" --include="*.js" --include="*.mjs" \
+              --exclude-dir=node_modules --exclude-dir=.git . || true)
+            if [ -z "$FOUND" ]; then
+              echo "::error::No files contain @verter/unplugin after replacement!"
+              exit 1
+            fi
+            echo "✅ Verified @verter/unplugin is present in:"
+            echo "$FOUND"
+            for f in $FOUND; do
+              echo "--- $f ---"
+              grep -n "@verter/unplugin" "$f"
+            done
+          else
+            FOUND=$(grep -rl "@verter/unplugin/vite" \
+              --include="vite.config.*" --include="vitest.config.*" \
+              --include="*.ts" --include="*.js" --include="*.mjs" \
+              --exclude-dir=node_modules --exclude-dir=.git . || true)
+            if [ -z "$FOUND" ]; then
+              echo "::error::No files contain @verter/unplugin after replacement!"
+              exit 1
+            fi
+            echo "✅ Verified @verter/unplugin is present in:"
+            echo "$FOUND"
+            for f in $FOUND; do
+              echo "--- $f ---"
+              grep -n "@verter/unplugin" "$f"
+            done
+          fi
+
+      - name: Verter build
+        id: verter-build
+        working-directory: test-project
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          START=$(date +%s)
+          if ${{ matrix.project.build-cmd }} 2>&1 | tee ../verter-build.log; then
+            echo "status=success" >> $GITHUB_OUTPUT
+          else
+            echo "status=failure" >> $GITHUB_OUTPUT
+          fi
+          echo "duration=$(($(date +%s) - START))" >> $GITHUB_OUTPUT
+
+      - name: Verter tests
+        id: verter-test
+        working-directory: test-project
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          if [ -z "${{ matrix.project.test-cmd }}" ]; then
+            echo "duration=0" >> $GITHUB_OUTPUT
+            echo "status=skipped" >> $GITHUB_OUTPUT
+            echo "test_passed=0" >> $GITHUB_OUTPUT
+            echo "test_failed=0" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          START=$(date +%s)
+          if ${{ matrix.project.test-cmd }} 2>&1 | tee ../verter-test.log; then
+            STATUS="passed"
+          else
+            STATUS="failed"
+          fi
+          END=$(date +%s)
+
+          # Extract test counts (vitest/jest: "Tests  42 passed | 3 failed (45)")
+          TP=$(grep -oE '[0-9]+ passed' ../verter-test.log | tail -1 | grep -oE '[0-9]+' || true)
+          TF=$(grep -oE '[0-9]+ failed' ../verter-test.log | tail -1 | grep -oE '[0-9]+' || true)
+
+          # Retry flaky tests: if verter has more failures than baseline, re-run up to 3 times
+          B_FAILED="${{ steps.baseline-test.outputs.test_failed }}"
+          MAX_RETRIES=3
+          for i in $(seq 1 $MAX_RETRIES); do
+            if [ "${TF:-0}" -le "${B_FAILED:-0}" ] 2>/dev/null; then
+              break
+            fi
+            echo "::notice::Retrying tests ($i/$MAX_RETRIES) — ${TF:-0} failures vs baseline ${B_FAILED:-0}"
+            if ${{ matrix.project.test-cmd }} 2>&1 | tee ../verter-test-retry.log; then
+              RETRY_STATUS="passed"
+            else
+              RETRY_STATUS="failed"
+            fi
+            RETRY_TP=$(grep -oE '[0-9]+ passed' ../verter-test-retry.log | tail -1 | grep -oE '[0-9]+' || true)
+            RETRY_TF=$(grep -oE '[0-9]+ failed' ../verter-test-retry.log | tail -1 | grep -oE '[0-9]+' || true)
+            # Keep the result with fewer failures
+            if [ "${RETRY_TF:-0}" -lt "${TF:-0}" ] 2>/dev/null; then
+              TP="${RETRY_TP:-0}"
+              TF="${RETRY_TF:-0}"
+              STATUS="$RETRY_STATUS"
+              cp ../verter-test-retry.log ../verter-test.log
+            fi
+          done
+
+          echo "status=$STATUS" >> $GITHUB_OUTPUT
+          echo "duration=$((END - START))" >> $GITHUB_OUTPUT
+          echo "test_passed=${TP:-0}" >> $GITHUB_OUTPUT
+          echo "test_failed=${TF:-0}" >> $GITHUB_OUTPUT
+
+      - name: Verter E2E tests
+        id: verter-e2e
+        if: matrix.project.e2e-cmd != ''
+        working-directory: test-project
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          START=$(date +%s)
+          # Write e2e command to a temp script to prevent bash from
+          # pre-expanding $-variables ($!, $?, etc.) inside double quotes.
+          cat > /tmp/verter-e2e-cmd.sh <<'VERTER_E2E_EOF'
+          ${{ matrix.project.e2e-cmd }}
+          VERTER_E2E_EOF
+          if bash /tmp/verter-e2e-cmd.sh 2>&1 | tee ../verter-e2e.log; then
+            echo "status=passed" >> $GITHUB_OUTPUT
+          else
+            echo "status=failed" >> $GITHUB_OUTPUT
+          fi
+          echo "duration=$(($(date +%s) - START))" >> $GITHUB_OUTPUT
+
+      - name: Generate project report
+        if: always()
+        run: |
+          REPORT="report-${{ matrix.project.name }}.md"
+
+          # Collect values from step outputs
+          B_BUILD="${{ steps.baseline-build.outputs.duration }}"
+          B_OUTCOME="${{ steps.baseline-build.outputs.status }}"
+          V_BUILD="${{ steps.verter-build.outputs.duration }}"
+          V_STATUS="${{ steps.verter-build.outputs.status }}"
+          B_TEST_DUR="${{ steps.baseline-test.outputs.duration }}"
+          B_TEST_ST="${{ steps.baseline-test.outputs.status }}"
+          B_TEST_P="${{ steps.baseline-test.outputs.test_passed }}"
+          B_TEST_F="${{ steps.baseline-test.outputs.test_failed }}"
+          V_TEST_DUR="${{ steps.verter-test.outputs.duration }}"
+          V_TEST_ST="${{ steps.verter-test.outputs.status }}"
+          V_TEST_P="${{ steps.verter-test.outputs.test_passed }}"
+          V_TEST_F="${{ steps.verter-test.outputs.test_failed }}"
+
+          # Helper: format test result
+          fmt_tests() {
+            local st="$1" p="$2" f="$3"
+            if [ "$st" = "skipped" ]; then echo "skipped"; return; fi
+            if [ "${f:-0}" -gt 0 ] 2>/dev/null; then
+              echo "❌ $f failed / $((p + f))"
+            elif [ "${p:-0}" -gt 0 ] 2>/dev/null; then
+              echo "✅ $p passed"
+            elif [ "$st" = "passed" ]; then echo "✅ passed"
+            elif [ "$st" = "failed" ]; then echo "❌ failed"
+            else echo "—"; fi
+          }
+
+          B_TESTS=$(fmt_tests "$B_TEST_ST" "$B_TEST_P" "$B_TEST_F")
+          V_TESTS=$(fmt_tests "$V_TEST_ST" "$V_TEST_P" "$V_TEST_F")
+
+          # Build delta
+          BUILD_DELTA="—"
+          if [ -n "$B_BUILD" ] && [ -n "$V_BUILD" ] && [ "$B_BUILD" -gt 0 ] && [ "$V_BUILD" -gt 0 ]; then
+            DIFF=$((V_BUILD - B_BUILD))
+            PCT=$((DIFF * 100 / B_BUILD))
+            if [ $DIFF -gt 0 ]; then BUILD_DELTA="🔴 +${DIFF}s (+${PCT}%)"
+            elif [ $DIFF -lt 0 ]; then BUILD_DELTA="🟢 ${DIFF}s (${PCT}%)"
+            else BUILD_DELTA="⚪ same"; fi
+          fi
+
+          # Test delta
+          TEST_DELTA="—"
+          if [ -n "$B_TEST_DUR" ] && [ -n "$V_TEST_DUR" ] && [ "$B_TEST_DUR" -gt 0 ] && [ "$V_TEST_DUR" -gt 0 ]; then
+            DIFF=$((V_TEST_DUR - B_TEST_DUR))
+            if [ $DIFF -gt 0 ]; then TEST_DELTA="+${DIFF}s"
+            elif [ $DIFF -lt 0 ]; then TEST_DELTA="${DIFF}s"
+            else TEST_DELTA="same"; fi
+          fi
+
+          # Status icons
+          B_ICON=$([ "$B_OUTCOME" = "success" ] && echo "✅" || echo "❌")
+          V_ICON=$([ "$V_STATUS" = "success" ] && echo "✅" || echo "❌")
+
+          # Overall status
+          OVERALL="fail"
+          CONCLUSION=""
+          if [ "$V_STATUS" != "success" ]; then
+            CONCLUSION="❌ **Failed** — Verter build failed"
+          elif [ "$V_TEST_ST" = "failed" ]; then
+            CONCLUSION="❌ **Failed** — Verter tests failed"
+          elif [ "$B_TEST_ST" != "skipped" ] && [ "${B_TEST_P:-0}" -gt 0 ] && [ "${V_TEST_P:-0}" -eq 0 ]; then
+            # Baseline had passing tests but Verter reported zero — tests likely crashed
+            CONCLUSION="❌ **Failed** — Verter tests did not produce results (baseline had ${B_TEST_P} passing)"
+          elif [ "${V_TEST_F:-0}" -gt 0 ] && [ "${V_TEST_F:-0}" -gt "${B_TEST_F:-0}" ]; then
+            # Verter introduced new test failures
+            CONCLUSION="❌ **Failed** — Verter has more test failures (${V_TEST_F} vs baseline ${B_TEST_F})"
+          else
+            SLOWER=""
+            [ -n "$B_BUILD" ] && [ -n "$V_BUILD" ] && [ "$B_BUILD" -gt 0 ] && [ "$V_BUILD" -gt "$B_BUILD" ] && SLOWER="build"
+            [ -n "$B_TEST_DUR" ] && [ -n "$V_TEST_DUR" ] && [ "$B_TEST_DUR" -gt 0 ] && [ "$V_TEST_DUR" -gt "$B_TEST_DUR" ] && SLOWER="${SLOWER:+$SLOWER + }tests"
+            if [ -n "$SLOWER" ]; then
+              OVERALL="warning"
+              CONCLUSION="⚠️ **Warning** — Verter is slower ($SLOWER)"
+            else
+              OVERALL="pass"
+              CONCLUSION="✅ **Passed** — Verter is faster or equal"
+            fi
+          fi
+
+          # Write status metadata
+          mkdir -p status
+          echo "project=${{ matrix.project.name }}" > status/status.txt
+          echo "build_status=$V_STATUS" >> status/status.txt
+          echo "test_status=$V_TEST_ST" >> status/status.txt
+          echo "baseline_build=$B_BUILD" >> status/status.txt
+          echo "verter_build=$V_BUILD" >> status/status.txt
+          echo "baseline_test=$B_TEST_DUR" >> status/status.txt
+          echo "verter_test=$V_TEST_DUR" >> status/status.txt
+          echo "baseline_test_passed=$B_TEST_P" >> status/status.txt
+          echo "baseline_test_failed=$B_TEST_F" >> status/status.txt
+          echo "baseline_test_status=$B_TEST_ST" >> status/status.txt
+          echo "verter_test_passed=$V_TEST_P" >> status/status.txt
+          echo "verter_test_failed=$V_TEST_F" >> status/status.txt
+          echo "overall_status=$OVERALL" >> status/status.txt
+
+          # Write report
+          cat > "$REPORT" << EOF
+          ## ${{ matrix.project.name }}
+
+          \`${{ matrix.project.repo }}\` @ \`${{ matrix.project.branch }}\` | Source: ${{ steps.source.outputs.source }}
+
+          | | Vue (baseline) | Verter | Delta |
+          |--|----------------|--------|-------|
+          | **Build** | ${B_BUILD:-—}s ${B_ICON} | ${V_BUILD:-—}s ${V_ICON} | ${BUILD_DELTA} |
+          | **Tests** | ${B_TEST_DUR:-—}s — ${B_TESTS} | ${V_TEST_DUR:-—}s — ${V_TESTS} | ${TEST_DELTA} |
+
+          ${CONCLUSION}
+
+          EOF
+
+          # Append logs in collapsible sections
+          echo '<details>' >> "$REPORT"
+          echo '<summary>Build logs</summary>' >> "$REPORT"
+          echo '' >> "$REPORT"
+          if [ -f baseline-build.log ]; then
+            echo '**Baseline (Vue):**' >> "$REPORT"
+            echo '```' >> "$REPORT"
+            tail -n 50 baseline-build.log >> "$REPORT"
+            echo '```' >> "$REPORT"
+            echo '' >> "$REPORT"
+          fi
+          if [ -f verter-build.log ]; then
+            echo '**Verter:**' >> "$REPORT"
+            echo '```' >> "$REPORT"
+            tail -n 50 verter-build.log >> "$REPORT"
+            echo '```' >> "$REPORT"
+          fi
+          echo '</details>' >> "$REPORT"
+
+          if [ -f baseline-test.log ] || [ -f verter-test.log ]; then
+            echo '' >> "$REPORT"
+            echo '<details>' >> "$REPORT"
+            echo '<summary>Test logs</summary>' >> "$REPORT"
+            echo '' >> "$REPORT"
+            if [ -f baseline-test.log ]; then
+              echo '**Baseline (Vue):**' >> "$REPORT"
+              echo '```' >> "$REPORT"
+              tail -n 50 baseline-test.log >> "$REPORT"
+              echo '```' >> "$REPORT"
+              echo '' >> "$REPORT"
+            fi
+            if [ -f verter-test.log ]; then
+              echo '**Verter:**' >> "$REPORT"
+              echo '```' >> "$REPORT"
+              tail -n 50 verter-test.log >> "$REPORT"
+              echo '```' >> "$REPORT"
+            fi
+            echo '</details>' >> "$REPORT"
+          fi
+
+      - name: Upload project report
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: report-${{ matrix.project.name }}
+          path: |
+            report-${{ matrix.project.name }}.md
+            status/status.txt
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: logs-${{ matrix.project.name }}
+          path: |
+            baseline-build.log
+            baseline-test.log
+            verter-build.log
+            verter-test.log
+            verter-e2e.log
+          if-no-files-found: ignore
+
+      - name: Add to job summary
+        if: always()
+        run: |
+          cat report-${{ matrix.project.name }}.md >> $GITHUB_STEP_SUMMARY
+
+  # Aggregate results and create final summary
+  summary:
+    name: Generate Summary
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    needs: [test-project]
+    if: always()
+    steps:
+      - name: Download all reports
+        uses: actions/download-artifact@v7
+        with:
+          pattern: report-*
+          path: reports
+
+      - name: Generate aggregate summary
+        run: |
+          SUMMARY_DATE=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
+
+          # Helper: format test counts
+          fmt_tests() {
+            local st="$1" p="$2" f="$3"
+            if [ "$st" = "skipped" ]; then echo "skipped"; return; fi
+            if [ "${f:-0}" -gt 0 ] 2>/dev/null; then
+              echo "❌ $f/$((p + f))"
+            elif [ "${p:-0}" -gt 0 ] 2>/dev/null; then
+              echo "✅ $p/$((p + 0))"
+            elif [ "$st" = "passed" ]; then echo "✅"
+            elif [ "$st" = "failed" ]; then echo "❌"
+            else echo "—"; fi
+          }
+
+          TOTAL=0 PASSED=0 WARNING=0 FAILED=0
+          TABLE_ROWS=""
+
+          for report_dir in reports/report-*; do
+            if [ -d "$report_dir" ] && [ -f "$report_dir/status/status.txt" ]; then
+              TOTAL=$((TOTAL + 1))
+
+              # Reset variables before sourcing
+              project="" build_status="" test_status="" overall_status=""
+              baseline_build="" verter_build="" baseline_test="" verter_test=""
+              baseline_test_passed="" baseline_test_failed="" baseline_test_status=""
+              verter_test_passed="" verter_test_failed=""
+
+              source "$report_dir/status/status.txt"
+
+              # Status
+              case "$overall_status" in
+                pass)    PASSED=$((PASSED + 1));  ICON="✅" ;;
+                warning) WARNING=$((WARNING + 1)); ICON="⚠️" ;;
+                *)       FAILED=$((FAILED + 1));  ICON="❌" ;;
+              esac
+
+              # Build column: "45s → 38s (-15%)" or "45s → ❌"
+              BUILD_COL="—"
+              if [ -n "$baseline_build" ] && [ "$baseline_build" -gt 0 ] 2>/dev/null; then
+                if [ "$build_status" = "success" ] && [ -n "$verter_build" ] && [ "$verter_build" -gt 0 ] 2>/dev/null; then
+                  DIFF=$((verter_build - baseline_build))
+                  PCT=$((DIFF * 100 / baseline_build))
+                  if [ $DIFF -gt 0 ]; then DELTA_STR="+${PCT}%"
+                  elif [ $DIFF -lt 0 ]; then DELTA_STR="${PCT}%"
+                  else DELTA_STR="="; fi
+                  BUILD_COL="${baseline_build}s → ${verter_build}s (${DELTA_STR})"
+                else
+                  BUILD_COL="${baseline_build}s → ❌"
+                fi
+              elif [ "$build_status" = "success" ] && [ -n "$verter_build" ]; then
+                BUILD_COL="— → ${verter_build}s"
+              fi
+
+              # Tests column: "✅ 42 → ✅ 42" or "✅ 10 → ❌ 2/10"
+              B_TESTS=$(fmt_tests "$baseline_test_status" "$baseline_test_passed" "$baseline_test_failed")
+              V_TESTS=$(fmt_tests "$test_status" "$verter_test_passed" "$verter_test_failed")
+              TESTS_COL="${B_TESTS} → ${V_TESTS}"
+
+              TABLE_ROWS="${TABLE_ROWS}| **${project}** | ${BUILD_COL} | ${TESTS_COL} | ${ICON} |
+          "
+            fi
+          done
+
+          # Determine overall workflow status
+          if [ "$FAILED" -gt 0 ]; then WORKFLOW_STATUS="❌ Failed"
+          elif [ "$WARNING" -gt 0 ]; then WORKFLOW_STATUS="⚠️ Warning"
+          else WORKFLOW_STATUS="✅ Passed"; fi
+
+          # Write summary
+          cat > integration-test-summary.md << EOF
+          # Verter Integration Test Summary
+
+          **Run #${{ github.run_number }}** | ${{ github.event_name }} | ${SUMMARY_DATE}
+
+          | Project | Build (Vue → Verter) | Tests (Vue → Verter) | |
+          |---------|---------------------|---------------------|---|
+          ${TABLE_ROWS}
+
+          **${PASSED}** passed / **${WARNING}** warnings / **${FAILED}** failed — ${WORKFLOW_STATUS}
+          EOF
+
+          # Store overall status for PR comment check
+          echo "$WORKFLOW_STATUS" > overall-status.txt
+          echo "$FAILED" > failed-count.txt
+
+      - name: Upload aggregate summary
+        uses: actions/upload-artifact@v6
+        with:
+          name: integration-test-summary
+          path: integration-test-summary.md
+
+      - name: Add to workflow summary
+        run: |
+          cat integration-test-summary.md >> $GITHUB_STEP_SUMMARY
+
+      - name: Post PR comment (if triggered from PR)
+        if: github.event_name == 'issue_comment'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const summary = fs.readFileSync('integration-test-summary.md', 'utf8');
+            const overallStatus = fs.readFileSync('overall-status.txt', 'utf8').trim();
+            const failedCount = parseInt(fs.readFileSync('failed-count.txt', 'utf8').trim());
+
+            // Get PR details to get the head SHA
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.payload.issue.number
+            });
+
+            // Determine check status based on failures
+            let checkConclusion = 'success';
+            let checkTitle = 'Integration Tests Passed';
+
+            if (failedCount > 0) {
+              checkConclusion = 'failure';
+              checkTitle = `Integration Tests Failed (${failedCount} project(s))`;
+            } else if (overallStatus.includes('⚠️')) {
+              checkConclusion = 'neutral';
+              checkTitle = 'Integration Tests Passed with Warnings';
+            }
+
+            // Create a check run for the PR
+            try {
+              await github.rest.checks.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                name: 'Verter Integration Tests',
+                head_sha: pr.head.sha,
+                status: 'completed',
+                conclusion: checkConclusion,
+                output: {
+                  title: checkTitle,
+                  summary: summary,
+                  text: `Full results: ${context.payload.repository.html_url}/actions/runs/${context.runId}`
+                }
+              });
+            } catch (error) {
+              console.log('Failed to create check run:', error.message);
+              // Continue with comment posting even if check creation fails
+            }
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.issue.number
+            });
+
+            // Find existing bot comment
+            const botComment = comments.find(c =>
+              c.user.login === 'github-actions[bot]' &&
+              c.body.includes('Verter Integration Test Summary')
+            );
+
+            const commentBody = summary + `\n\n---\n[View full run](${context.payload.repository.html_url}/actions/runs/${context.runId})`;
+
+            if (botComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body: commentBody
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.issue.number,
+                body: commentBody
+              });
+            }
+
+            // React with checkmark to original comment
+            await github.rest.reactions.createForIssueComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: context.payload.comment.id,
+              content: '+1'
+            });

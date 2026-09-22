@@ -1,0 +1,40 @@
+name: Test workflow
+
+on:
+  workflow_dispatch:  # Allow manual triggering for testing
+
+jobs:
+  commit:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Configure Git
+        run: |
+          git config --local user.email "${{ github.actor_id }}+${{ github.actor }}@users.noreply.github.com"
+          git config --local user.name "${{ github.actor }}"
+
+      - name: Run daily commit script
+        run: python3 daily_commit.py --test --no-push
+
+      - name: Push changes (if any commits were made)
+        run: |
+          if [ -z "$(git log origin/main..HEAD)" ]; then
+            echo "No commits to push"
+          else
+            echo "Pushing commits to remote..."
+            git push
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

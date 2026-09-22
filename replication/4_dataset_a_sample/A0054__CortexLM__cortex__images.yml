@@ -1,0 +1,329 @@
+name: images
+
+# Build service images, push by commit SHA + branch tag, record digests as an artifact.
+# Digests-only pins are consumed by deploy/scripts/promote.sh.
+# After merge: promote pin services into deploy/pins/staging.json and commit so
+# deploy-prod preflight can match staging.json.commit_sha to the image SHA.
+# Service images use GHCR.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "bins/**"
+      - "deploy/Dockerfile"
+      - "deploy/attest-helper/**"
+      # Ops scripts (promote/remote-deploy/burn-seal) — keep the
+      # digest → staging-pin ladder reachable for ops-only commits.
+      - "deploy/scripts/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "deny.toml"
+      - ".github/workflows/images.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+
+concurrency:
+  group: images-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-push-digests:
+    name: build · push · record digests
+    if: ${{ github.event_name != 'pull_request' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: validator
+            image_suffix: validator
+            dockerfile: deploy/Dockerfile
+          - target: gateway
+            image_suffix: gateway
+            dockerfile: deploy/Dockerfile
+          - target: updater
+            image_suffix: updater
+            dockerfile: deploy/Dockerfile
+          - target: bounty-challenge
+            image_suffix: bounty-challenge
+            dockerfile: deploy/Dockerfile
+          - target: proof-challenge
+            image_suffix: proof-challenge
+            dockerfile: deploy/Dockerfile
+          - target: ""
+            image_suffix: base-attest-helper
+            dockerfile: deploy/attest-helper/Dockerfile
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Lowercase GHCR image prefix
+        run: |
+          set -euo pipefail
+          # GHCR rejects mixed-case repository paths (e.g. BaseIntelligence).
+          owner_repo="${GITHUB_REPOSITORY,,}"
+          echo "IMAGE_PREFIX=ghcr.io/${owner_repo}" >> "$GITHUB_ENV"
+          echo "IMAGE_PREFIX=ghcr.io/${owner_repo}"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.image_suffix == 'base-attest-helper' && 'deploy/attest-helper' || '.' }}
+          file: ${{ matrix.dockerfile }}
+          target: ${{ matrix.target }}
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: |
+            ${{ env.IMAGE_PREFIX }}/${{ matrix.image_suffix }}:${{ github.sha }}
+            ${{ env.IMAGE_PREFIX }}/${{ matrix.image_suffix }}:${{ github.ref_name }}
+          build-args: |
+            BUILD_FROM=source
+          provenance: false
+
+      - name: Write digest fragment
+        run: |
+          set -euo pipefail
+          mkdir -p digests-out
+          DIGEST="${{ steps.build.outputs.digest }}"
+          test -n "$DIGEST"
+          test "${DIGEST#sha256:}" != "$DIGEST"
+          REPO="${{ env.IMAGE_PREFIX }}/${{ matrix.image_suffix }}"
+          SVC="${{ matrix.image_suffix }}"
+          cat > "digests-out/${SVC}.json" <<EOF
+          {
+            "service": "${SVC}",
+            "repository": "${REPO}",
+            "tag_sha": "${{ github.sha }}",
+            "digest": "${DIGEST}",
+            "image": "${REPO}@${DIGEST}",
+            "commit_sha": "${{ github.sha }}"
+          }
+          EOF
+          cat "digests-out/${SVC}.json"
+
+      - name: Upload digest fragment
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.image_suffix }}
+          path: digests-out/${{ matrix.image_suffix }}.json
+          if-no-files-found: error
+
+  merge-digests:
+    name: merge digest manifest
+    needs: build-push-digests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download fragments
+        uses: actions/download-artifact@v4
+        with:
+          pattern: digest-*
+          path: digests-in
+          merge-multiple: true
+
+      - name: Merge + validate
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, pathlib, os
+          from datetime import datetime, timezone
+          root = pathlib.Path("digests-in")
+          images = {}
+          for p in sorted(root.glob("*.json")):
+              d = json.loads(p.read_text())
+              assert d["digest"].startswith("sha256:") and len(d["digest"]) == 71
+              assert "@sha256:" in d["image"]
+              images[d["service"]] = d
+          expected = {
+              "validator",
+              "gateway",
+              "updater",
+              "bounty-challenge",
+              "proof-challenge",
+              "base-attest-helper",
+          }
+          assert set(images) == expected, (set(images), expected)
+          out = {
+              "commit_sha": os.environ.get("GITHUB_SHA", ""),
+              "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "registry": "ghcr.io",
+              "images": images,
+          }
+          pathlib.Path("deploy/digests").mkdir(parents=True, exist_ok=True)
+          path = pathlib.Path("deploy/digests") / f"{out['commit_sha']}.json"
+          path.write_text(json.dumps(out, indent=2, sort_keys=True) + "\n")
+          print(path.read_text())
+          PY
+
+      - name: Upload merged digests
+        uses: actions/upload-artifact@v4
+        with:
+          name: base-image-digests-${{ github.sha }}
+          path: deploy/digests/${{ github.sha }}.json
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Close the staging → prod ladder: write deploy/digests/<sha>.json and promote
+  # pin services into deploy/pins/staging.json, then commit/push to origin/main.
+  # Staging droplet deploy remains --build-from source (deploy-staging / ci.yml).
+  # ---------------------------------------------------------------------------
+  update-staging-pins:
+    name: update · commit staging pins
+    needs: merge-digests
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download merged digests
+        uses: actions/download-artifact@v4
+        with:
+          name: base-image-digests-${{ github.sha }}
+          path: /tmp/digests-in
+
+      - name: Record digests + promote staging pins
+        run: |
+          set -euo pipefail
+          SHA="${{ github.sha }}"
+          mkdir -p deploy/digests
+          # Artifact may be the file itself or nested under deploy/digests/
+          SRC=""
+          if [[ -f "/tmp/digests-in/${SHA}.json" ]]; then
+            SRC="/tmp/digests-in/${SHA}.json"
+          elif [[ -f "/tmp/digests-in/deploy/digests/${SHA}.json" ]]; then
+            SRC="/tmp/digests-in/deploy/digests/${SHA}.json"
+          else
+            SRC=$(find /tmp/digests-in -name "${SHA}.json" -type f | head -1)
+          fi
+          test -n "$SRC" && test -f "$SRC"
+          cp "$SRC" "deploy/digests/${SHA}.json"
+          echo "Recorded digest manifest: deploy/digests/${SHA}.json"
+          chmod +x deploy/scripts/promote.sh
+          # Pin services only (validator/gateway/updater/live challenges).
+          # --skip-backup: this job records CI digests; Spaces/PG backup runs at
+          # prod promote (deploy-prod.yml, fail-closed).
+          for svc in validator gateway updater bounty-challenge proof-challenge; do
+            IMAGE=$(python3 -c '
+          import json, sys
+          d = json.load(open(sys.argv[1]))
+          meta = d["images"][sys.argv[2]]
+          print(meta["image"])
+          ' "deploy/digests/${SHA}.json" "$svc")
+            echo "staging promote $svc → $IMAGE"
+            ./deploy/scripts/promote.sh \
+              --env staging \
+              --service "$svc" \
+              --image "$IMAGE" \
+              --commit "$SHA" \
+              --skip-backup
+          done
+          python3 -c '
+          import json, sys
+          p = json.load(open("deploy/pins/staging.json"))
+          assert p["commit_sha"] == sys.argv[1], (p["commit_sha"], sys.argv[1])
+          for s in ("validator", "gateway", "updater", "bounty-challenge", "proof-challenge"):
+              assert s in p["services"], s
+              assert p["services"][s]["digest"].startswith("sha256:")
+          print("staging pins ok", p["commit_sha"])
+          ' "$SHA"
+
+      - name: Commit and push staging pins
+        run: |
+          set -euo pipefail
+          SHA="${{ github.sha }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "deploy/digests/${SHA}.json" deploy/pins/staging.json
+          if git diff --cached --quiet; then
+            echo "No pin/digest changes to commit"
+            exit 0
+          fi
+          git commit -m "deploy: staging pins for ${SHA}"
+          # Rebase onto latest main in case another pin commit landed.
+          git pull --rebase origin main
+          git push origin HEAD:main
+
+  # ---------------------------------------------------------------------------
+  # Make GHCR packages public so unauthenticated / Phala pulls work. Lives here
+  # rather than in ghcr-public.yml so it runs inline right after digests merge;
+  # ghcr-public.yml remains for manual re-runs.
+  # ---------------------------------------------------------------------------
+  ghcr-public:
+    needs: merge-digests
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Set package visibility public
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          # Nested image names: ghcr.io/<owner>/base/<suffix> → package name "base/<suffix>"
+          pkgs=(
+            "base/base-attest-helper"
+            "base/gateway"
+            "base/validator"
+            "base/updater"
+            "base/bounty-challenge"
+            "base/proof-challenge"
+          )
+          ok=0
+          # First list packages to Learn exact names (debug)
+          curl -sS -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/orgs/${OWNER}/packages?package_type=container&per_page=100" \
+            | tee /tmp/pkg-list.json | head -c 2000 || true
+          echo
+          for pkg in "${pkgs[@]}"; do
+            enc=$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=""))' "$pkg")
+            code=$(curl -sS -o "/tmp/vis-${enc}.json" -w "%{http_code}" \
+              -X PUT \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/orgs/${OWNER}/packages/container/${enc}/visibility" \
+              -d '{"visibility":"public"}' || true)
+            echo "pkg=${pkg} http=${code} body=$(head -c 200 "/tmp/vis-${enc}.json" || true)"
+            if [ "$code" = "204" ] || [ "$code" = "200" ]; then
+              ok=$((ok + 1))
+            fi
+          done
+          echo "publicized_ok=${ok}/${#pkgs[@]}"
+          # Soft fail while packages may not exist yet on first base build
+          if [ "$ok" -lt 1 ]; then
+            echo "WARNING: no packages publicized yet (may be missing until images run)"
+            exit 0
+          fi

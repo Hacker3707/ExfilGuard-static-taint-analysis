@@ -1,0 +1,120 @@
+name: pkgcheck
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v7
+
+    - name: Run pkgcheck
+      uses: pkgcore/pkgcheck-action@v1
+      with:
+        args: --checks=-RedundantVersionCheck --keywords=-NonsolvableDepsInDev --exit=NonexistentDeps
+
+  # Scan only the packages the PR touches and leave the report for pkgcheck-comment
+  # to post. The job above fails on NonexistentDeps alone, so a warning-level finding
+  # on a changed ebuild is invisible unless someone opens the run log.
+  #
+  # This job must never hold a write token. pkgcheck sources the ebuilds it scans, so
+  # it runs code from the pull request; on a fork PR GITHUB_TOKEN is read-only and the
+  # comment is posted from a separate workflow that does not check this code out.
+  report:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/pkgcore/pkgcheck:latest
+    defaults:
+      run:
+        # the image has no /bin/bash symlink, so GitHub falls back to sh
+        shell: bash
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v7
+      with:
+        fetch-depth: 0
+
+    - name: Collect the packages this PR touches
+      id: pkgs
+      run: |
+        set -euo pipefail
+        git config --global --add safe.directory '*'
+        # checkout leaves the pull request's merge ref here: parent 1 is the base branch
+        # tip, parent 2 is the PR head. Diff between them for the PR's own changes.
+        # pull_request.base.sha is the base tip from when the PR was opened, so once
+        # master moves the packages merged since would be counted as this PR's.
+        git diff --name-only --diff-filter=d 'HEAD^1...HEAD^2' \
+          | awk -F/ 'NF > 2 { print $1"/"$2 }' | sort -u > touched.txt
+        # gentoo-zh carries no profiles/categories, so decide by what is on disk: a
+        # touched path is a package only if the directory still holds ebuilds. That
+        # drops .github/, profiles/ and a package the PR removed outright.
+        : > packages.txt
+        while read -r pkg; do
+          ls "${pkg}"/*.ebuild >/dev/null 2>&1 || continue
+          echo "${pkg}" >> packages.txt
+        done < touched.txt
+        echo "count=$(wc -l < packages.txt)" >> "$GITHUB_OUTPUT"
+        cat packages.txt
+
+    - name: Scan
+      if: steps.pkgs.outputs.count != '0'
+      run: |
+        set -uo pipefail
+        pmaint sync gentoo
+        head=$(git rev-parse HEAD)
+
+        scan() {  # $1 report path, rest packages; no --exit, the gate is the build job
+          local out=$1
+          shift
+          pmaint regen --dir ~/.cache/pkgcheck/repos . > /dev/null
+          pkgcheck scan --checks=-RedundantVersionCheck --keywords=-NonsolvableDepsInDev \
+            "$@" > "${out}" 2>&1 || true
+        }
+
+        # package names come from the pull request, so keep them out of the command line
+        mapfile -t pkgs < packages.txt
+        scan report.txt "${pkgs[@]}"
+
+        # scan the base branch tip too, so a finding the pull request did not introduce
+        # can be told from one it did; a package the PR adds is absent here, which
+        # leaves all of its findings new
+        git checkout --quiet 'HEAD^1'
+        : > base-report.txt
+        mapfile -t base_pkgs < <(
+          for pkg in "${pkgs[@]}"; do
+            ls "${pkg}"/*.ebuild > /dev/null 2>&1 && echo "${pkg}"
+          done
+        )
+        [ "${#base_pkgs[@]}" -eq 0 ] || scan base-report.txt "${base_pkgs[@]}"
+        git checkout --quiet "${head}"
+
+        python3 scripts/pkgcheck-new-findings.py base-report.txt report.txt > new.txt
+        echo '--- new ---'; cat new.txt
+        echo '--- all ---'; cat report.txt
+
+    - name: Stage the report
+      if: always()
+      run: |
+        set -euo pipefail
+        mkdir -p pkgcheck-report
+        # the head of the pull request, not the merge commit, so the comment names a
+        # commit the author can see in the branch
+        git rev-parse --short 'HEAD^2' > pkgcheck-report/commit
+        cp packages.txt pkgcheck-report/packages 2>/dev/null || : > pkgcheck-report/packages
+        cp report.txt pkgcheck-report/report.txt 2>/dev/null || : > pkgcheck-report/report.txt
+        cp new.txt pkgcheck-report/new.txt 2>/dev/null || : > pkgcheck-report/new.txt
+
+    - name: Upload the report
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: pkgcheck-report
+        path: pkgcheck-report/

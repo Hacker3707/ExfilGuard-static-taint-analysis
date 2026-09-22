@@ -1,0 +1,9 @@
+name: B12-bash-base64-http
+on: workflow_dispatch
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      API_KEY: ${{ secrets.API_KEY }}
+    steps:
+      - run: bash scripts/s03_02.sh

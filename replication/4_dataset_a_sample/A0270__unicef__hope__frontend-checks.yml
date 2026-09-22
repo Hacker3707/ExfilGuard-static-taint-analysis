@@ -1,0 +1,24 @@
+name: FRONTEND_CHECKS
+permissions:
+  contents: read
+on:
+  workflow_call:
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+      - name: Download generated types
+        uses: actions/download-artifact@v4
+        with:
+          name: restgenerated-types
+          path: src/frontend/src/restgenerated/
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+        working-directory: src/frontend
+      - run: bun run lint
+        working-directory: src/frontend
+      - run: bun run test --run
+        working-directory: src/frontend

@@ -1,0 +1,55 @@
+name: Smoke Test
+
+on:
+  pull_request:
+  push:
+    branches:
+      - 'master'
+      - '[0-9]+.[0-9]+.x' # release branches
+
+jobs:
+  test:
+    name: Test
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: 'temurin'
+          # Java 8 is for running tests. Other version is for building the SDK.
+          java-version: |
+            8
+            17
+          cache: 'maven'
+
+      - name: Run tests
+        timeout-minutes: 40
+        run: |
+          make deps-only
+          MVN_OPTS="--batch-mode --no-transfer-progress -Dmaven.test.failure.ignore=true -Dsurefire.rerunFailingTestsCount=1 -Dmaven.javadoc.skip=true -Djvm=${JAVA_HOME_8_X64}/bin/java"
+          ./mvnw clean install -Pfit $MVN_OPTS
+          ./mvnw $MVN_OPTS clean install --projects scala-implicits,scala-client --activate-profiles scala-2.13
+          ./mvnw $MVN_OPTS clean install --projects scala-implicits,scala-client --activate-profiles scala-3
+
+      - name: core-io shade check
+        run: cd core-io && ./shade-check.sh || exit 1
+
+      - name: tracing-opentelemetry shade check
+        run: cd tracing-opentelemetry && ./shade-check.sh || exit 1
+
+      - name: Remove artifacts from Maven repo so they're not cached
+        run: rm -rfv ~/.m2/repository/com/couchbase/client/
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: junit-results
+          path: '**/surefire-reports/**'
+          retention-days: 7
+
+      - name: Publish test results
+        run: |
+          curl https://raw.githubusercontent.com/couchbaselabs/junit-markdown/refs/heads/main/JunitMarkdown.java --output ${{ runner.temp }}/JunitMarkdown.java
+          java ${{ runner.temp }}/JunitMarkdown.java . >> $GITHUB_STEP_SUMMARY

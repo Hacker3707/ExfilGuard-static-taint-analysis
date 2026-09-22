@@ -1,0 +1,90 @@
+name: flaker-scheduled
+
+on:
+  # Manual-only: rewired from the retired MoonBit-host suite (#594) to the
+  # selfhost unit-test battery (#988 — flaker.toml custom runner via
+  # scripts/flaker_vibe_runner.mjs). Re-enable a cron schedule once the
+  # selfhost runs are trusted.
+  workflow_dispatch:
+
+jobs:
+  full-run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Cache seed artifact
+        uses: actions/cache@v4
+        with:
+          path: bootstrap/seed/compiler.wasm
+          key: seed-artifact-${{ hashFiles('bootstrap/seed.json') }}
+
+      - name: Ensure seed artifact
+        # bootstrap/seed/compiler.wasm is a local build cache (gitignored,
+        # not git-tracked) — the compiler build the suite compiles against
+        # needs it.
+        run: bash scripts/ensure_seed.sh
+      - name: Generated compiler artifacts (fingerprint)
+        # Build outputs, not tracked files -- see scripts/ensure_generated.sh.
+        id: genfp
+        run: echo "fp=$(bash scripts/ensure_generated.sh --print-fingerprint)" >> "$GITHUB_OUTPUT"
+      - name: Cache generated compiler artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            lib/@vibe/compiler/compiler_sources_bundle.vibe
+            lib/@vibe/compiler/cli_adapter_bundle.vibe
+            lib/@vibe/compiler/selfbuild_runtime_entry_bundle.vibe
+            lib/@vibe/compiler/_cli_adapter_module_source.vibe
+            lib/@vibe/compiler/cache/codegen_fingerprint.vibe
+            lib/@vibe/compiler/.generated.stamp
+          key: gen-v1-${{ steps.genfp.outputs.fp }}
+      - name: Ensure generated compiler artifacts
+        run: bash scripts/ensure_generated.sh
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+
+      - name: Install wasmtime
+        # Optional for the unit-test battery: allowlisted files that shell
+        # out to the wasmtime CLI are skipped when it is missing (#769).
+        # Install it so the full run covers them. Version pinned to ci.yml's.
+        env:
+          WASMTIME_VERSION: v47.0.2
+        run: |
+          set -euo pipefail
+          dir="wasmtime-${WASMTIME_VERSION}-x86_64-linux"
+          curl -sSL --fail --retry 5 --retry-delay 2 --retry-all-errors "https://github.com/bytecodealliance/wasmtime/releases/download/${WASMTIME_VERSION}/${dir}.tar.xz" | tar -xJ
+          echo "$PWD/$dir" >> "$GITHUB_PATH"
+
+      - name: Install flaker
+        run: npm install -g @mizchi/flaker
+
+      - name: Restore flaker DB
+        uses: actions/cache/restore@v4
+        with:
+          path: .flaker/
+          key: flaker-db-main
+          restore-keys: flaker-db-
+
+      - name: Full test run
+        # The custom runner's first execute builds a fresh
+        # seed->stage1->stage2 generation (scripts/unit_test_runner.sh),
+        # then runs the whole allowlist through it.
+        run: flaker run --profile scheduled
+
+      - name: Save flaker DB
+        uses: actions/cache/save@v4
+        with:
+          path: .flaker/
+          key: flaker-db-main-${{ github.run_id }}
+
+      - name: Upload DB artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: flaker-db
+          path: .flaker/
+          retention-days: 30

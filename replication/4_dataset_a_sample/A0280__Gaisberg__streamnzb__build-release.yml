@@ -1,0 +1,277 @@
+name: build-release
+
+on:
+  release:
+    types: [published]
+  push:
+    branches-ignore:
+      - 'release-please--branches--main'
+      # Dependabot pushes a branch per update. Without this, each one builds
+      # five platforms and tries to publish images it has no secrets for —
+      # and a dependency bump is not something to release from a branch.
+      - 'dependabot/**'
+    # The release-please merge commit lands on main carrying only these two
+    # files, and the tag's `release: published` event rebuilds the same code
+    # seconds later. Without this the push still starts a run: the publish job
+    # skipped itself, but `verify` had already spent two minutes on the whole
+    # test suite for a changelog entry. Now the push produces no run at all.
+    #
+    # Same self-limiting property as ci.yml's filter: `paths-ignore` only skips
+    # when *every* changed file matches, so a release commit that ever carries
+    # code still builds.
+    paths-ignore:
+      - 'CHANGELOG.md'
+      - '.release-please-manifest.json'
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Tag name for the build (e.g., v1.0.0)'
+        required: false
+        default: 'manual-build'
+
+permissions:
+  contents: write
+  packages: write
+  # Required because this workflow calls ci.yml, whose `changes` job reads the
+  # pull request's file list. A called workflow may not request a permission the
+  # caller has not granted, and the check happens when the file is parsed — not
+  # when the step runs — so it fails even on the push and release paths, where
+  # that job never touches the API.
+  pull-requests: read
+
+jobs:
+  # Nothing is published for a tree that does not pass the same checks build.sh
+  # runs locally. Reused from ci.yml rather than repeated here so the release
+  # gate and the pull-request check can never drift apart.
+  verify:
+    # Backstop to the paths-ignore above, for the day a release commit carries
+    # something besides the changelog: the filter would let the push through,
+    # and without this the suite would run in full for a build that then skips.
+    if: >-
+      github.event_name != 'push' ||
+      !startsWith(github.event.head_commit.message, 'chore(main): release')
+    uses: ./.github/workflows/ci.yml
+
+  build-release:
+    needs: verify
+    # Skip the release-please merge commit on push: the same code is rebuilt
+    # seconds later by the tag's `release: published` event.
+    if: >-
+      github.event_name != 'push' ||
+      !startsWith(github.event.head_commit.message, 'chore(main): release')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Lowercase repo name
+        run: |
+          echo "REPO=${GITHUB_REPOSITORY,,}" >> "${GITHUB_ENV}"
+
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.25'
+          cache: false
+
+      # setup-go's built-in cache is keyed only on go.sum, so the build cache
+      # freezes at the last dependency change and goes stale as commits land.
+      # Key on the commit SHA instead: every run saves an incremental cache and
+      # the next run restores the newest one via restore-keys.
+      - name: Cache Go build and module cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: go-${{ hashFiles('go.sum') }}-${{ github.sha }}
+          restore-keys: |
+            go-${{ hashFiles('go.sum') }}-
+            go-
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+        with:
+          driver: docker-container
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.MY_RELEASE_PLEASE_TOKEN }}
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build frontend
+        run: |
+          cd frontend
+          npm ci
+          npm run build
+          cd ..
+          mkdir -p pkg/server/web/static
+          cp -r frontend/dist/* pkg/server/web/static/
+
+      - name: Set version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            VERSION="${GITHUB_REF#refs/tags/}"
+            VERSION="${VERSION#v}"
+            echo "VERSION=$VERSION" >> "${GITHUB_OUTPUT}"
+          else
+            TAG="${{ github.event.inputs.tag_name }}"
+            if [ -n "$TAG" ] && [ "$TAG" != "manual-build" ]; then
+              echo "VERSION=${TAG#v}" >> "${GITHUB_OUTPUT}"
+            else
+              SHORT_SHA="${GITHUB_SHA:0:7}"
+              RELEASE_VERSION=$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+' .release-please-manifest.json | head -1 || echo "0.0.0")
+              echo "VERSION=${RELEASE_VERSION}-${SHORT_SHA}" >> "${GITHUB_OUTPUT}"
+            fi
+          fi
+
+      # The ffprobe version is pinned in installer.go, so the downloaded
+      # binaries only change when that file does.
+      - name: Cache embedded ffprobe binaries
+        id: ffprobe-cache
+        uses: actions/cache@v6
+        with:
+          path: pkg/media/ffprobe/bin
+          key: ffprobe-${{ hashFiles('pkg/media/ffprobe/installer.go') }}
+
+      - name: Fetch embedded ffprobe binaries
+        if: steps.ffprobe-cache.outputs.cache-hit != 'true'
+        run: go run ./tools/fetch-ffprobe
+
+      - name: Build binaries
+        run: |
+          mkdir -p dist/linux_amd64 dist/linux_arm64 dist/windows_amd64 dist/darwin_amd64 dist/darwin_arm64
+          LDFLAGS="-s -w -X main.TMDBKey=${{ secrets.TMDB_API_KEY }} -X main.TVDBKey=${{ secrets.TVDB_API_KEY }} -X main.SimklKey=${{ secrets.SIMKL_CLIENT_ID }} -X main.Version=${{ steps.version.outputs.VERSION }}"
+          # -tags embedffprobe bundles the matching ffprobe binary (fetched above) into each build.
+          pids=()
+          build() {
+            CGO_ENABLED=0 GOOS="$1" GOARCH="$2" go build -tags embedffprobe -ldflags="$LDFLAGS" -o "$3" ./cmd/streamnzb &
+            pids+=($!)
+          }
+          build linux amd64 dist/linux_amd64/streamnzb
+          build linux arm64 dist/linux_arm64/streamnzb
+          build windows amd64 dist/windows_amd64/streamnzb.exe
+          build darwin amd64 dist/darwin_amd64/streamnzb
+          build darwin arm64 dist/darwin_arm64/streamnzb
+          fail=0
+          for pid in "${pids[@]}"; do wait "$pid" || fail=1; done
+          exit $fail
+
+      # Pushes to main publish the rolling `dev` image; other branches keep
+      # their own name. Releases also refresh `dev`: the release-please merge
+      # commit never gets its own push build, so without this the tag would go
+      # stale the moment a release lands.
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: |
+            ghcr.io/${{ env.REPO }}
+            ${{ env.REPO }}
+          tags: |
+            type=ref,event=tag
+            type=ref,event=branch,enable=${{ github.ref != 'refs/heads/main' }}
+            type=raw,value=${{ github.event.inputs.tag_name || 'latest' }},enable=${{ github.event_name == 'workflow_dispatch' }}
+            type=raw,value=latest,enable=${{ github.event_name == 'release' }}
+            type=raw,value=dev,enable=${{ github.ref == 'refs/heads/main' || github.event_name == 'release' }}
+
+      - name: Build and push Docker image
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Every dev image lands with a message in #dev-testing so testers know a
+      # new build is up without watching CI. DISCORD_DEV_WEBHOOK is that
+      # channel's webhook — releases announce through DISCORD_WEBHOOK above,
+      # this one is only for main pushes. allowed_mentions is emptied so the
+      # message can never ping anyone, even if a commit subject carries
+      # @everyone or a user mention. The push payload's commits array covers
+      # every commit in the push (not just HEAD); force-pushes can leave it
+      # empty, so head_commit remains as the fallback.
+      - name: Announce dev build in Discord
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          WEBHOOK_URL: ${{ secrets.DISCORD_DEV_WEBHOOK }}
+          VERSION: ${{ steps.version.outputs.VERSION }}
+        run: |
+          jq -n \
+            --arg version "$VERSION" \
+            --arg pull "docker pull ghcr.io/${REPO}:dev" \
+            --slurpfile event "$GITHUB_EVENT_PATH" \
+            '
+            (if ($event[0].commits // []) == [] then [$event[0].head_commit // empty]
+             else $event[0].commits end) as $commits |
+            ($commits | map("`" + (.message | split("\n")[0]) + "`")) as $lines |
+            (if ($lines | length) > 10
+             then $lines[:10] + ["… and \(($lines | length) - 10) more"]
+             else $lines end) as $shown |
+            {
+              username: "Dev Builds",
+              allowed_mentions: {parse: []},
+              embeds: [{
+                title: ("New dev build " + $version),
+                url: (if ($commits | length) > 1 then $event[0].compare
+                      else ("https://github.com/" + env.GITHUB_REPOSITORY + "/commit/" + env.GITHUB_SHA) end),
+                description: (($shown | join("\n")) + "\n\n```\n" + $pull + "\n```"),
+                color: 15105570
+              }]
+            }' | curl -sf -H "Content-Type: application/json" -d @- "$WEBHOOK_URL" \
+            || echo "::warning::Discord dev-build announcement failed"
+
+      - name: Prepare Release Assets
+        if: github.event_name == 'release'
+        run: |
+          mkdir -p release_assets
+          cp dist/linux_amd64/streamnzb release_assets/streamnzb-linux-amd64
+          cp dist/linux_arm64/streamnzb release_assets/streamnzb-linux-arm64
+          cp dist/windows_amd64/streamnzb.exe release_assets/streamnzb-windows-amd64.exe
+          cp dist/darwin_amd64/streamnzb release_assets/streamnzb-darwin-amd64
+          cp dist/darwin_arm64/streamnzb release_assets/streamnzb-darwin-arm64
+
+      - name: Upload Release Assets
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ secrets.MY_RELEASE_PLEASE_TOKEN }}
+        run: |
+          gh release upload ${{ github.ref_name }} release_assets/*
+
+      - name: GitHub Releases to Discord
+        if: github.event_name == 'release'
+        uses: SethCohen/github-releases-to-discord@v1.20.0
+        with:
+          webhook_url: ${{ secrets.DISCORD_WEBHOOK }}
+          release_name: ${{ github.event.release.name }}
+          release_body: ${{ github.event.release.body }}
+          release_html_url: ${{ github.event.release.html_url }}
+          color: "2105893"
+          username: "Release Changelog"
+          avatar_url: "https://cdn.discordapp.com/icons/1470288400157380710/6f397b4a2e9561dc7ad43526588cfd67.png"
+          content: "||@everyone||"
+          footer_title: "Changelog"
+          reduce_headings: true

@@ -1,0 +1,364 @@
+---
+name: Code static analysis
+on:  # yamllint disable-line rule:truthy
+  push:
+    branches: [main, stable, 'rhoai-*']
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  check-generated-code:
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Fetch base and head refs for lock scoping
+        if: github.event_name == 'pull_request'
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          git fetch --no-tags origin "pull/${PR_NUMBER}/head:${HEAD_REF}"
+          git fetch --no-tags origin "+refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}"
+
+      - name: Setup uv and Python
+        uses: ./.github/actions/setup-uv
+
+      - name: Install skopeo
+        uses: ./.github/actions/apt-install
+        with:
+          packages: skopeo
+
+      - name: Login to quay.io/aipcc (if the secret is present)
+        shell: bash
+        env:
+          AIPCC_USER: ${{ secrets.AIPCC_QUAY_BOT_USERNAME }}
+          AIPCC_PASS: ${{ secrets.AIPCC_QUAY_BOT_PASSWORD }}
+        run: |
+          if [[ -z "${AIPCC_USER}" ]]; then
+            echo "AIPCC_QUAY_BOT_USERNAME is not set, skipping quay.io/aipcc login"
+            exit 0
+          fi
+          printf '%s' "${AIPCC_PASS}" | skopeo login --username "${AIPCC_USER}" --password-stdin quay.io
+
+      - name: Rerun all code generators we have (pr)
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: bash ci/generate_code.sh --pr-base "origin/${BASE_REF}" --pr-to-ref "${HEAD_REF}"
+
+      - name: Rerun all code generators we have (push)
+        if: github.event_name != 'pull_request'
+        run: bash ci/generate_code.sh
+
+      - name: Check there aren't any modified files present
+        run: |
+          clean=$(git status --porcelain)
+          if [[ -z "$clean" ]]; then
+              echo "Empty git status --porcelain: $clean"
+          else
+              echo "::error::Please run 'bash ci/generate_code.sh' (the command from the previous step), commit the changed files locally, and push again."
+              echo "Uncommitted file changes detected: $clean"
+              git diff
+              exit 1
+          fi
+
+  pytest-tests:
+    permissions:
+      contents: read
+      packages: read
+      code-quality: write  # upload coverage to GitHub Code Quality
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false  # https://github.com/actions/checkout/issues/2312
+          # Full history so tests/test_pylock_downgrade.py can `git show origin/main:…/pylock.toml`.
+          fetch-depth: 0
+          # Check out the PR head (not the merge commit) so coverage maps to head.sha, which is
+          # what upload-code-coverage attributes the report to (matches the action's README
+          # example). On push, head.sha is empty -> falls back to github.sha (unchanged).
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Login to GitHub Container Registry
+        if: ${{ github.repository != 'opendatahub-io/notebooks' }}
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup uv and Python
+        uses: ./.github/actions/setup-uv
+
+      - name: Check uv is installed correctly
+        run: uv version
+
+      - name: Install deps
+        id: install-deps
+        run: uv sync --locked
+
+      - name: Static tests (pytest + Dockerfile alignment)
+        id: static-tests
+        run: make test
+        if: ${{ steps.install-deps.conclusion == 'success' && !cancelled() }}
+        env:
+          PYTEST_ADDOPTS: >-
+            --cov=.
+            --cov-branch
+            --cov-report=term-missing
+            --cov-report=xml:coverage.xml
+            --junitxml=junit.xml -o junit_family=legacy
+            -o log_file=logs/pytest-logs.txt -o log_file_level=DEBUG
+          # pytest's --color=auto sees a non-tty stdout in CI and disables color;
+          # FORCE_COLOR forces it back on for the (colorable) GitHub Actions log viewer.
+          FORCE_COLOR: "1"
+          # PR: compare to the PR base (fork PRs vs upstream main, not the fork default branch).
+          # Push: compare to the previous tip of this branch (not origin/main on stable/rhoai-*).
+          NOTEBOOKS_DOWNGRADE_BASE_REF: ${{ github.event.pull_request.base.sha || github.event.before }}
+
+      - name: Upload pytest debug log
+        if: ${{ always() && steps.static-tests.conclusion != 'skipped' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          path: logs/pytest-logs.txt
+          archive: false
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Upload Python coverage to Codecov
+        if: ${{ !cancelled() && steps.install-deps.conclusion == 'success' }}
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f  # v7.0.0
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          slug: opendatahub-io/notebooks
+          files: coverage.xml
+          flags: python
+          fail_ci_if_error: false
+
+      # --- GitHub Code Quality: native code coverage on PRs (complements Codecov) ---
+      # One-time repo setup: Settings > Security > Code quality > Enable code quality.
+      # Needs (1) a Cobertura XML report -- coverage.xml, produced above by pytest-cov
+      # via PYTEST_ADDOPTS -- and (2) code-quality:write, granted on this job's perms.
+      # Fork PRs and merge_group runs are skipped by the action itself (read-only token).
+      # Feature docs:   https://docs.github.com/en/code-security/code-quality
+      # Setup guide:    https://docs.github.com/en/code-security/how-tos/maintain-quality-code/set-up-code-coverage
+      # Enable feature: https://docs.github.com/en/code-security/how-tos/maintain-quality-code/enable-code-quality
+      # Upload action:  https://github.com/actions/upload-code-coverage
+      # NOTE: on push/workflow_dispatch this action interpolates github.ref_name/github.ref into a
+      # shell run: (upstream script injection: https://github.com/actions/upload-code-coverage/issues/26).
+      # Only reachable with write access (which already grants CI code execution), so no marginal
+      # risk here; the fix belongs upstream (pass those values via env:).
+      - name: Upload Python coverage to GitHub Code Quality
+        if: ${{ !cancelled() && steps.install-deps.conclusion == 'success' }}
+        uses: actions/upload-code-coverage@d8e329117199404bba6fc81efe8093dc7c015e34  # v1.4.2
+        with:
+          file: coverage.xml
+          language: Python
+          label: code-coverage/python
+          fail-on-error: false  # non-blocking, matching the Codecov steps
+
+      - name: Upload test results to Codecov
+        if: ${{ !cancelled() && steps.install-deps.conclusion == 'success' }}
+        uses: codecov/test-results-action@0fa95f0e1eeaafde2c782583b36b28ad0d8c77d3  # v1.2.1
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
+
+  go-tests:
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+      code-quality: write  # upload coverage to GitHub Code Quality
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false  # don't leave the (code-quality:write) token in .git/config for PR code
+          # PR head (not the merge commit) so Go coverage maps to head.sha (see pytest-tests note).
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version-file: scripts/buildinputs/go.mod
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a  # v9.3.0
+        with:
+          version: v2.12.2
+          working-directory: scripts/buildinputs
+
+      - name: Install gotestsum
+        run: go install gotest.tools/gotestsum@v1.13.0
+
+      - name: Run Go tests with coverage and JUnit output
+        run: gotestsum --junitfile=junit-go.xml -- -coverprofile=coverage-go.out -covermode=atomic ./...
+        working-directory: scripts/buildinputs
+
+      - name: Convert Go coverage to Cobertura XML
+        id: go-cobertura
+        if: ${{ !cancelled() }}
+        continue-on-error: true  # optional coverage tooling must not fail the go-tests job
+        # upload-code-coverage only accepts Cobertura; Codecov reads the native .out directly.
+        # GitHub's documented Go recipe (see the "set-up-code-coverage" guide, language table):
+        #   go test -coverprofile=cover.out && gocover-cobertura < cover.out > coverage.xml
+        # https://docs.github.com/en/code-security/how-tos/maintain-quality-code/set-up-code-coverage
+        # https://github.com/boumenot/gocover-cobertura
+        run: |
+          go install github.com/boumenot/gocover-cobertura@v1.5.0
+          "$(go env GOPATH)/bin/gocover-cobertura" < coverage-go.out > coverage-go.xml
+        working-directory: scripts/buildinputs
+
+      - name: Upload Go coverage to Codecov
+        if: ${{ !cancelled() }}
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f  # v7.0.0
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          slug: opendatahub-io/notebooks
+          files: scripts/buildinputs/coverage-go.out
+          flags: go
+          fail_ci_if_error: false
+
+      # See the upstream-injection note on the Python upload above (github.com/actions/upload-code-coverage/issues/26).
+      - name: Upload Go coverage to GitHub Code Quality
+        if: ${{ !cancelled() && steps.go-cobertura.outcome == 'success' }}
+        uses: actions/upload-code-coverage@d8e329117199404bba6fc81efe8093dc7c015e34  # v1.4.2
+        with:
+          file: scripts/buildinputs/coverage-go.xml
+          language: Go
+          label: code-coverage/go
+          fail-on-error: false  # non-blocking, matching the Codecov steps
+
+      - name: Upload Go test results to Codecov
+        if: ${{ !cancelled() }}
+        uses: codecov/test-results-action@0fa95f0e1eeaafde2c782583b36b28ad0d8c77d3  # v1.2.1
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: scripts/buildinputs/junit-go.xml
+          fail_ci_if_error: false
+
+  code-static-analysis:
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Do not check secrets, they are encrypted
+        run: rm -rf ./ci/secrets
+
+      - name: Install linting tools
+        uses: ./.github/actions/apt-install
+        with:
+          packages: yamllint yajl-tools wget
+
+      - name: Validate YAML files (best code practices check included)
+        if: ${{ !cancelled() }}
+        id: validate-yaml-files
+        run: |
+          # We ignore .tekton (managed by devops), insta-merge.yaml, and machine-generated .lock.yaml lockfiles
+          # (e.g. rpms.lock.yaml, artifacts.lock.yaml — produced by rpm-lockfile-prototype with non-configurable indentation).
+          find . -name "*.yaml" | grep -v "./.tekton/" | grep -v "./.github/workflows/insta-merge.yaml" | grep -v "\.lock\.yaml$" | xargs yamllint --strict --config-file ./ci/yamllint-config.yaml
+          find . -name "*.yml" | grep -v "./.tekton/" | xargs yamllint --strict --config-file ./ci/yamllint-config.yaml
+
+      # The version is pinned in the URL (same pattern as hadolint above). The
+      # config at .github/actionlint.yaml is picked up automatically.
+      - name: Validate GitHub workflows (actionlint)
+        if: ${{ !cancelled() }}
+        id: validate-github-workflows
+        run: |
+          wget --output-document=actionlint.tar.gz https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
+          tar -xzf actionlint.tar.gz actionlint
+          chmod a+x actionlint
+          ./actionlint .github/workflows/*.yaml .github/workflows/*.yml
+
+      # In some YAML files we use JSON strings, let's check these
+      - name: Validate JSON strings in YAML files (just syntax)
+        if: ${{ !cancelled() }}
+        id: validate-json-strings-in-yaml-files
+        run: |
+          bash ./ci/check-json.sh
+
+      - name: Validate JSON files (just syntax)
+        if: ${{ !cancelled() }}
+        id: validate-json-files
+        run: ./ci/validate_json.py
+
+      - name: Validate Dockerfiles
+        if: ${{ !cancelled() }}
+        id: validate-dockerfiles
+        run: |
+          wget --output-document=hadolint https://github.com/hadolint/hadolint/releases/download/v2.15.0/hadolint-Linux-x86_64
+          chmod a+x hadolint
+          echo "Starting Hadolint"
+          find . -name "Dockerfile*" -print0 | xargs -0 ./hadolint --config ./ci/hadolint-config.yaml
+          echo "Hadolint done"
+
+      # This simply checks that the manifests and respective kustomization.yaml finishes without an error.
+      - name: Check kustomize manifest
+        if: ${{ !cancelled() }}
+        id: kustomize-manifests
+        run: ./ci/kustomize.sh
+
+  # https://github.com/pre-commit/action
+  prek:
+    name: "prek"
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-uv
+      - name: "Install workspace packages for prek"
+        run: uv sync --locked --all-packages
+      - name: "Cache prek"
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ~/.cache/prek
+          key: prek-${{ hashFiles('.pre-commit-config.yaml') }}
+      # https://github.com/astral-sh/ruff/blob/3bfdb1208392802d3b38ec771789a99437c482d0/.github/workflows/ci.yaml#L810
+      - name: "Run prek"
+        run: |
+          echo '```console' > "$GITHUB_STEP_SUMMARY"
+          # Enable color output for prek and remove it for the summary
+          # Use --hook-stage=manual to enable slower hooks that are skipped by default
+          uvx prek run --all-files --show-diff-on-failure --color always --hook-stage manual | \
+            tee >(sed -E 's/\x1B\[([0-9]{1,2}(;[0-9]{1,2})*)?[mGK]//g' >> "$GITHUB_STEP_SUMMARY") >&1
+          exit_code="${PIPESTATUS[0]}"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          exit "$exit_code"
+
+  action-pin-check:
+    name: GitHub Actions SHA pinning
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+    env:
+      PINACT_VERSION: "3.9.0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinact
+        run: |
+          curl -sL "https://github.com/suzuki-shunsuke/pinact/releases/download/v${PINACT_VERSION}/pinact_linux_amd64.tar.gz" \
+            | tar xz -C /usr/local/bin
+      - name: Check all actions are SHA-pinned
+        run: pinact run --check
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Verify SHAs match version comments
+        # aquasecurity org has an IP allowlist that blocks GHA runners
+        run: pinact run --verify --exclude '^aquasecurity/trivy-action$'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

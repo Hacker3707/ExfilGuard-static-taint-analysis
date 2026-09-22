@@ -1,0 +1,7 @@
+name: B24-node-benign-dummy
+on: workflow_dispatch
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: node scripts/s05_04.js

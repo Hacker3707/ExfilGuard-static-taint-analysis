@@ -1,0 +1,117 @@
+# SPDX-FileCopyrightText: Copyright (C) 2024 Adaline Simonian
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# This file is part of gdvm.
+#
+# gdvm is free software: you can redistribute it and/or modify it under the
+# terms of the GNU General Public License as published by the Free Software
+# Foundation, either version 3 of the License, or (at your option) any later
+# version.
+#
+# gdvm is distributed in the hope that it will be useful, but WITHOUT ANY
+# WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR
+# A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License along with
+# this program. If not, see <https://www.gnu.org/licenses/>.
+
+name: Update Registry (v2)
+
+on:
+  schedule:
+    - cron: "*/30 * * * *" # Run every 30 minutes.
+  workflow_dispatch: # Allow running manually from the Actions tab.
+    inputs:
+      rebuild:
+        description: "Rebuild entire registry. Without this, only incremental updates are made for releases not yet included in the registry."
+        required: false
+        type: boolean
+      clean:
+        description: "Clean the registry before updating. This will remove all files and directories in the registry directory."
+        required: false
+        type: boolean
+
+concurrency:
+  group: "update-registry-v2"
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout registry
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: registry
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: "v2/package.json"
+
+      - name: Clean registry
+        if: ${{ github.event.inputs.clean == 'true' }}
+        run: |
+          echo "Cleaning registry..."
+          rm -rf v2/releases/*
+          rm -rf v2/index.json
+          rm -rf v2/.state.json
+          rm -rf v2/registry.json
+          echo "Registry cleaned."
+
+      - name: Update registry (incremental)
+        if: ${{ github.event.inputs.rebuild != 'true' }}
+        run: node ./update-registry.mts
+        working-directory: v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update registry (full rebuild)
+        if: ${{ github.event.inputs.rebuild == 'true' }}
+        run: node ./update-registry.mts --rebuild
+        working-directory: v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Git info
+        run: |
+          git add v2
+          git status
+          ls -hlaF v2
+
+      - name: Detect changes
+        id: changes
+        run: |
+          if git diff --cached --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true"  >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Validate registry
+        if: steps.changes.outputs.changed == 'true'
+        run: node ./validate.mts
+        working-directory: v2
+
+      - name: Generate commit message
+        if: steps.changes.outputs.changed == 'true'
+        id: commitmsg
+        run: |
+          echo 'message<<EOF' >> $GITHUB_OUTPUT
+          node ./generate-commit-msg.mts >> $GITHUB_OUTPUT
+          echo 'EOF' >> $GITHUB_OUTPUT
+        working-directory: v2
+
+      - name: Commit and push changes
+        if: steps.changes.outputs.changed == 'true'
+        uses: planetscale/ghcommit-action@a6b150b81dca5dd027baa898604418eec9e11465 # v0.2.22
+        with:
+          commit_message: ${{ steps.commitmsg.outputs.message }}
+          repo: ${{ github.repository }}
+          branch: registry
+        env:
+          GITHUB_TOKEN: ${{secrets.GITHUB_TOKEN}}

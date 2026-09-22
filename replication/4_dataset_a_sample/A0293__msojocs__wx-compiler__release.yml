@@ -1,0 +1,239 @@
+# This workflow will do a clean installation of node dependencies, cache/restore them, build the source code and run tests across different versions of node
+# For more information see: https://help.github.com/actions/language-and-framework-guides/using-nodejs-with-github-actions
+
+name: Build Packages
+
+on:
+  release:
+    types: [published]
+  push:
+    tags:        
+      - v*
+    branches: [ master, dev, ci, module]
+  pull_request:
+    branches: [ master ]
+  # # Allows you to run this workflow manually from the Actions tab
+  # workflow_dispatch:
+
+jobs:
+  build:
+    name: Build Base Packages
+    runs-on: ubuntu-22.04
+
+    strategy:
+      matrix:
+        ARCH: ['x86_64', 'loong64', 'arm64']
+        # See supported Node.js release schedule at https://nodejs.org/en/about/releases/
+
+    steps:
+      - uses: actions/checkout@v2
+        with:
+          submodules: 'recursive'
+
+      - name: Prepare
+        run: |
+          cd compiler && npm install
+          echo "$UID, $GID"
+
+      - name: Generate TAG
+        id: Tag
+        run: |
+          tag='continuous'
+          name='Continuous Build'
+          if [ 'true' == ${{ startsWith(github.ref, 'refs/tags/') }} ];then
+            tag='${{ github.ref_name }}'
+            name='${{ github.ref_name }}'
+          fi
+          echo "tag result: $tag - $name"
+          echo "tag=$tag" >> $GITHUB_OUTPUT
+          echo "name=$name" >> $GITHUB_OUTPUT
+          
+      # - name: Configure the project
+      #   uses: threeal/cmake-action@v1.3.0
+  
+      # - name: Build the project
+      #   run: cmake --build build
+      
+      - name: Build the project
+        if: matrix.ARCH == 'x86_64'
+        run: |
+          export DOCKER_UID=$UID
+          export DOCKER_GID=$GID  
+          tools/build-with-docker.sh
+
+      - name: Use Node.js ${{ matrix.node-version }}
+        if: matrix.ARCH == 'loong64'
+        uses: actions/setup-node@v3
+        with:
+          # Version Spec of the version to use in SemVer notation.
+          # It also emits such aliases as lts, latest, nightly and canary builds
+          # Examples: 12.x, 10.15.1, >=10.15.0, lts/Hydrogen, 16-nightly, latest, node
+          node-version: '22'
+          check-latest: false
+      - name: Prepare PNPM
+        if: matrix.ARCH == 'loong64'
+        run: |
+          corepack enable
+          pnpm install --no-frozen-lockfile
+      - name: Build the project
+        if: matrix.ARCH == 'loong64'
+        run: |
+          export DOCKER_UID=$UID
+          export DOCKER_GID=$GID  
+          tools/build-loong64.sh
+
+      - name: Use Node.js ${{ matrix.node-version }}
+        if: matrix.ARCH == 'arm64'
+        uses: actions/setup-node@v3
+        with:
+          node-version: '22'
+          check-latest: false
+      - name: Prepare PNPM
+        if: matrix.ARCH == 'arm64'
+        run: |
+          corepack enable
+          pnpm install --no-frozen-lockfile
+      - name: Build the project
+        if: matrix.ARCH == 'arm64'
+        run: |
+          export DOCKER_UID=$UID
+          export DOCKER_GID=$GID  
+          tools/build-arm64.sh
+
+      - name: Upload prepare
+        run: |
+          ls -l
+          echo "------------------------"
+          ls -l build
+          mkdir -p tmp/build
+          mv build/{wcc,wcsc,wcc_module.node,wcsc_module.node} tmp/build
+          cd tmp/build
+          mv wcc wcc-${{ matrix.ARCH }}
+          mv wcsc wcsc-${{ matrix.ARCH }}
+          mv wcc_module.node wcc-${{ matrix.ARCH }}.node
+          mv wcsc_module.node wcsc-${{ matrix.ARCH }}.node
+          ls -l
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          # Artifact name
+          name: wx-compiler-${{ matrix.ARCH }}.build
+          path: tmp/build
+
+  test:
+    name: Test for spec
+    needs:
+      - build
+    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        node-version: [18.x]
+        ARCH: ['x86_64']
+    steps:
+      - uses: actions/checkout@v2
+        with:
+          submodules: 'recursive'
+      - name: Use Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v3
+        with:
+          # Version Spec of the version to use in SemVer notation.
+          # It also emits such aliases as lts, latest, nightly and canary builds
+          # Examples: 12.x, 10.15.1, >=10.15.0, lts/Hydrogen, 16-nightly, latest, node
+          node-version: '18.12.0'
+          check-latest: false
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+
+      - name: Inspect directory after downloading artifacts
+        run: ls -alFR
+
+      - name: Prepare
+        run: |
+          set -x
+          
+          sudo apt update
+          sudo apt upgrade -y
+          sudo dpkg --add-architecture i386
+          sudo mkdir -pm755 /etc/apt/keyrings
+          sudo wget -O /etc/apt/keyrings/winehq-archive.key https://dl.winehq.org/wine-builds/winehq.key
+          sudo wget -NP /etc/apt/sources.list.d/ https://dl.winehq.org/wine-builds/ubuntu/dists/jammy/winehq-jammy.sources
+          sudo apt update
+          sudo apt install winehq-stable -y
+          sudo apt-get install wine-binfmt wine32 -y
+          sudo update-binfmts --import /usr/share/binfmts/wine
+          wine --version
+
+          corepack enable
+          ls -l
+          mkdir build
+          cp **-${{ matrix.ARCH }}.build/wcc-${{ matrix.ARCH }} build/wcc
+          cp **-${{ matrix.ARCH }}.build/wcsc-${{ matrix.ARCH }} build/wcsc
+          cp **-${{ matrix.ARCH }}.build/wcc-${{ matrix.ARCH }}.node build/wcc_module.node
+          cp **-${{ matrix.ARCH }}.build/wcsc-${{ matrix.ARCH }}.node build/wcsc_module.node
+          chmod +x build/*
+          ls -l build
+          node -v
+          pnpm install --no-frozen-lockfile
+
+      - name: Test
+        run: |
+          ls -l test/wine
+          # ./test/wine/wcc.exe
+          sudo apt install -y xvfb curl
+          tools/install-electron-dependency.sh
+          pnpm run test-electron
+          pnpm run test-prepare
+          ls -l build
+          ls -l test/runner/addon/wcc/build/Release
+          # fix: 预先运行，做一下配置，不然第一次执行会有问题
+          ./test/wine/wcc.exe || true
+          ./test/wine/wcc.exe -v || true
+          # 需要wine64
+          pnpm run test
+        
+  upload:
+    name: Create release and upload artifacts
+    needs:
+      - test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+      - name: Inspect directory after downloading artifacts
+        run: ls -alFR
+
+      - name: Generate TAG
+        id: Tag
+        run: |
+          tag='continuous'
+          name='Continuous Build'
+          if [ 'true' == ${{ startsWith(github.ref, 'refs/tags/') }} ];then
+            tag='${{ github.ref_name }}'
+            name='${{ github.ref_name }}'
+          fi
+          echo "tag result: $tag - $name"
+          echo "::set-output name=tag::$tag"
+          echo "::set-output name=name::$name"
+
+      - name: Create release and upload artifacts
+        if: startsWith(github.ref, 'refs/heads/')
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          sudo apt install -y fuse
+          wget -q https://github.com/TheAssassin/pyuploadtool/releases/download/continuous/pyuploadtool-x86_64.AppImage
+          chmod +x pyuploadtool-x86_64.AppImage
+          ./pyuploadtool-x86_64.AppImage **build/wcc* **build/wcsc*
+
+      - name: Release
+        uses: softprops/action-gh-release@v1
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          # note you'll typically need to create a personal access token
+          # with permissions to create releases in the other repo
+          name: ${{ steps.tag.outputs.name }}
+          tag_name: ${{ steps.tag.outputs.tag }}
+          files: |
+            **build/wcc*
+            **build/wcsc*

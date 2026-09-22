@@ -1,0 +1,683 @@
+name: Validate
+
+# First-principles rebuild (ag-877 / ag-5ck, 2026-05-28): 67 fine-grained jobs
+# collapsed to ~10 purpose-grouped jobs. The 59 scripts/{check,validate}-* are
+# the safety logic and are preserved verbatim; only the GitHub-job orchestration
+# was re-shaped. Each purpose job runs its family of scripts as path-gated steps
+# (per-step `if: needs.changes.outputs.X`), with advisory checks marked
+# `continue-on-error: true` so they report without blocking. Design:
+# spec/teardown-2026-05-28/gate-rebuild-first-principles.md
+#
+# Coverage invariant (the no-strangler safety net): every script invoked by the
+# previous validate.yml is still invoked here. Proof:
+#   comm -23 \
+#     <(git show main:.github/workflows/validate.yml | grep -oE 'scripts/[a-z0-9./_-]+\.(sh|py)' | sort -u) \
+#     <(grep -oE 'scripts/[a-z0-9./_-]+\.(sh|py)' .github/workflows/validate.yml | sort -u)
+# MUST be empty.
+
+on:
+  # This repository chooses tag, manual, pull-request, and merge-group runs.
+  # AgentOps itself does not assign delivery authority to this workflow.
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+  # Merge queue: GitHub validates queued PRs on the combined merge_group ref.
+  # The `summary` required check MUST run here or the queue hangs forever. The
+  # `changes` job forces a full run on merge_group (see the release step) so the
+  # path-filter — which has no PR base in-queue — can't skip validation.
+  merge_group:
+
+# Cancel superseded PR runs so update-branch / force-push churn during a merge
+# train doesn't leave stale runs eating the (20-slot, free-plan) concurrency pool
+# — the self-DoS that produced a 19-deep queue on 2026-06-06. NEVER cancels main
+# or tag pushes (cancel-in-progress is false unless this is a pull_request).
+concurrency:
+  group: validate-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      go: ${{ steps.release.outputs.release == 'true' || steps.filter.outputs.go }}
+      skills: ${{ steps.release.outputs.release == 'true' || steps.filter.outputs.skills }}
+      hooks: ${{ steps.release.outputs.release == 'true' || steps.filter.outputs.hooks }}
+      docs: ${{ steps.release.outputs.release == 'true' || steps.filter.outputs.docs }}
+      codex: ${{ steps.release.outputs.release == 'true' || steps.filter.outputs.codex }}
+      shell: ${{ steps.release.outputs.release == 'true' || steps.filter.outputs.shell }}
+      bats: ${{ steps.release.outputs.release == 'true' || steps.filter.outputs.bats }}
+      ci: ${{ steps.release.outputs.release == 'true' || steps.filter.outputs.ci }}
+      contracts: ${{ steps.release.outputs.release == 'true' || steps.filter.outputs.contracts }}
+      goals: ${{ steps.release.outputs.release == 'true' || steps.filter.outputs.goals }}
+      learning: ${{ steps.release.outputs.release == 'true' || steps.filter.outputs.learning }}
+      markdown: ${{ steps.release.outputs.release == 'true' || steps.filter.outputs.markdown }}
+      corpus: ${{ steps.release.outputs.release == 'true' || steps.filter.outputs.corpus }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Detect release tag push or merge-queue (force full run)
+        id: release
+        shell: bash
+        run: |
+          # merge_group has no PR base for the path-filter, so force the full
+          # validation suite — the queue must validate the combined ref in full.
+          if [[ "${GITHUB_REF}" == refs/tags/v* || "${GITHUB_EVENT_NAME}" == "merge_group" ]]; then
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4
+        if: steps.release.outputs.release != 'true'
+        id: filter
+        with:
+          filters: |
+            go:
+              - 'cli/**'
+              - 'go.mod'
+              - 'go.sum'
+              - 'tests/windows/**'
+            skills:
+              - 'skills/**'
+              - 'skills-codex/**'
+              - 'skills-codex-overrides/**'
+              - 'tests/skills/**'
+            hooks:
+              - 'lib/**'
+              - 'cli/embedded/**'
+            docs:
+              - 'docs/**'
+              - 'README.md'
+              - 'CHANGELOG.md'
+              - 'PRODUCT.md'
+              - 'SKILL-TIERS.md'
+            codex:
+              - 'skills-codex/**'
+              - 'skills-codex-overrides/**'
+            shell:
+              - '**/*.sh'
+              - 'scripts/**'
+            bats:
+              - '**/*.bats'
+            ci:
+              - '.github/**'
+            contracts:
+              - 'schemas/**'
+              - 'docs/contracts/**'
+              # Runtime workflow changes are contract-shaped inputs.
+              - '.claude/workflows/**'
+              # redteam-pack target globs (ag-nl1u): every file the
+              # security redteam pack
+              # (skills/security/references/agentops-redteam-pack.json)
+              # asserts behavioral contracts against MUST re-run the
+              # contracts-sync canaries when edited — otherwise a break to a
+              # guarded file lands without the canary that guards it (the #634
+              # regression). The guard test
+              # tests/scripts/test-pathfilter-gate-coverage.sh asserts this
+              # list stays a superset of the pack's target globs.
+              - 'AGENTS.md'
+              - 'docs/ARCHITECTURE.md'
+              - 'docs/CI-CD.md'
+              - 'docs/strategic-direction.md'
+              - 'docs/standards/shell-script-standards.md'
+              - 'skills/security/**'
+              # AGENTS detail owners (post sibling cutover): scripts/validate-agents-split.sh
+              # validates AGENTS.md AND these four owner docs (existence, bidirectional
+              # links). The gate triggers on contracts (added with this list), so an
+              # owner-only edit re-runs the split gate that guards it — without these
+              # globs a docs/agent-workflow-reference.md-only edit would skip its own
+              # gate (the #634 class). The guard test
+              # tests/scripts/test-pathfilter-gate-coverage.bats asserts every owner
+              # path the split script reads is covered by the contracts filter.
+              - 'docs/agent-workflow-reference.md'
+              - 'docs/CI-CD.md'
+              - 'docs/contracts/codex-skill-api.md'
+            goals:
+              # correctness/doctrine gates that police GOALS.md + the executable
+              # spec scenarios (ag-n4m7): a GOALS.md-only or scenario-only edit
+              # must trigger the directive↔scenario link gates, which previously
+              # ran only on go/docs/ci and silently SKIPPED on these paths (the
+              # #591/#593 phantom-scenario regression). docs/** already covers
+              # the ADR; GOALS.md + spec/scenarios/** are added explicitly here.
+              - 'GOALS.md'
+              - 'spec/scenarios/**'
+              - 'docs/adr/ADR-0003*'
+            learning:
+              - '.agents/learnings/**'
+            markdown:
+              - '**/*.md'
+            corpus:
+              - '.agents/**/*.md'
+              - '.agents/**/*.jsonl'
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # go-gate-shadow — PB3 migration authority lane.
+  #
+  # Runs the single Go gate entrypoint in CI and emits per-check GitHub
+  # annotations + JSON evidence. The job is required and enforces workflow
+  # parity for non-deferred blocking scripts, while the legacy purpose jobs
+  # remain blocking until the final dual-orchestration collapse.
+  # ─────────────────────────────────────────────────────────────────────────
+  # ─────────────────────────────────────────────────────────────────────────
+  # go-gate-shadow — PB3 migration authority lane.
+  #
+  # Runs the single Go gate entrypoint in CI and emits per-check GitHub
+  # annotations + JSON evidence. The job is required and enforces workflow
+  # parity for non-deferred blocking scripts, while the legacy purpose jobs
+  # remain blocking until the final dual-orchestration collapse.
+  # ─────────────────────────────────────────────────────────────────────────
+  go-gate-shadow:
+    needs: [changes]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # Full history keeps changed-scope and repository checks reproducible
+          # for tag, PR, and manual runs.
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.27.1'
+          cache-dependency-path: cli/go.sum
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.14'
+
+      - name: Install gate dependencies
+        run: |
+          sudo apt-get update
+          # bats + ripgrep: the full gate's check-cli-contract.sh shells out to
+          # both (bats runs tests/cli_contract_gate.bats, whose tests `run rg`
+          # and assert exit 1 — an absent rg exits 127 and fails them).
+          sudo apt-get install -y jq shellcheck bats ripgrep
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/v4.53.3/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+          pip install jsonschema pyyaml
+          GOBIN=/usr/local/bin go install github.com/fzipp/gocyclo/cmd/gocyclo@v0.6.0
+
+      - name: Build ao
+        run: |
+          mkdir -p bin
+          (cd cli && go build -o ../bin/ao ./cmd/ao)
+
+      - name: Run Go gate shadow
+        id: go_gate
+        shell: bash
+        run: |
+          set +e
+          WORKTREE_DISPOSITION_CI_SKIP=1 \
+            ./bin/ao gate check --full --json --github-annotations --workflow-coverage --require-workflow-parity \
+            > ao-gate-report.json
+          rc=$?
+          jq '.run.summary' ao-gate-report.json
+          jq '.coverage | {workflow_script_count, registry_script_count, missing_script_count, missing_blocking_count, missing_advisory_count, missing_deferred_count, registry_only_script_count, missing_blocking_scripts, missing_advisory_scripts, missing_deferred_scripts, registry_only_scripts}' ao-gate-report.json
+          echo "exit_code=$rc" >> "$GITHUB_OUTPUT"
+          exit "$rc"
+
+      - name: Upload Go gate report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ao-gate-shadow-report
+          path: ao-gate-report.json
+          if-no-files-found: error
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # skill-gates — REQUIRED. The consolidated skill-authoring gate surface:
+  # every check that guards a SKILL.md / .feature / derived-skill-surface edit,
+  # grouped into one named job (ag-87sv). Pure regroup of already-live gates —
+  # no new gate logic. Absorbs from skills-integrity (heal --strict,
+  # validate-skill-schema, validate-skill-frontmatter, validate-skill-body-refs)
+  # + contracts-sync + doctrine-proof
+  # (check-scenario-test-linkage), and adds the six-surface drift sweep
+  # `regen-all.sh --check`. Required: listed in `summary.needs`.
+  # ─────────────────────────────────────────────────────────────────────────
+  # ─────────────────────────────────────────────────────────────────────────
+  # correctness — go build/test/coverage/complexity, embedded sync, CLI
+  # integration, JSON-flag consistency, bats, python smoke, native Windows
+  # smoke, and the advisory `ao doctor` dead-reference check. Windows folds in
+  # as a matrix leg (its smoke runs `tests/windows/*.ps1`, no scripts/ family).
+  # Absorbs: go-build, cli-integration, json-flag-consistency, bats-tests,
+  # smoke-test, windows-smoke, doctor-check.
+  # ─────────────────────────────────────────────────────────────────────────
+  correctness:
+    needs: [changes]
+    if: >-
+      needs.changes.outputs.go == 'true' || needs.changes.outputs.ci == 'true' ||
+      needs.changes.outputs.hooks == 'true' || needs.changes.outputs.shell == 'true' ||
+      needs.changes.outputs.bats == 'true' || needs.changes.outputs.skills == 'true' ||
+      needs.changes.outputs.docs == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # Full history keeps range-sensitive tests reproducible.
+          fetch-depth: 0
+
+      # ── bats runs FIRST, on the pristine checkout, before the Go build/test
+      # steps below. The Go test phase shares this working tree and a cli/ test
+      # exercises git plumbing that can leave the shared repo HEAD moved
+      # (observed: detached at origin/main), which would make the workflow
+      # self-tests in the bats suite read stale validate.yml. Running bats up
+      # front — exactly the pristine-checkout + npm-bats setup the standalone
+      # bats-tests job used pre-rebuild — keeps it pollution-free (ag-877).
+      #
+      # bats needs Python with jsonschema/PyYAML, jq, and ripgrep. It does not
+      # need a semantic-review runtime or a pre-seeded lifecycle verdict.
+      - name: Set up Python (bats and smoke-test)
+        if: runner.os == 'Linux' && (needs.changes.outputs.hooks == 'true' || needs.changes.outputs.shell == 'true' || needs.changes.outputs.bats == 'true' || needs.changes.outputs.ci == 'true' || needs.changes.outputs.skills == 'true' || needs.changes.outputs.docs == 'true')
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.14'
+
+      - name: Install bats Python dependencies
+        if: runner.os == 'Linux' && (needs.changes.outputs.hooks == 'true' || needs.changes.outputs.shell == 'true' || needs.changes.outputs.bats == 'true' || needs.changes.outputs.ci == 'true' || needs.changes.outputs.skills == 'true' || needs.changes.outputs.docs == 'true')
+        run: python3 -m pip install jsonschema pyyaml
+
+      - name: Install bats
+        if: runner.os == 'Linux' && (needs.changes.outputs.hooks == 'true' || needs.changes.outputs.shell == 'true' || needs.changes.outputs.bats == 'true' || needs.changes.outputs.ci == 'true' || needs.changes.outputs.skills == 'true' || needs.changes.outputs.docs == 'true')
+        run: sudo npm install -g bats@1.12.0
+
+      - name: Run bats tests
+        if: runner.os == 'Linux' && (needs.changes.outputs.hooks == 'true' || needs.changes.outputs.shell == 'true' || needs.changes.outputs.bats == 'true' || needs.changes.outputs.ci == 'true' || needs.changes.outputs.skills == 'true' || needs.changes.outputs.docs == 'true')
+        run: |
+          echo "=== Running bats tests (4-way parallel) ==="
+          # bats --jobs needs GNU parallel; the serial run was ~237s (55% of the
+          # correctness critical path). --no-parallelize-within-files preserves
+          # ordering inside each file; only independent files run concurrently.
+          # ripgrep is NOT preinstalled on the runner image: a few gate scripts
+          # (check-orchestration-skill-boundaries.sh, skill-standards-convergence,
+          # the cli_contract nested gate) shell out to `rg` and otherwise 127.
+          sudo apt-get install -y parallel ripgrep >/dev/null 2>&1 || { sudo apt-get update -qq && sudo apt-get install -y parallel ripgrep; }
+          bats --jobs 4 --no-parallelize-within-files --print-output-on-failure tests/scripts/*.bats
+          echo "✅ Bats tests passed"
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.27.1'
+          cache-dependency-path: cli/go.sum
+
+      # ── go-build (Linux) ──────────────────────────────────────────────────
+      - name: Build ao CLI
+        if: runner.os == 'Linux' && (needs.changes.outputs.go == 'true' || needs.changes.outputs.ci == 'true')
+        run: |
+          echo "=== Building ao CLI ==="
+          cd cli
+          go build -o /tmp/ao-test ./cmd/ao
+          echo "✅ ao CLI builds successfully"
+
+      - name: Run Go tests with race detection and coverage
+        if: runner.os == 'Linux' && (needs.changes.outputs.go == 'true' || needs.changes.outputs.ci == 'true')
+        run: |
+          echo "=== Running Go tests ==="
+          cd cli
+          set -o pipefail
+          go test -race -shuffle=on -coverprofile=coverage.out -covermode=atomic ./... -v 2>&1 | tee /tmp/go-test-output.txt
+          echo ""
+          echo "=== Coverage Summary ==="
+          go tool cover -func=coverage.out | tail -1
+          echo "✅ Go tests passed"
+
+      - name: Enforce cmd/ao coverage floor
+        if: runner.os == 'Linux' && (needs.changes.outputs.go == 'true' || needs.changes.outputs.ci == 'true')
+        run: |
+          echo "=== Enforcing cli/cmd/ao coverage floor ==="
+          # Ratchet target: 85% (source epic evolve-cycle-6-coverage-85pct).
+          # Current floor is set in scripts/check-cmd-ao-coverage.sh; bump it
+          # one whole percent each time real coverage rises.
+          bash scripts/check-cmd-ao-coverage.sh --profile cli/coverage.out
+
+      - name: Warn about slow test packages
+        if: always() && runner.os == 'Linux' && (needs.changes.outputs.go == 'true' || needs.changes.outputs.ci == 'true')
+        run: |
+          echo "=== Test Package Duration Analysis ==="
+          THRESHOLD=45
+          FOUND_SLOW=0
+
+          if [[ ! -f /tmp/go-test-output.txt ]]; then
+            echo "No test output file found; skipping."
+            exit 0
+          fi
+
+          while IFS= read -r line; do
+            if [[ "$line" =~ ^(ok|FAIL)[[:space:]]+([^[:space:]]+)[[:space:]]+([0-9]+(\.[0-9]+)?)s ]]; then
+              pkg="${BASH_REMATCH[2]}"
+              elapsed="${BASH_REMATCH[3]}"
+              is_slow=$(awk -v e="$elapsed" -v t="$THRESHOLD" 'BEGIN { print (e > t) ? "1" : "0" }')
+              if [[ "$is_slow" == "1" ]]; then
+                echo "::warning::Slow test package ${pkg}: ${elapsed}s exceeds ${THRESHOLD}s threshold"
+                FOUND_SLOW=$((FOUND_SLOW + 1))
+              fi
+            fi
+          done < /tmp/go-test-output.txt
+
+          if [[ "$FOUND_SLOW" -gt 0 ]]; then
+            echo "⚠️ Found $FOUND_SLOW slow package(s) exceeding ${THRESHOLD}s threshold"
+          else
+            echo "✅ All test packages completed within ${THRESHOLD}s"
+          fi
+
+      - name: Enforce Go complexity budget on changed files
+        if: runner.os == 'Linux' && (needs.changes.outputs.go == 'true' || needs.changes.outputs.ci == 'true')
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF_NAME: ${{ github.base_ref }}
+        run: |
+          echo "=== Enforcing Go complexity budget ==="
+          GOBIN=/usr/local/bin go install github.com/fzipp/gocyclo/cmd/gocyclo@v0.6.0
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            git fetch --no-tags --depth=1 origin "$BASE_REF_NAME"
+            BASE_REF="origin/$BASE_REF_NAME"
+          else
+            BASE_REF="HEAD~1"
+          fi
+          ./scripts/check-go-complexity.sh --base "$BASE_REF" --warn 15 --fail 25
+
+      # Swallowed-json guard (agentops-tqc.3 / planning-rule f-2026-04-29-002).
+      # Blocking. golangci-lint's errcheck does NOT catch the blank-discard
+      # swallow (`b, _ := json.Marshal(...)`) because check-blank is off, and
+      # turning it on globally would explode unrelated discards — so this
+      # dedicated step runs errcheck -blank filtered to conventional `json.`
+      # selector call sites (textual, not alias-resolving).
+      - name: Enforce checked json.Marshal/Unmarshal returns
+        if: runner.os == 'Linux' && (needs.changes.outputs.go == 'true' || needs.changes.outputs.ci == 'true')
+        run: |
+          echo "=== Enforcing checked json.Marshal/Unmarshal returns ==="
+          GOBIN=/usr/local/bin go install github.com/kisielk/errcheck@v1.20.0
+          bash scripts/check-json-marshal-checked.sh
+
+      - name: Upload coverage to Codecov
+        if: runner.os == 'Linux' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7
+        with:
+          files: ./cli/coverage.out
+          flags: cli
+          fail_ci_if_error: false
+
+      - name: Upload coverage artifact
+        if: always() && runner.os == 'Linux' && (needs.changes.outputs.go == 'true' || needs.changes.outputs.ci == 'true')
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: go-coverage
+          path: cli/coverage.out
+          retention-days: 7
+
+      # ── cli-integration (Linux) ───────────────────────────────────────────
+      - name: Build ao CLI (integration)
+        if: runner.os == 'Linux' && (needs.changes.outputs.go == 'true' || needs.changes.outputs.ci == 'true')
+        run: cd cli && make build
+
+      - name: Run CLI commands integration test
+        if: runner.os == 'Linux' && (needs.changes.outputs.go == 'true' || needs.changes.outputs.ci == 'true')
+        run: bash tests/integration/test-cli-commands.sh
+
+      - name: Run release smoke test
+        if: runner.os == 'Linux' && (needs.changes.outputs.go == 'true' || needs.changes.outputs.ci == 'true')
+        run: bash scripts/release-smoke-test.sh --skip-build
+
+      # ── json-flag-consistency (Linux; was its own job, needs go-build → go||ci) ─
+      - name: Run JSON flag consistency tests
+        if: runner.os == 'Linux' && (needs.changes.outputs.go == 'true' || needs.changes.outputs.ci == 'true')
+        run: |
+          chmod +x tests/cli/test-json-flag-consistency.sh
+          ./tests/cli/test-json-flag-consistency.sh
+
+      # ── smoke-test (Linux; python) ────────────────────────────────────────
+      - name: Run smoke tests
+        if: runner.os == 'Linux' && (needs.changes.outputs.skills == 'true' || needs.changes.outputs.hooks == 'true' || needs.changes.outputs.shell == 'true' || needs.changes.outputs.ci == 'true')
+        run: |
+          chmod +x tests/smoke-test.sh
+          ./tests/smoke-test.sh --verbose
+
+      # ── doctor-check (Linux; advisory; was needs go-build → go||ci) ───────
+      - name: Run ao doctor (advisory dead-reference check)
+        if: runner.os == 'Linux' && (needs.changes.outputs.go == 'true' || needs.changes.outputs.ci == 'true')
+        continue-on-error: true
+        run: |
+          echo "=== Running ao doctor ==="
+          /tmp/ao-test doctor 2>/dev/null || true
+          echo ""
+          echo "Note: doctor may report warnings for CI-expected missing tools."
+          echo "This job catches stale references and dead commands."
+
+      # ── windows-smoke (Windows matrix leg) ────────────────────────────────
+      - name: Run native Windows smoke tests
+        if: runner.os == 'Windows' && (needs.changes.outputs.go == 'true' || needs.changes.outputs.ci == 'true')
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: .\tests\windows\test-windows-smoke.ps1
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # lint — shellcheck, markdownlint, skill-lint. Absorbs: shellcheck,
+  # markdownlint, skill-lint. (No scripts/ family — inline + action + tests/.)
+  # ─────────────────────────────────────────────────────────────────────────
+  # ─────────────────────────────────────────────────────────────────────────
+  # security — secret/dangerous-pattern scan + full security toolchain gate.
+  # Absorbs: security-scan, security-toolchain-gate.
+  # ─────────────────────────────────────────────────────────────────────────
+  security:
+    needs: [changes]
+    if: >-
+      needs.changes.outputs.go == 'true' || needs.changes.outputs.shell == 'true' ||
+      needs.changes.outputs.skills == 'true' || needs.changes.outputs.ci == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Scan for secrets
+        if: needs.changes.outputs.go == 'true' || needs.changes.outputs.shell == 'true' || needs.changes.outputs.skills == 'true' || needs.changes.outputs.ci == 'true'
+        run: |
+          echo "=== Scanning for secrets ==="
+          # Common secret patterns
+          patterns=(
+            "password.*=.*['\"][^'\"]{8,}['\"]"
+            "api[_-]?key.*=.*['\"][^'\"]{16,}['\"]"
+            "secret.*=.*['\"][^'\"]{8,}['\"]"
+            "(access|auth|refresh|bearer)[_-]?token.*=.*['\"][^'\"]{16,}['\"]"
+            "AWS[_A-Z]*=.*['\"][A-Z0-9]{16,}['\"]"
+          )
+
+          found=0
+          for pattern in "${patterns[@]}"; do
+            if grep -r -i -E "$pattern" \
+                --exclude-dir=.git \
+                --exclude-dir=tests \
+                --exclude-dir=testdata \
+                --exclude-dir=cli/testdata \
+                --exclude-dir=dist \
+                --exclude-dir=.agents \
+                --exclude-dir=.tmp \
+                --exclude-dir=.gc \
+                --exclude="*.md" \
+                --exclude="*.jsonl" \
+                --exclude="*.sh" \
+                --exclude="*_test.go" \
+                --exclude="validate.yml" \
+                --binary-files=without-match \
+                . 2>/dev/null | grep -v 'os\.Getenv(' | grep -v 'regexp\.MustCompile(' ; then
+              found=1
+            fi
+          done
+
+          if [[ $found -eq 1 ]]; then
+            echo "⚠️ Potential secrets found - review above"
+            exit 1
+          fi
+          echo "✅ No secrets detected"
+
+      - name: Check for dangerous patterns
+        if: needs.changes.outputs.go == 'true' || needs.changes.outputs.shell == 'true' || needs.changes.outputs.skills == 'true' || needs.changes.outputs.ci == 'true'
+        run: |
+          echo "=== Checking for dangerous patterns ==="
+          # Patterns that could be dangerous in scripts
+          # Note: validate.sh files use eval safely for CLI validation
+          dangerous=(
+            "rm -rf /"
+            "curl.*\| *sh"
+            "curl.*\| *bash"
+            "wget.*\| *sh"
+          )
+
+          found=0
+          for pattern in "${dangerous[@]}"; do
+            if grep -r -E "$pattern" \
+                --include="*.sh" \
+                --exclude-dir=.git \
+                --exclude-dir=tests \
+                --exclude-dir=cli/testdata \
+                --exclude="install-ao.ps1" \
+                --exclude="install-bd.sh" \
+                --exclude="installer-bootstrap.sh" \
+                --exclude="installer-common.sh" \
+                --exclude="ci-local-release.sh" \
+                . 2>/dev/null; then
+              echo "Found: $pattern"
+              found=1
+            fi
+          done
+
+          if [[ $found -eq 1 ]]; then
+            echo "⚠️ Dangerous patterns found"
+            exit 1
+          fi
+          echo "✅ No dangerous patterns"
+
+      - name: "Door 9 guard: no phased RPI Claude print path"
+        if: needs.changes.outputs.go == 'true' || needs.changes.outputs.shell == 'true' || needs.changes.outputs.ci == 'true'
+        run: bash scripts/check-door9-no-claude-p.sh
+
+      - name: Set up Go (security toolchain)
+        if: needs.changes.outputs.go == 'true' || needs.changes.outputs.shell == 'true' || needs.changes.outputs.ci == 'true'
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.27.1'
+          cache-dependency-path: cli/go.sum
+
+      - name: Set up Python (security toolchain)
+        if: needs.changes.outputs.go == 'true' || needs.changes.outputs.shell == 'true' || needs.changes.outputs.ci == 'true'
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.14'
+
+      - name: Install scanner tools
+        # 3-attempt exponential-backoff retry per soc-z7qq item 40
+        # (covers transient trivy/hadolint network timeouts).
+        if: needs.changes.outputs.go == 'true' || needs.changes.outputs.shell == 'true' || needs.changes.outputs.ci == 'true'
+        run: |
+          retry() {
+            local max=3
+            local delay=5
+            local attempt=1
+            while true; do
+              if "$@"; then
+                return 0
+              fi
+              if [[ $attempt -ge $max ]]; then
+                echo "command failed after $max attempts: $*" >&2
+                return 1
+              fi
+              echo "attempt $attempt failed; retrying in ${delay}s..." >&2
+              sleep "$delay"
+              delay=$((delay * 2))
+              attempt=$((attempt + 1))
+            done
+          }
+          retry python -m pip install --upgrade pip
+          retry python -m pip install semgrep==1.169.0 ruff==0.15.21 radon==6.0.1
+          retry env GOBIN=/usr/local/bin go install github.com/securego/gosec/v2/cmd/gosec@v2.27.1
+          retry env GOBIN=/usr/local/bin go install github.com/zricethezav/gitleaks/v8@v8.30.1
+          retry env GOBIN=/usr/local/bin go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.1
+          retry env GOBIN=/usr/local/bin go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
+          # trivy — pinned tag, download-then-execute (mirrors nightly.yml; piping a
+          # mutable-branch script into sh is the gha-curl-pipe-shell supply-chain class).
+          retry bash -c 'curl -sSfL -o /tmp/trivy-install.sh https://raw.githubusercontent.com/aquasecurity/trivy/v0.72.0/contrib/install.sh && sh /tmp/trivy-install.sh -b /usr/local/bin v0.72.0'
+          retry bash -c 'curl -sL https://github.com/hadolint/hadolint/releases/download/v2.14.0/hadolint-Linux-x86_64 -o /tmp/hadolint && chmod +x /tmp/hadolint && sudo mv /tmp/hadolint /usr/local/bin/hadolint'
+
+      - name: Run security toolchain gate
+        if: needs.changes.outputs.go == 'true' || needs.changes.outputs.shell == 'true' || needs.changes.outputs.ci == 'true'
+        run: |
+          chmod +x scripts/security-gate.sh
+          ./scripts/security-gate.sh --mode quick
+        env:
+          SECURITY_GATE_OUTPUT_DIR: ${{ runner.temp }}/agentops-security
+          TOOLCHAIN_OUTPUT_DIR: ${{ runner.temp }}/agentops-tooling
+
+      - name: Upload security gate artifacts
+        if: always() && (needs.changes.outputs.go == 'true' || needs.changes.outputs.shell == 'true' || needs.changes.outputs.ci == 'true')
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: security-gate
+          path: ${{ runner.temp }}/agentops-security/
+          retention-days: 7
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # summary — aggregate deterministic check status over the purpose jobs.
+  # ─────────────────────────────────────────────────────────────────────────
+  summary:
+    needs: [changes, go-gate-shadow, correctness, security]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Check results
+        run: |
+          echo "=== CI Summary ==="
+          echo "go-gate-shadow: ${{ needs.go-gate-shadow.result }}"
+          echo "correctness: ${{ needs.correctness.result }}"
+          echo "security: ${{ needs.security.result }}"
+
+          # Fail on actual failures. On release tags, skipped purpose jobs are
+          # also failures because validate.yml must be a full exact-SHA release
+          # verdict, not a path-filtered partial signal.
+          if [[ "${{ contains(needs.*.result, 'failure') }}" == "true" ]]; then
+            echo ""
+            echo "❌ Some checks failed (failure detected)"
+            exit 1
+          fi
+
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            release_needs_json='${{ toJson(needs) }}'
+            release_skipped="$(
+              NEEDS_JSON="$release_needs_json" python3 - <<'PY'
+          import json
+          import os
+
+          # All purpose jobs run on release tags (changes sets every output
+          # true), so no job should be skipped. None are allowlisted.
+          allowed_skips = set()
+
+          needs = json.loads(os.environ["NEEDS_JSON"])
+          unexpected = sorted(
+              name
+              for name, metadata in needs.items()
+              if metadata.get("result") == "skipped" and name not in allowed_skips
+          )
+
+          for name in unexpected:
+              print(name)
+          PY
+            )"
+            if [[ -n "$release_skipped" ]]; then
+              echo ""
+              echo "❌ Release-tag Validate had unexpected skipped jobs; skipped release lanes are not a release verdict"
+              printf '%s\n' "$release_skipped" | sed 's/^/- /'
+              exit 1
+            fi
+          fi
+
+          echo ""
+          echo "✅ All checks passed"

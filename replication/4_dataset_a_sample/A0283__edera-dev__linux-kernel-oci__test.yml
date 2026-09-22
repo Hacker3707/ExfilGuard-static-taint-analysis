@@ -1,0 +1,23 @@
+name: Test Kernel Build
+on:
+  pull_request:
+  push:
+    branches:
+    - main
+    # Config-snippet merges are built and published by build.yml; skip the
+    # throwaway publish:false rebuild here so a config merge builds once.
+    paths-ignore:
+    - "configs/**"
+permissions:
+  contents: read
+  packages: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+jobs:
+  test:
+    uses: ./.github/workflows/matrix.yml
+    secrets: inherit
+    with:
+      spec: "only-latest-lts:flavor=host,zone,zone-nvidiagpu"
+      publish: false

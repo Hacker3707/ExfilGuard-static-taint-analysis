@@ -1,0 +1,161 @@
+name: Fetch sgmodule Files
+
+on:
+  schedule:
+    - cron: '7 1 * * *'  # 每小时的第 0 分钟和第 30 分钟执行
+  workflow_dispatch:
+
+env:
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+  fetch-and-commit:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq python3
+
+      - name: Fetch sgmodule paths
+        run: |
+          curl -H "Authorization: token $GITHUB_TOKEN" -s \
+            "https://api.github.com/repos/zirawell/R-Store/git/trees/main?recursive=1" \
+            | jq -r '.tree[] | select(.path | test("sgmodule$")) | .path' > sgmodule_paths.txt
+          cat sgmodule_paths.txt
+
+      - name: Count duplicate filenames
+        run: |
+          declare -A name_count
+          while IFS= read -r path; do
+            filename=$(basename "$path")
+            name_count["$filename"]=$(( ${name_count["$filename"]} + 1 ))
+          done < sgmodule_paths.txt
+
+          # Export duplicates info for next step
+          echo "DUPLICATE_FILENAMES<<EOF" >> $GITHUB_ENV
+          for f in "${!name_count[@]}"; do
+            echo "$f ${name_count[$f]}"
+          done >> duplicate_list.txt
+          cat duplicate_list.txt >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+      - name: Download sgmodule files with retry and smart renaming
+        shell: bash
+        run: |
+          mkdir -p Modules/Surge/zirawell/Official
+          retry=3
+
+          # 读取重复统计
+          declare -A name_count
+          while IFS= read -r line; do
+            filename=$(echo "$line" | awk '{print $1}')
+            count=$(echo "$line" | awk '{print $2}')
+            name_count["$filename"]=$count
+          done < duplicate_list.txt
+
+          # 取合适前缀的函数
+          get_prefix() {
+            local full_path="$1"
+            IFS='/' read -r -a parts <<< "$full_path"
+            for i in 3 2 1; do
+              dir="${parts[i]}"
+              # 简单判断非文件即目录（没.sgmodule后缀）
+              if [[ "$dir" != *".sgmodule" ]]; then
+                echo "$dir"
+                return
+              fi
+            done
+            echo "Unknown"
+          }
+
+          while IFS= read -r file_path; do
+            filename_full=$(basename "$file_path")
+            filename="${filename_full%.sgmodule}"
+            count=${name_count["$filename_full"]}
+            prefix=$(get_prefix "$file_path")
+
+            if [[ $count -gt 1 ]]; then
+              save_name="${filename}-${prefix}.sgmodule"
+            else
+              save_name="$filename_full"
+            fi
+
+            echo "Downloading $file_path as $save_name"
+            encoded_path=$(python3 -c "import urllib.parse; print(urllib.parse.quote('''$file_path'''))")
+
+            attempt=1
+            success=0
+            while [ $attempt -le $retry ]; do
+              echo "Attempt $attempt for $file_path"
+              curl -H "Authorization: token $GITHUB_TOKEN" --fail -sL \
+                -H "Accept: application/vnd.github.raw" \
+                "https://api.github.com/repos/zirawell/R-Store/contents/$encoded_path?ref=main" \
+                -o "Modules/Surge/zirawell/Official/$save_name" && success=1 && break
+              echo "Attempt $attempt failed for $file_path"
+              attempt=$((attempt+1))
+              sleep 2
+            done
+
+            if [ $success -ne 1 ]; then
+              echo "⚠️ Warning: Failed to download $file_path after $retry attempts, skipping."
+            fi
+          done < sgmodule_paths.txt
+
+      - name: Find and replace external JS resources
+        continue-on-error: true  # 确保步骤在部分失败时继续执行
+        run: |
+          js_base_url="https://github.com/${GITHUB_REPOSITORY}/raw/main/Modules/JS"
+
+          for module_file in Modules/Surge/zirawell/Official/*.sgmodule; do
+            echo "Processing $module_file"
+
+            author=$(echo "$module_file" | awk -F'/' '{print $(NF-2)}')
+            module_folder=$(basename "$module_file" .sgmodule)
+            echo "Processing $module_file from folder $author for JS links"
+
+            js_links=$(grep -v '#' "$module_file" | grep -oP 'https?://[^ ]+\.(json|js|jq)' || echo "")
+
+            for js_link in $js_links; do
+              js_filename=$(basename "$js_link")
+              local_js_path="Modules/JS/$author/$module_folder/$js_filename"
+              github_js_url="$js_base_url/$author/$module_folder/$js_filename"
+
+              mkdir -p "$(dirname "$local_js_path")"
+        
+              echo "Downloading $js_link to $local_js_path"
+              if curl -A "Surge Mac/2985" -L -o "$local_js_path" "$js_link"; then
+                echo "Download successful for $js_link"
+                echo "Replacing $js_link with $github_js_url in $module_file"
+                sed -i "s|$js_link|$github_js_url|g" "$module_file"
+          
+                Copied_module_file="Modules/Surge/zirawell/$module_folder.sgmodule"
+                if [ -f "$Copied_module_file" ]; then
+                  echo "Replacing $js_link with $github_js_url in $Copied_module_file"
+                  sed -i "s|$js_link|$github_js_url|g" "$Copied_module_file"
+                fi
+              else
+                echo "Failed to download $js_link, skipping..."
+              fi
+            done
+          done
+
+      - name: Commit and push changes
+        run: |
+          DATE="$(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S')"
+          
+          git config user.name "${GITHUB_ACTOR}"
+          git config user.email "${GITHUB_ACTOR}@users.noreply.github.com"
+          git add Modules/Surge/zirawell/Official
+          if git diff --cached --quiet; then
+            echo "✅ No changes to commit."
+          else
+            git commit -m "Download Surge Modules at $DATE (UTC+8)"
+            git push
+          fi

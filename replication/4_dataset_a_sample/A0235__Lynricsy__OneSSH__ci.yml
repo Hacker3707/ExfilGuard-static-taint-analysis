@@ -1,0 +1,453 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - "**"
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    name: Go checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Check formatting
+        shell: bash
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [[ -n "$unformatted" ]]; then
+            printf 'Files need gofmt:\n%s\n' "$unformatted"
+            exit 1
+          fi
+
+      - name: Check module files
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build search helper assets
+        run: go run ./internal/searchx/helper/genassets
+
+      - name: Test
+        env:
+          CGO_ENABLED: "0"
+        run: go test -count=1 ./...
+
+      - name: Build CGO-free binary
+        env:
+          CGO_ENABLED: "0"
+        run: go build -trimpath -o /tmp/onessh ./cmd/onessh
+
+  compatibility:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        goos:
+          - linux
+          - darwin
+          - freebsd
+        goarch:
+          - amd64
+          - arm64
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Build search helper assets
+        run: go run ./internal/searchx/helper/genassets
+
+      - name: Cross-compile
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: go build -trimpath -o /tmp/onessh ./cmd/onessh
+
+  windows:
+    name: Windows ${{ matrix.goarch }} native
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goarch: amd64
+            runner: windows-latest
+          - goarch: arm64
+            runner: windows-11-arm
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Verify native architecture
+        shell: pwsh
+        run: |
+          $actual = go env GOARCH
+          if ($actual -ne "${{ matrix.goarch }}") {
+            throw "期望在 ${{ matrix.goarch }} 上原生运行，实际为 $actual"
+          }
+
+      - name: Build search helper assets
+        run: go run ./internal/searchx/helper/genassets
+
+      - name: Test natively
+        env:
+          CGO_ENABLED: "0"
+        run: go test -count=1 ./...
+
+      - name: Build native binary
+        shell: pwsh
+        env:
+          CGO_ENABLED: "0"
+          VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'ci' }}
+        run: |
+          $ldflags = "-s -w -X main.version=$env:VERSION"
+          go build -trimpath -ldflags="$ldflags" `
+            -o "$env:RUNNER_TEMP\onessh.exe" ./cmd/onessh
+
+      - name: Smoke test native binary
+        shell: pwsh
+        env:
+          EXPECTED_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'ci' }}
+          ONESSH_MASTER_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+          ONESSH_ADMIN_PASSWORD: test-password
+          ONESSH_DATA_DIR: ${{ runner.temp }}\onessh-data
+          ONESSH_LISTEN: 127.0.0.1:18866
+          ONESSH_POLL_INTERVAL: "0"
+        run: |
+          $process = Start-Process `
+            -FilePath "$env:RUNNER_TEMP\onessh.exe" `
+            -PassThru
+          $health = $null
+          try {
+            for ($attempt = 0; $attempt -lt 30; $attempt++) {
+              try {
+                $health = Invoke-RestMethod `
+                  -Uri "http://127.0.0.1:18866/healthz" `
+                  -TimeoutSec 2
+                break
+              } catch {
+                Start-Sleep -Seconds 1
+              }
+            }
+            if ($null -eq $health) {
+              throw "OneSSH 未在 30 秒内通过健康检查"
+            }
+            if (!$health.ok -or $health.version -ne $env:EXPECTED_VERSION) {
+              throw "健康检查响应异常: $($health | ConvertTo-Json -Compress)"
+            }
+          } finally {
+            if (!$process.HasExited) {
+              Stop-Process -Id $process.Id -Force
+            }
+          }
+
+      - name: Package Windows archive
+        shell: pwsh
+        env:
+          VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'ci' }}
+        run: |
+          $releaseVersion = $env:VERSION.TrimStart("v")
+          $archive = Join-Path `
+            $env:RUNNER_TEMP `
+            "onessh_${releaseVersion}_windows_${{ matrix.goarch }}.zip"
+          Compress-Archive `
+            -LiteralPath "$env:RUNNER_TEMP\onessh.exe" `
+            -DestinationPath $archive `
+            -Force
+
+      - name: Upload Windows release archive
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: windows-release-${{ matrix.goarch }}
+          path: ${{ runner.temp }}\onessh_*.zip
+          if-no-files-found: error
+
+  frontend:
+    name: Web checks
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type-check and build
+        run: npm run build
+
+      # 卡片运行时是纯浏览器代码，Go 测试够不到它自己跑起来之后的行为。
+      # 这份一致性测试在 Node 里把 runtime.js 真的执行一遍，覆盖 ui/* 协议报文、
+      # 只读回调白名单和 32 张卡片对真实样例的渲染，零依赖，不需要装任何东西。
+      - name: MCP Apps card runtime conformance
+        working-directory: .
+        run: node --test internal/mcpserver/apps/runtime.test.mjs
+
+  e2e:
+    name: Docker end-to-end
+    runs-on: ubuntu-latest
+    env:
+      ONESSH_MASTER_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+      ONESSH_ADMIN_PASSWORD: test123
+      ONESSH_URL: http://localhost:8866/mcp
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Start OneSSH and test hosts
+        run: docker compose -f docker-compose.yml -f docker-compose.test.yml up -d --build
+
+      - name: Wait for health check
+        shell: bash
+        run: |
+          for _ in {1..60}; do
+            if curl --fail --silent http://localhost:8866/healthz; then
+              exit 0
+            fi
+            sleep 2
+          done
+          exit 1
+
+      - name: Run end-to-end suite
+        run: go test -count=1 -tags e2e -run TestEndToEnd -v ./e2e
+
+      - name: Print container logs on failure
+        if: failure()
+        run: docker compose -f docker-compose.yml -f docker-compose.test.yml logs --no-color
+
+      - name: Stop test environment
+        if: always()
+        run: docker compose -f docker-compose.yml -f docker-compose.test.yml down -v
+
+  prepare-release:
+    name: Prepare release artifacts
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - backend
+      - frontend
+      - e2e
+      - compatibility
+      - windows
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Download native Windows archives
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          pattern: windows-release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Build search helper assets
+        run: go run ./internal/searchx/helper/genassets
+
+      - name: Build and verify release archives
+        shell: bash
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          release_version="${VERSION#v}"
+          mkdir -p dist
+          for target in \
+            linux/amd64 linux/arm64 \
+            darwin/amd64 darwin/arm64 \
+            freebsd/amd64 freebsd/arm64
+          do
+            goos="${target%/*}"
+            goarch="${target#*/}"
+            base="onessh_${release_version}_${goos}_${goarch}"
+            package_dir="dist/${base}"
+            binary="${package_dir}/onessh"
+            mkdir -p "$package_dir"
+            CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" \
+              go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" \
+              -o "$binary" ./cmd/onessh
+            tar -C "$package_dir" -czf "dist/${base}.tar.gz" onessh
+            rm -rf "$package_dir"
+          done
+          (cd dist && sha256sum ./*.tar.gz ./*.zip > checksums.txt)
+
+      - name: Upload verified release assets
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: release-assets
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 1
+
+  stage-release:
+    name: Stage draft release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - prepare-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Download verified release assets
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: release-assets
+          path: dist
+
+      - name: Create draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release create "${GITHUB_REF_NAME}" \
+              --draft \
+              --verify-tag \
+              --generate-notes \
+              --title "${GITHUB_REF_NAME}"
+          fi
+          gh release upload "${GITHUB_REF_NAME}" dist/* --clobber
+
+  publish:
+    name: Publish GHCR image
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - stage-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Normalize image name
+        id: image
+        shell: bash
+        run: echo "name=${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate image metadata
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ghcr.io/${{ steps.image.outputs.name }}
+          tags: |
+            type=ref,event=tag
+            type=sha,prefix=sha-
+            type=raw,value=latest
+
+      - name: Build and push image
+        id: push
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          platforms: linux/amd64,linux/arm64
+          build-args: VERSION=${{ github.ref_name }}
+
+      - name: Attest image provenance
+        uses: actions/attest@v4
+        with:
+          subject-name: ghcr.io/${{ steps.image.outputs.name }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+  release:
+    name: Publish GitHub release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Publish staged release
+        shell: bash
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "${GITHUB_REF_NAME}" --draft=false

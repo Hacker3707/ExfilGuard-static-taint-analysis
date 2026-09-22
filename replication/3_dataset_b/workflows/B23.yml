@@ -1,0 +1,9 @@
+name: B23-node-multihop
+on: workflow_dispatch
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      API_KEY: ${{ secrets.API_KEY }}
+    steps:
+      - run: node scripts/s05_03.js

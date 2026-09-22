@@ -1,0 +1,482 @@
+---
+name: Build and package application
+
+# yamllint disable-line rule:truthy
+on:
+  push:
+    branches:
+      - dev
+  pull_request:
+    types:
+      - opened
+      - synchronize
+  release:
+    types:
+      - published
+  workflow_dispatch: {}
+
+env:
+  STATIC_EXPORT: "true"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_type == 'tag' && format('tag-{0}', github.ref_name) || github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
+jobs:
+  build-linux:
+    name: Build linux
+    container:
+      image: ghcr.io/${{ github.repository }}/ci-build-arch:latest
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.get_version.outputs.version }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+
+      - name: Mark workspace safe for git
+        run: git config --global --add safe.directory .
+
+      - name: Setup Go
+        uses: ./.github/actions/setup-go
+
+      - name: Build web client
+        uses: ./.github/actions/build-client-web
+
+      - name: Get version
+        id: get_version
+        shell: bash
+        run: .github/scripts/bash/get-version.sh "${{ github.ref_type }}" "${{ github.ref_name }}" "${{ github.sha }}"
+
+      - name: Write version to file
+        run: echo "${{ env.VERSION }}" > VERSION
+
+      - name: Build application
+        env:
+          GOOS: linux
+          GOARCH: amd64
+          CGO_ENABLED: 1
+        run: |
+          go build -v -ldflags="-X 'github.com/timmo001/system-bridge/version.Version=${{ env.VERSION }}'" -o "system-bridge-linux"
+
+      - name: Build TUI
+        run: |
+          mise run build:tui
+
+      - name: Verify CSS in Linux binary
+        run: |
+          chmod +x ./.scripts/verify-css.sh
+          ./.scripts/verify-css.sh ./system-bridge-linux
+
+      - name: Upload application
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: system-bridge-linux-${{ env.VERSION }}
+          path: |
+            system-bridge-linux
+            system-bridge-tui
+
+  package-linux:
+    name: Package ${{ matrix.build.package }} (${{ matrix.build.distro }})
+    needs:
+      - build-linux
+    container:
+      image: ghcr.io/${{ github.repository }}/ci-build-${{ matrix.build.distro }}:latest
+      options: "--privileged --cap-add=SYS_ADMIN --device=/dev/fuse"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        build:
+          - distro: arch
+            package: arch
+          - distro: ubuntu
+            package: deb
+          - distro: ubuntu
+            package: rpm
+          - distro: ubuntu
+            package: flatpak
+    env:
+      VERSION: ${{ needs.build-linux.outputs.version }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+
+      - name: Download application
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: system-bridge-linux-${{ env.VERSION }}
+          path: .
+
+      - name: Package for linux
+        run: .github/scripts/bash/package-linux.sh "${{ matrix.build.package }}"
+
+      - name: Upload packages
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: system-bridge-linux-packages-${{ matrix.build.package }}-${{ env.VERSION }}
+          path: dist/**
+          retention-days: ${{ github.ref_type == 'tag' && 90 || 7 }}
+
+  build-package-windows:
+    name: Build and package windows
+    runs-on: windows-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+
+      - name: Detect NowPlaying-related changes
+        id: nowplaying_changes
+        if: ${{ github.event_name == 'pull_request' }}
+        shell: bash
+        run: .github/scripts/bash/detect-nowplaying-changes.sh "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}"
+
+      - name: Download NowPlaying helper
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ALLOW_RATE_LIMIT_SKIP: ${{ github.event_name == 'pull_request' && steps.nowplaying_changes.outputs.changed != 'true' && 'true' || 'false' }}
+        if: ${{ github.token != '' }}
+        continue-on-error: ${{ github.event_name == 'pull_request' }}
+        run: ./.scripts/windows/download-now-playing.ps1
+
+      - name: Setup Go
+        uses: ./.github/actions/setup-go
+
+      - name: Build web client
+        uses: ./.github/actions/build-client-web
+
+      - name: Setup MinGW
+        uses: egor-tensin/setup-mingw@41b837e47d7f85214629d255b9c4bc3fcbe9fd63 # v3
+        with:
+          platform: x64
+          # https://github.com/egor-tensin/setup-mingw/issues/17#issuecomment-1890253793
+          version: 12.2.0
+
+      - name: Install NSIS
+        run: choco install nsis -y --no-progress --limit-output
+
+      - name: Get version
+        id: get_version
+        shell: bash
+        run: .github/scripts/bash/get-version.sh "${{ github.ref_type }}" "${{ github.ref_name }}" "${{ github.sha }}"
+
+      - name: Generate resource file
+        run: |
+          powershell -ExecutionPolicy Bypass -File ./.scripts/windows/generate-rc.ps1
+          windres system-bridge.rc -O coff -o system-bridge.syso
+
+      - name: Build application
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: 1
+          CC: gcc
+        run: |
+          go build -v -ldflags="-H windowsgui -X 'github.com/timmo001/system-bridge/version.Version=${{ env.VERSION }}'" -o "system-bridge.exe"
+
+      - name: Build TUI
+        run: |
+          mise run build:tui
+
+      - name: Verify CSS in Windows binary
+        shell: pwsh
+        run: |
+          ./.scripts/windows/create-installer.ps1 -VerifyBinaryOnly
+
+      - name: Package for Windows
+        run: ./.github/scripts/pwsh/package-windows.ps1
+
+      - name: Upload packages
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: system-bridge-windows-packages-${{ env.VERSION }}
+          path: dist/**
+          retention-days: ${{ github.ref_type == 'tag' && 90 || 7 }}
+    outputs:
+      version: ${{ steps.get_version.outputs.version }}
+
+  aur-changes:
+    name: Check AUR-relevant changes
+    if: github.ref == 'refs/heads/dev' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      changed: ${{ steps.aur_changes.outputs.changed }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+
+      - name: Detect AUR-relevant changes
+        id: aur_changes
+        if: github.ref == 'refs/heads/dev' && github.event_name == 'push'
+        shell: bash
+        run: .github/scripts/bash/detect-aur-changes.sh "${{ github.event.before }}" "${{ github.sha }}"
+
+  prepare-aur-development:
+    name: Prepare AUR package (system-bridge-git)
+    if: github.ref == 'refs/heads/dev' && github.event_name == 'push' && needs.aur-changes.outputs.changed == 'true'
+    needs:
+      - aur-changes
+      - build-linux
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+
+      - name: Prepare AUR package files
+        run: .scripts/linux/prepare-aur.sh development "${{ runner.temp }}/aur-package"
+
+      - name: Upload AUR package files
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: aur-system-bridge-git-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/aur-package
+          if-no-files-found: error
+          retention-days: 1
+
+  update-aur-development:
+    name: Update AUR (system-bridge-git)
+    if: github.ref == 'refs/heads/dev' && github.event_name == 'push' && needs.aur-changes.outputs.changed == 'true'
+    needs:
+      - aur-changes
+      - prepare-aur-development
+    permissions:
+      contents: read
+    uses: timmo001/workflows/.github/workflows/publish-aur.yml@722ef29d1740604bd16be91fde520339d2cfadbb # master
+    with:
+      package-name: system-bridge-git
+      artifact-name: aur-system-bridge-git-${{ github.run_id }}-${{ github.run_attempt }}
+      pkgbuild-path: PKGBUILD
+    secrets:
+      AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+
+  report-aur-development:
+    name: Report AUR status (system-bridge-git)
+    if: always() && github.ref == 'refs/heads/dev' && github.event_name == 'push'
+    needs:
+      - aur-changes
+      - prepare-aur-development
+      - update-aur-development
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Report change detection failure
+        if: needs.aur-changes.result != 'success'
+        run: echo "Unable to determine whether AUR-relevant files changed."
+
+      - name: Report skipped AUR update
+        if: needs.aur-changes.result == 'success' && needs.aur-changes.outputs.changed != 'true'
+        run: echo "No source, workflow, or build script changes detected; skipping AUR update."
+
+      - name: Report AUR update status
+        if: needs.aur-changes.outputs.changed == 'true' && needs.prepare-aur-development.result == 'success'
+        run: >-
+          .github/scripts/bash/report-aur-status.sh
+          system-bridge-git
+          "${{ needs.update-aur-development.result }}"
+          "${{ needs.update-aur-development.outputs.changed }}"
+
+      - name: Report AUR preparation status
+        if: needs.aur-changes.outputs.changed == 'true' && needs.prepare-aur-development.result != 'success'
+        run: >-
+          .github/scripts/bash/report-aur-status.sh
+          system-bridge-git
+          "${{ needs.prepare-aur-development.result }}"
+          false
+
+  prepare-aur-stable:
+    name: Prepare AUR package (system-bridge)
+    if: github.event_name == 'release' && github.event.action == 'published' && github.event.release.prerelease == false
+    needs:
+      - build-linux
+    container:
+      image: ghcr.io/timmo001/system-bridge/ci-build-arch:latest@sha256:7860abed58de36b5f5779b9f252aa5a5ad3fb161251996fa7d119fad67a9e427
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.release.tag_name }}
+
+      - name: Prepare AUR package files
+        env:
+          VERSION: ${{ github.event.release.tag_name }}
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/aur-package"
+          chown builduser:builduser "$GITHUB_WORKSPACE/aur-package"
+          sudo -u builduser -H .scripts/linux/prepare-aur.sh stable "$GITHUB_WORKSPACE/aur-package" "$VERSION"
+
+      - name: Upload AUR package files
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: aur-system-bridge-${{ github.run_id }}-${{ github.run_attempt }}
+          path: aur-package
+          if-no-files-found: error
+          retention-days: 1
+
+  build-arch-package-stable:
+    name: Build Arch package (system-bridge)
+    if: github.event_name == 'release' && github.event.action == 'published' && github.event.release.prerelease == false
+    needs:
+      - prepare-aur-stable
+    permissions:
+      contents: read
+    # yamllint disable-line rule:comments
+    uses: timmo001/workflows/.github/workflows/build-arch-package.yml@722ef29d1740604bd16be91fde520339d2cfadbb # master
+    with:
+      package-name: system-bridge
+      package-files-artifact-name: aur-system-bridge-${{ github.run_id }}-${{ github.run_attempt }}
+      pkgbuild-path: PKGBUILD
+    secrets:
+      ARCH_REPO_DISPATCH_TOKEN: ${{ secrets.ARCH_REPO_DISPATCH_TOKEN }}
+
+  update-aur-stable:
+    name: Update AUR (system-bridge)
+    if: github.event_name == 'release' && github.event.action == 'published' && github.event.release.prerelease == false
+    needs:
+      - prepare-aur-stable
+    permissions:
+      contents: read
+    uses: timmo001/workflows/.github/workflows/publish-aur.yml@722ef29d1740604bd16be91fde520339d2cfadbb # master
+    with:
+      package-name: system-bridge
+      artifact-name: aur-system-bridge-${{ github.run_id }}-${{ github.run_attempt }}
+      pkgbuild-path: PKGBUILD
+    secrets:
+      AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+
+  report-aur-stable:
+    name: Report AUR status (system-bridge)
+    if: always() && github.event_name == 'release' && github.event.action == 'published' && github.event.release.prerelease == false
+    needs:
+      - prepare-aur-stable
+      - update-aur-stable
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Report AUR update status
+        if: needs.prepare-aur-stable.result == 'success'
+        run: >-
+          .github/scripts/bash/report-aur-status.sh
+          system-bridge
+          "${{ needs.update-aur-stable.result }}"
+          "${{ needs.update-aur-stable.outputs.changed }}"
+
+      - name: Report AUR preparation status
+        if: needs.prepare-aur-stable.result != 'success'
+        run: >-
+          .github/scripts/bash/report-aur-status.sh
+          system-bridge
+          "${{ needs.prepare-aur-stable.result }}"
+          false
+
+  update-release:
+    name: Update release
+    if: github.event_name == 'release'
+    needs:
+      - build-linux
+      - package-linux
+      - build-package-windows
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download linux arch packages
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: system-bridge-linux-packages-arch-${{ needs.build-linux.outputs.version }}
+          path: dist/linux/arch
+
+      - name: Download linux deb packages
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: system-bridge-linux-packages-deb-${{ needs.build-linux.outputs.version }}
+          path: dist/linux/deb
+
+      - name: Download linux rpm packages
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: system-bridge-linux-packages-rpm-${{ needs.build-linux.outputs.version }}
+          path: dist/linux/rpm
+
+      - name: Download linux flatpak packages
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: system-bridge-linux-packages-flatpak-${{ needs.build-linux.outputs.version }}
+          path: dist/linux/flatpak
+
+      - name: Download windows packages
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: system-bridge-windows-packages-${{ needs.build-package-windows.outputs.version }}
+          path: dist/windows
+
+      - name: Update release
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
+        with:
+          files: |
+            dist/linux/arch/*.pkg.tar.zst
+            dist/linux/deb/*.deb
+            dist/linux/rpm/*.rpm
+            dist/linux/flatpak/*.flatpak
+            dist/windows/*-setup.exe
+
+  compute-next-patch:
+    name: Compute next patch tag
+    runs-on: ubuntu-latest
+    needs:
+      - update-release
+    if: github.event_name == 'release'
+    outputs:
+      next_tag: ${{ steps.compute.outputs.next_tag }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Compute next patch tag
+        id: compute
+        shell: bash
+        run: .github/scripts/bash/compute-next-patch.sh "${{ github.event.release.tag_name }}"
+
+  create-prerelease:
+    name: Create draft release
+    runs-on: ubuntu-latest
+    needs:
+      - compute-next-patch
+    if: github.event_name == 'release'
+    permissions:
+      contents: write
+    steps:
+      - name: Create draft prerelease
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
+        with:
+          draft: true
+          prerelease: false
+          make_latest: true
+          name: ${{ needs.compute-next-patch.outputs.next_tag }}
+          tag_name: ${{ needs.compute-next-patch.outputs.next_tag }}
+          generate_release_notes: false

@@ -1,0 +1,472 @@
+name: Build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+jobs:
+  linux-build:
+    name: ${{ matrix.platform.display_name }} ${{ matrix.preset_build_type.display_name }}
+
+    runs-on: ${{ matrix.platform.os }}
+
+    defaults:
+      run:
+        shell: bash
+
+    strategy:
+      fail-fast: false
+
+      matrix:
+        platform:
+        - { display_name: 'Linux Native Libraries', os: ubuntu-24.04, preset_os: linux }
+
+        preset_build_type:
+        - { display_name: 'Debug', name: debug }
+        - { display_name: 'Release', name: release }
+
+    container:
+      image: 'registry.gitlab.steamos.cloud/steamrt/sniper/sdk:latest'
+
+    steps:
+      # Silence a git warning emitted from actions/checkout.
+      # For context: https://git-scm.com/docs/git-init#Documentation/git-init.txt---initial-branchbranch-name
+    - name: Set initial default branch name
+      run: git config --global init.defaultBranch master
+
+    - uses: actions/checkout@v6
+      with:
+        fetch-depth: 0
+
+    - name: Set ownership
+      run: |
+        # Fix for "detected dubious ownership in repository"
+        chown -R $(id -u):$(id -g) $PWD
+
+    - name: Set reusable strings
+      run: |
+        preset_name="${{ matrix.platform.preset_os }}-${{ matrix.preset_build_type.name }}"
+        workspace_dir="$GITHUB_WORKSPACE"
+        source_dir=${workspace_dir//\\//}/src
+        build_dir=${workspace_dir//\\//}/src/build/$preset_name
+        install_dir=$build_dir/install
+        echo "source_dir=$source_dir" >> "$GITHUB_ENV"
+        echo "build_dir=$build_dir" >> "$GITHUB_ENV"
+        echo "install_dir=$install_dir" >> "$GITHUB_ENV"
+        echo "preset_name=$preset_name" >> "$GITHUB_ENV"
+
+    - name: Git fetch tags
+      run: git fetch origin --tags --force
+
+    # Libraries
+
+    - name: Sparse fetch neoAssets
+      uses: actions/checkout@v6
+      with:
+        repository: NeotokyoRebuild/neoAssets
+        path: neoAssets
+        sparse-checkout:
+          neo/detail.vbsp
+          neo/lights.rad
+          neo/resource/
+          neo/shaders/fxc/
+          neo/rebuild.fgd
+
+    - name: CMake configure libraries build
+      working-directory: ${{ env.source_dir }}
+      run: >
+        cmake
+        --preset ${{ env.preset_name }}
+        -DCMAKE_INSTALL_PREFIX=${{ env.install_dir }}
+        -DNEO_CI_BUILD=ON
+        -DNEO_USE_CCACHE=OFF
+        -DNEO_COPY_LIBRARIES=OFF
+        -DNEO_USE_SEPARATE_BUILD_INFO=ON
+        -DNEO_INSTALL_LIBRARIES=ON
+        -DNEO_INSTALL_LAUNCHER=ON
+        -DNEO_INSTALL_RESOURCES=OFF
+        -DNEO_EXTRA_ASSETS_ALT_PATH=${{ github.workspace }}/neoAssets
+
+    - name: CMake libraries build
+      working-directory: ${{ env.source_dir }}
+      run: cmake --build --preset ${{ env.preset_name }} --parallel --verbose
+
+    - name: Install libraries
+      run: cmake --install ${{ env.build_dir }}
+
+    # Run unit tests
+
+    - name: CTest
+      working-directory: ${{ env.source_dir }}
+      env:
+        NEO_TEST_HIDE_PASS: "1"
+      run: ctest --test-dir build/${{ env.preset_name }}/tests/ --output-on-failure
+
+    # Dedicated library
+
+    - name: CMake reconfigure dedicated library build
+      working-directory: ${{ env.source_dir }}
+      run: >
+        cmake
+        --preset ${{ env.preset_name }}
+        -DNEO_DEDICATED=ON
+        -DNEO_GENERATE_GAMEDATA=ON
+
+    - name: CMake dedicated library build
+      working-directory: ${{ env.source_dir }}
+      run: cmake --build --preset ${{ env.preset_name }} --parallel --verbose
+
+    - name: Install dedicated library
+      run: cmake --install ${{ env.build_dir }}
+
+    # Artifacts
+
+    - name: Get artifact names
+      working-directory: ${{ env.install_dir }}
+      run: |
+        echo "libraries=$(find . -regex '\.\/neo-\w*-\w*-libraries-\w*-\w*' -printf '%f')" >> "$GITHUB_ENV"
+        echo "libraries_debuginfo=$(find . -regex '\.\/neo-\w*-\w*-libraries-debuginfo-\w*-\w*' -printf '%f')" >> "$GITHUB_ENV"
+        echo "dedicated=$(find . -regex '\.\/neo-\w*-\w*-dedicated-\w*-\w*' -printf '%f')" >> "$GITHUB_ENV"
+        echo "dedicated_debuginfo=$(find . -regex '\.\/neo-\w*-\w*-dedicated-debuginfo-\w*-\w*' -printf '%f')" >> "$GITHUB_ENV"
+        echo "gamedata=$(find . -regex '\.\/neo-\w*-\w*-gamedata' -printf '%f')" >> "$GITHUB_ENV"
+        echo "launcher=$(find . -regex '\.\/neo-\w*-\w*-launcher-\w*-\w*' -printf '%f')" >> "$GITHUB_ENV"
+        echo "launcher_debuginfo=$(find . -regex '\.\/neo-\w*-\w*-launcher-debuginfo-\w*-\w*' -printf '%f')" >> "$GITHUB_ENV"
+
+    - name: Upload libraries
+      uses: actions/upload-artifact@v7
+      with:
+        name: ${{ env.libraries }}
+        path: ${{ env.install_dir }}/${{ env.libraries }}
+        if-no-files-found: error
+
+    - name: Upload libraries debug information
+      uses: actions/upload-artifact@v7
+      with:
+        name: ${{ env.libraries_debuginfo }}
+        path: ${{ env.install_dir }}/${{ env.libraries_debuginfo }}
+        if-no-files-found: error
+
+    - name: Upload dedicated library
+      uses: actions/upload-artifact@v7
+      with:
+        name: ${{ env.dedicated }}
+        path: ${{ env.install_dir }}/${{ env.dedicated }}
+        if-no-files-found: error
+
+    - name: Upload dedicated library debug information
+      uses: actions/upload-artifact@v7
+      with:
+        name: ${{ env.dedicated_debuginfo }}
+        path: ${{ env.install_dir }}/${{ env.dedicated_debuginfo }}
+        if-no-files-found: error
+
+    - name: Upload SourceMod gamedata
+      if: ${{ matrix.preset_build_type.name == 'release' }}
+      uses: actions/upload-artifact@v7
+      with:
+        name: ${{ env.gamedata }}
+        path: ${{ env.install_dir }}/${{ env.gamedata }}
+        if-no-files-found: error
+
+    - name: Upload launcher
+      uses: actions/upload-artifact@v7
+      with:
+        name: ${{ env.launcher }}
+        path: ${{ env.install_dir }}/${{ env.launcher }}
+        if-no-files-found: error
+
+    - name: Upload launcher debug information
+      uses: actions/upload-artifact@v7
+      with:
+        name: ${{ env.launcher_debuginfo }}
+        path: ${{ env.install_dir }}/${{ env.launcher_debuginfo }}
+        if-no-files-found: error
+
+  windows-build:
+    name: ${{ matrix.platform.display_name }} ${{ matrix.preset_build_type.display_name }}
+
+    runs-on: ${{ matrix.platform.os }}
+
+    defaults:
+      run:
+        shell: bash
+
+    strategy:
+      fail-fast: false
+
+      matrix:
+        platform:
+        - { display_name: 'Windows Native Libraries', os: windows-2022, preset_os: windows }
+
+        preset_build_type:
+        - { display_name: 'Debug', name: debug }
+        - { display_name: 'Release', name: release }
+
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        fetch-depth: 0
+
+    - name: Set reusable strings
+      run: |
+        preset_name="${{ matrix.platform.preset_os }}-${{ matrix.preset_build_type.name }}"
+        workspace_dir="${{ github.workspace }}"
+        source_dir=${workspace_dir//\\//}/src
+        build_dir=${workspace_dir//\\//}/src/build/$preset_name
+        install_dir=$build_dir/install
+        echo "source_dir=$source_dir" >> "$GITHUB_ENV"
+        echo "build_dir=$build_dir" >> "$GITHUB_ENV"
+        echo "install_dir=$install_dir" >> "$GITHUB_ENV"
+        echo "preset_name=$preset_name" >> "$GITHUB_ENV"
+
+    - uses: TheMrMilchmann/setup-msvc-dev@79dac248aac9d0059f86eae9d8b5bfab4e95e97c
+      with:
+        arch: x64
+
+    - name: Print PATH
+      run: |
+        echo "PATH: $PATH"
+
+    - name: Git fetch tags
+      run: git fetch origin --tags --force
+
+    # Libraries
+
+    - name: Sparse fetch neoAssets
+      uses: actions/checkout@v6
+      with:
+        repository: NeotokyoRebuild/neoAssets
+        path: neoAssets
+        sparse-checkout:
+          neo/detail.vbsp
+          neo/lights.rad
+          neo/resource/
+          neo/shaders/fxc/
+          neo/rebuild.fgd
+
+    - name: CMake configure libraries build
+      working-directory: ${{ env.source_dir }}
+      run: >
+        cmake
+        --preset ${{ env.preset_name }}
+        -DCMAKE_INSTALL_PREFIX=${{ env.install_dir }}
+        -DNEO_CI_BUILD=ON
+        -DNEO_USE_CCACHE=OFF
+        -DNEO_COPY_LIBRARIES=OFF
+        -DNEO_USE_SEPARATE_BUILD_INFO=ON
+        -DNEO_INSTALL_LIBRARIES=ON
+        -DNEO_INSTALL_LAUNCHER=ON
+        -DNEO_INSTALL_RESOURCES=OFF
+        -DNEO_EXTRA_ASSETS_ALT_PATH=${{ github.workspace }}/neoAssets
+
+    - name: CMake libraries build
+      working-directory: ${{ env.source_dir }}
+      run: cmake --build --preset ${{ env.preset_name }} --parallel --verbose
+
+    - name: Install libraries
+      run: cmake --install ${{ env.build_dir }}
+
+    # Run unit tests
+
+    - name: CTest
+      working-directory: ${{ env.source_dir }}
+      env:
+        NEO_TEST_HIDE_PASS: "1"
+      run: ctest --test-dir build/${{ env.preset_name }}/tests/ --output-on-failure
+
+    # Dedicated library
+
+    - name: CMake reconfigure dedicated library build
+      working-directory: ${{ env.source_dir }}
+      run: >
+        cmake
+        --preset ${{ env.preset_name }}
+        -DNEO_DEDICATED=ON
+        -DNEO_GENERATE_GAMEDATA=ON
+
+    - name: CMake dedicated library build
+      working-directory: ${{ env.source_dir }}
+      run: cmake --build --preset ${{ env.preset_name }} --parallel --verbose
+
+    - name: Install dedicated library
+      run: cmake --install ${{ env.build_dir }}
+
+    # Artifacts
+
+    - name: Get artifact names
+      working-directory: ${{ env.install_dir }}
+      run: |
+        echo "libraries=$(find . -regex '\.\/neo-\w*-\w*-libraries-\w*-\w*' -printf '%f')" >> "$GITHUB_ENV"
+        echo "libraries_debuginfo=$(find . -regex '\.\/neo-\w*-\w*-libraries-debuginfo-\w*-\w*' -printf '%f')" >> "$GITHUB_ENV"
+        echo "dedicated=$(find . -regex '\.\/neo-\w*-\w*-dedicated-\w*-\w*' -printf '%f')" >> "$GITHUB_ENV"
+        echo "dedicated_debuginfo=$(find . -regex '\.\/neo-\w*-\w*-dedicated-debuginfo-\w*-\w*' -printf '%f')" >> "$GITHUB_ENV"
+        echo "gamedata=$(find . -regex '\.\/neo-\w*-\w*-gamedata' -printf '%f')" >> "$GITHUB_ENV"
+        echo "launcher=$(find . -regex '\.\/neo-\w*-\w*-launcher-\w*-\w*' -printf '%f')" >> "$GITHUB_ENV"
+        echo "launcher_debuginfo=$(find . -regex '\.\/neo-\w*-\w*-launcher-debuginfo-\w*-\w*' -printf '%f')" >> "$GITHUB_ENV"
+
+    - name: Upload libraries
+      uses: actions/upload-artifact@v7
+      with:
+        name: ${{ env.libraries }}
+        path: ${{ env.install_dir }}/${{ env.libraries }}
+        if-no-files-found: error
+
+    - name: Upload libraries debug information
+      uses: actions/upload-artifact@v7
+      with:
+        name: ${{ env.libraries_debuginfo }}
+        path: ${{ env.install_dir }}/${{ env.libraries_debuginfo }}
+        if-no-files-found: error
+
+    - name: Upload dedicated library
+      uses: actions/upload-artifact@v7
+      with:
+        name: ${{ env.dedicated }}
+        path: ${{ env.install_dir }}/${{ env.dedicated }}
+        if-no-files-found: error
+
+    - name: Upload dedicated library debug information
+      uses: actions/upload-artifact@v7
+      with:
+        name: ${{ env.dedicated_debuginfo }}
+        path: ${{ env.install_dir }}/${{ env.dedicated_debuginfo }}
+        if-no-files-found: error
+
+    - name: Upload launcher
+      uses: actions/upload-artifact@v7
+      with:
+        name: ${{ env.launcher }}
+        path: ${{ env.install_dir }}/${{ env.launcher }}
+        if-no-files-found: error
+
+    - name: Upload launcher debug information
+      uses: actions/upload-artifact@v7
+      with:
+        name: ${{ env.launcher_debuginfo }}
+        path: ${{ env.install_dir }}/${{ env.launcher_debuginfo }}
+        if-no-files-found: error
+
+  pack-resources:
+    name: Windows Native Resources
+
+    runs-on: windows-2022
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        fetch-depth: 0
+
+    - name: Set reusable strings
+      run: |
+        workspace_dir="${{ github.workspace }}"
+        source_dir=${workspace_dir//\\//}/src
+        build_dir=${workspace_dir//\\//}/src/build/windows-release
+        install_dir=$build_dir/install
+        echo "source_dir=$source_dir" >> "$GITHUB_ENV"
+        echo "build_dir=$build_dir" >> "$GITHUB_ENV"
+        echo "install_dir=$install_dir" >> "$GITHUB_ENV"
+
+    - name: Git fetch tags
+      run: git fetch origin --tags --force
+
+    - uses: TheMrMilchmann/setup-msvc-dev@79dac248aac9d0059f86eae9d8b5bfab4e95e97c
+      with:
+        arch: x64
+
+    # Resources
+
+    - name: CMake configure resources build
+      working-directory: ${{ env.source_dir }}
+      run: >
+        cmake
+        --preset windows-release
+        -DCMAKE_INSTALL_PREFIX=${{ env.install_dir }}
+        -DNEO_USE_CCACHE=OFF
+        -DNEO_COPY_LIBRARIES=OFF
+        -DNEO_INSTALL_LIBRARIES=OFF
+        -DNEO_INSTALL_RESOURCES=ON
+        -DNEO_INSTALL_LAUNCHER=OFF
+
+    - name: Install resources
+      run: cmake --install ${{ env.build_dir }}
+
+    - name: Get artifact name
+      working-directory: ${{ env.install_dir }}
+      run: echo "resources=$(echo neo-*-*-resources)" >> "$GITHUB_ENV"
+
+    - name: Upload resources
+      uses: actions/upload-artifact@v7
+      with:
+        name: ${{ env.resources }}
+        path: ${{ env.install_dir }}/${{ env.resources }}
+        if-no-files-found: error
+
+  upload-latest-build:
+    name: Upload Latest Build
+
+    needs: [linux-build, windows-build, pack-resources]
+    runs-on: ubuntu-24.04
+    if: github.ref == 'refs/heads/master'
+    permissions:
+      contents: write
+
+    steps:
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+
+    - name: Packing artifacts
+      run: 'parallel 7z a -t7z -m0=lzma -mx=9 "{}.7z" "./{}/*" ::: neo-*'
+
+    - name: Create & upload latest build
+      env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO_INFO: ${{ github.repository }}
+      run: |
+        # Delete old "latest" (delete step always returns true so that even if there's no release, it still uploads)
+        gh release delete latest --cleanup-tag --yes --repo "$REPO_INFO" || true
+        # Create new "latest"
+        gh release create latest neo-*.7z --prerelease --title "Latest Master Build" --repo "$REPO_INFO"
+
+  upload-release:
+    name: Upload Release and update website
+
+    needs: [linux-build, windows-build, pack-resources]
+    runs-on: ubuntu-24.04
+    if: github.event_name == 'release' && github.event.action == 'published'
+    permissions:
+      contents: write
+
+    steps:
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+
+    - name: Deleting every debug artifact
+      run: 'rm -r *-Debug'
+
+    - name: Packing artifacts
+      run: 'parallel 7z a -t7z -m0=lzma -mx=9 "{= s/neo-(.*)/neo-$GITHUB_REF_NAME-\1.7z/ =}" "./{}/*" ::: neo-*'
+
+    - name: Upload assets to a release
+      env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO_INFO: ${{ github.repository }}
+      run: 'gh release upload "$GITHUB_REF_NAME" neo-*.7z --clobber --repo "$REPO_INFO"'
+
+    - name: Trigger NeotokyoRebuild.github.io to update
+      env:
+          NTRE_GH_SITE_PAT: ${{ secrets.NTRE_GH_SITE_PAT }}
+      run: |
+        curl -qs --fail-with-body -L -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $NTRE_GH_SITE_PAT" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/repos/NeotokyoRebuild/NeotokyoRebuild.github.io/dispatches \
+            -d '{"event_type":"new-release"}'
+

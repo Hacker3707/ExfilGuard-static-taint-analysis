@@ -1,0 +1,440 @@
+name: mutation
+
+# Mutation testing runs on push-to-main + nightly + manual dispatch, and on
+# pull_request for author-time visibility.
+#
+# `mutation` is INFORMATIONAL on an ordinary PR (#2230, the merge/release
+# two-tier split): mutation quality is a release-gate concern — it is not in
+# release.yml's RELEASE_REQUIRED_CHECKS either (see the `mutation` row in
+# docs/operations.md's de-gated-lanes table), only its RELEASE_INFORMATIONAL_
+# CHECKS — so a genuinely full verdict is only ever load-bearing on push-to-
+# main + nightly, never on a PR or a publish. The diff-scoped selection below
+# is kept anyway, deliberately NOT collapsed to a blanket no-op like the other
+# lanes #2230 demoted: it is cheap by construction (most PRs queue one leg or
+# none) and it is what closes the v1.13.2-cycle hollow-green class described
+# below, so it still buys early, real, PR-time signal for the cost.
+#
+# On an ordinary PR the `mutate` matrix runs the legs whose SCOPE the PR
+# changed, and production-only edits use gremlins' merge-base changed-line
+# filter inside those legs. Test/harness changes, unknown projections, and a
+# changed-line run with zero executable mutants fall back to the full selected
+# phase. A PR editing only docs runs no leg at all. Selection is computed by
+# .github/scripts/mutation-matrix.mjs from the PR's own diff against its merge
+# base; the phase table it selects from lives in mutation-phases.mjs. Push /
+# schedule / dispatch and `release/*` PRs sweep the FULL matrix, so no leg's
+# efficacy floor depends on some PR happening to touch its package.
+#
+# A merge-queue entry is scoped the same way, off the merge group's own
+# `base_sha..head_sha`. The push that lands the batch still sweeps the full
+# matrix on the identical SHA, so the floor is unchanged and the queue is not
+# charged the sweep twice.
+#
+# Before this scoping existed, the matrix was skipped WHOLESALE on any
+# non-release PR and the (then-required) `mutation` aggregator reported that
+# skip as green. That is a hollow green — a required check passing on work it
+# never did — and it let a PR drop internal/chplan below its 95% floor, merge
+# green, and surface the regression on the release PR, where it blocked the
+# release instead of the change that caused it. Scoping keeps the wall-clock
+# win that motivated the skip (most PRs still queue one leg or none) without
+# the blind spot, and that property holds regardless of whether `mutation` is
+# a required context.
+#
+# The single `mutation` aggregator job passes through green ONLY when the
+# selector proved no phase scope changed, and fails if the selector itself
+# failed — an unknown selection is never a pass.
+
+on:
+  pull_request:
+  # `mutation` is informational (see the header above), but the aggregator
+  # still posts inside the merge queue for the same early-signal reason it
+  # runs on an ordinary PR. The merge group selects legs from its OWN diff
+  # (`base_sha..head_sha`, the union of the batched PRs' diffs) exactly as a
+  # PR does — see the merge_group clause in .github/scripts/lib/scope-gate.mjs.
+  merge_group:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '17 3 * * *'   # nightly at 3:17 UTC; off-minute to avoid scheduler peaks
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # Main pushes and the exact nightly cron replace only their own modes. Scoped
+  # PR/queue and manual or release-head qualification remain unique.
+  group: ${{ github.workflow }}-${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && 'latest-main-push' || (github.event_name == 'schedule' && github.ref == 'refs/heads/main' && github.event.schedule != '') && format('latest-main-schedule-{0}', github.event.schedule) || github.run_id }}
+  # NEVER cancel a run that is already in progress (tsouza/cerberus#2994).
+  #
+  # The GROUP above still coalesces: GitHub holds at most ONE pending run per
+  # group, so a burst of pushes is superseded at QUEUE time, where a pending run
+  # holds no runner and costs nothing. Killing a run already EXECUTING is a
+  # separate act, and it only pays when the killed work was near-worthless.
+  # Before "optimising" this line back into an expression, read the decision
+  # rule and this lane's recorded answer in QUEUE_COALESCED_WORKFLOWS in
+  # .github/scripts/main-coalescing.mjs, whose audit fails this workflow if the
+  # two halves ever disagree. The figures below are run-minutes (wall clock per
+  # run, not billed runner minutes, which a fan-out multiplies).
+  #
+  # Measured here: 60% of its main-push runs CANCELLED against 10 successes, a
+  # median 38.6-min successful run against the 38.5-min median push gap — only
+  # 50% of gaps are long enough for a run to finish — kills landing a median
+  # 24.3 min in (63% of a full run) with 19 of 59 past the 90% mark, and 45% of
+  # this lane's run-minutes (1413 min in 74.5 h) discarded. Cancellation
+  # coalesced nothing here; it starved the lane, as it starved coverage.
+  cancel-in-progress: false
+
+jobs:
+  # select — decide WHICH phases this event runs, and emit them as the `mutate`
+  # strategy.matrix.
+  #
+  # The phase table itself lives in .github/scripts/mutation-phases.mjs, not
+  # inline here, because the selector has to REASON about it (match each leg's
+  # scope + scope-relative file pattern against the PR diff, assert those
+  # patterns stay inside Go's RE2 dialect, and translate every `include_files`
+  # allowlist into the `exclude_files` gremlins understands) — and a workflow
+  # `include:`
+  # block is data the workflow cannot read back. Same single-source-of-truth
+  # shape as compose-smoke-setup / .github/scripts/compose-smoke-matrix.mjs.
+  #
+  # Cheap by construction: node + a `git diff`, no toolchain, no gremlins. A
+  # docs-only PR pays a few seconds here and queues zero mutation legs.
+  select:
+    name: mutation-select
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.emit.outputs.matrix }}
+      # `has_phases` is read by the aggregator to tell "nothing in scope
+      # changed" (a legitimate green) apart from "the matrix did not run" (not).
+      has_phases: ${{ steps.emit.outputs.has_phases }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The selector diffs the PR head against its MERGE BASE, which a
+          # shallow clone cannot resolve. A failed diff is not read as "nothing
+          # changed" — mutation-matrix.mjs falls back to the full matrix — but
+          # that fallback is a safety net, not the intended path.
+          fetch-depth: 0
+
+      # A pull request and a merge group each name a base/head pair; the two are
+      # mutually exclusive, so one `||` picks whichever the event carries.
+      # BASE_SHA/HEAD_SHA are empty off both, and the selector already runs the
+      # full matrix for those events and never consults them.
+      - id: emit
+        name: select the phases this event runs
+        run: node .github/scripts/mutation-matrix.mjs
+        env:
+          MODE: emit
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_REF: ${{ github.head_ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
+
+  mutate:
+    # Per-phase mutation kill-zone. gremlins v0.6.0 has no per-package
+    # threshold, so each phase runs as its own matrix entry scoped to a
+    # single package with its own --threshold-efficacy bar. `.gremlins.yaml`
+    # declares no bar at all (its former top-level `threshold-efficacy` /
+    # `threshold-mcover` keys were never read by gremlins, so the whole-repo
+    # floor they advertised for `just mutate` never existed) — the phase table
+    # in .github/scripts/mutation-phases.mjs is the only bar, and carries
+    # the per-leg rationale (the logql/traceql OOM splits, the equivalent-mutant
+    # analysis behind each bar) that used to live in this block.
+    name: gremlins ${{ matrix.phase }} (${{ matrix.scope }} @ ${{ matrix.efficacy }}%)
+    needs: select
+    # Skipped only when the selector proved NOTHING in any phase scope changed.
+    # The aggregator re-checks `has_phases`, so a skip here can never be mistaken
+    # for a pass over work that should have run.
+    if: ${{ needs.select.outputs.has_phases == 'true' }}
+    runs-on: ubuntu-latest
+    # 90 (not 60): the parser legs run workers=1 (see mutation-phases.mjs) to
+    # stay under the runner memory ceiling, which serialises their ~109 timeout
+    # mutants and pushes wall-clock toward an hour on a 2-core runner. The faster
+    # phases finish well inside this; it only bounds a genuinely-hung leg.
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.select.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # A non-empty matrix.diff_ref (below) makes gremlins run its own
+          # `git diff DIFF_REF` internally to scope mutants to changed lines
+          # — the exact hazard the `select` job's own checkout comment
+          # already documents for the identical operation: "a shallow clone
+          # cannot resolve" a merge-base diff. This job's checkout was never
+          # given the same fetch-depth: 0, so gremlins failed outright with
+          # `fatal: bad object <sha>` on every phase whose diff_ref pointed
+          # at a commit this shallow (depth-1) clone never fetched (observed
+          # on PRs #2282-#2284, all opened against the same recent main tip;
+          # #2286+ passed only because later phases happened not to need the
+          # diff path, not because the checkout was sufficient).
+          fetch-depth: 0
+      - uses: ./.github/actions/setup-go
+      # We install gremlins directly via `go install` so we don't
+      # depend on a third-party Action's release-download path.
+      # The setup-go composite's module cache keeps subsequent runs fast.
+      # Use `--output` for structured JSON: the lane withholds
+      # `--threshold-efficacy` from gremlins and gates on the parsed report
+      # below. The pinned fork DOES exit non-zero on a violation — it just
+      # does so mid-run, before the report is written and uploaded, leaving an
+      # opaque `gremlins exited N` with no artifact and no measured-vs-threshold
+      # numbers.
+      #
+      # We consume gremlins via the tsouza/gremlins fork, which carries five
+      # fixes cerberus needs:
+      #
+      #   --on-shutdown-status=not-run   in-flight mutants killed by the
+      #     runner's SIGTERM are recorded as NOT_RUN rather than LIVED, which
+      #     used to falsely deflate test_efficacy. Upstream PR:
+      #     https://github.com/go-gremlins/gremlins/pull/283
+      #
+      #   --timeout-max                  an absolute ceiling on a single
+      #     mutant's test run. See the `gremlins unleash` step below.
+      #
+      #   --compile-allowance            the run bound above now bounds only the
+      #     RUN, and this is what compiling the mutant is charged to. The fork
+      #     also reads a mutant's verdict from the child's output instead of its
+      #     exit status, because `go test` reports a failing test, a package
+      #     that does not build and a test that ran past its -timeout all as
+      #     exit 1 (#2910).
+      #
+      #   prefix operators read as prefix operators
+      #     gremlins' token table describes the INFIX meaning of each operator,
+      #     and it was applied to `*ast.UnaryExpr` too. On this tree, whose
+      #     plan-building code is mostly `&chplan.Foo{...}` composite literals,
+      #     INVERT_BITWISE turned every one of them into `|chplan.Foo{...}` —
+      #     source that does not parse. Those mutants were then booked KILLED
+      #     off the same exit status 1, so each leg was paid efficacy for work
+      #     the compiler did: `Not viable: 0` on every leg was the tell that the
+      #     status had never once been reported. The fork no longer generates
+      #     them (#2930).
+      #
+      #   a candidate mutant is type-checked before it is emitted
+      #     The line above is one instance of a wider gap: a token table says
+      #     what a rewrite MEANS for a token read on its own, and whether the
+      #     result is a program depends on the operand types, the constant
+      #     values around it, and what statements the enclosing function
+      #     admits. `a + "-" + b` has no `-` on this tree either; `const week
+      #     = 7 * 24 * time.Hour` mutates into a legal constant expression
+      #     whose `d / week` further down is a division by zero; and
+      #     INVERT_LOOPCTRL turns the `continue` that keeps a `for {}` from
+      #     terminating into a `break` that leaves the function missing a
+      #     return. The fork type-checks the candidate's whole PACKAGE — the
+      #     package, because the error need not appear where the mutation is —
+      #     and does not emit it if that fails (#2933). A package it cannot
+      #     load and type-check as it stands is not used as an oracle at all:
+      #     its mutants are generated and left to the compiler, as before.
+      #
+      #   the two per-mutant bounds report which of them claimed a mutant
+      #     A mutant is leashed twice — `go test -timeout` bounds the RUN, and a
+      #     context deadline covering compile+run is the backstop no -timeout can
+      #     be — but both produced one verdict, TIMED OUT. So a mutant that
+      #     genuinely does not terminate was indistinguishable from a compile
+      #     that hung and from one the memory guard below reaped. The fork now
+      #     reports RUN TIMED OUT when the test BINARY's own watchdog fired and
+      #     said so in its output, and keeps TIMED OUT for the backstop. It takes
+      #     no position on which is a detection — neither appears in
+      #     `test_efficacy` — so the policy stays in gremlins-threshold.mjs,
+      #     which credits the run-phase one and not the backstop (#2944).
+      #
+      #   the mutated tests run with `-vet=off`
+      #     `go test` runs a subset of `go vet` before it builds anything and
+      #     reports a finding as `FAIL pkg [build failed]`, which from the
+      #     outside is source that does not compile. Its bools analyzer rejects
+      #     exactly what INVERT_LOGICAL produces from `name == a || name == b`
+      #     — a conjunction of equalities against distinct constants, "suspect
+      #     and". Those mutants are legal Go and a real change of behaviour, so
+      #     the fix is not to stop generating them (that would drop mutants the
+      #     suite ought to be asked about) but to stop letting a style analyzer
+      #     decide whether a mutant may be adjudicated. This is the one entry
+      #     in this list that can MOVE a leg's number rather than only correct
+      #     its meaning: 78 mutants that used to leave the ratio as NOT VIABLE
+      #     now get a real verdict, and one that nothing kills is a genuine gap
+      #     in the suite (#2933).
+      # Routed through go-module-fetch.mjs because gremlins is NOT in go.mod, so
+      # the warm step in ./.github/actions/setup-go — which runs
+      # `go mod download` over the main module's own requirements — does not
+      # cover it. This is the one `go install` in the tree, and it fetches from
+      # sum.golang.org and proxy.golang.org exactly like any other module fetch:
+      # run 33084966918 died on `reading https://sum.golang.org/tile/8/0/x227/070:
+      # stream error: stream ID 3; INTERNAL_ERROR; received from peer` before a
+      # single mutant ran. The wrapper's never-retry set is what keeps a bad
+      # version pin, or gremlins failing to COMPILE, from being retried.
+      - name: install gremlins
+        run: >
+          node .github/scripts/go-module-fetch.mjs --
+          go install github.com/tsouza/gremlins/cmd/gremlins@v0.6.0-cerberus-run-phase-timeout-consume
+      # `workers: 0` keeps gremlins' default (runtime.NumCPU()); a
+      # non-zero value caps the parallel `go test` fan-out per the
+      # comment above the matrix entry.
+      #
+      # The per-mutant budget is MEASURED, not declared. mutation-run.mjs times
+      # this leg's own recompile+link+run cycle on this runner — it edits a byte
+      # of the scope's production source and runs the scope's tests exactly as
+      # gremlins runs them for a mutant — and sizes the budget from what it
+      # measured. MUTANT_TIMEOUT_MIN and MUTANT_TIMEOUT_MAX are the bounds that
+      # measurement is clamped into, not the budget itself.
+      #
+      # A mutant is bounded TWICE, and the measured cycle serves both. Per
+      # mutant on an 8-core machine, against the flat 15s that used to be
+      # declared here:
+      #
+      #   internal/chsql   compile+link 12.7-14.4s   test run 0.31s
+      #   internal/promql  compile+link  8.4-8.7s    test run 2.07s
+      #
+      # One number could not bound both. The compiler was 80-98% of it, every
+      # contended runner pushed mutants over, and gremlins recorded that as
+      # TIMED OUT — which the gate then scored as a detection, paying the leg
+      # efficacy points for being starved (#2903). Measuring the cycle sized the
+      # number to what it was really bounding; the fork then stopped asking one
+      # number to bound two quantities at all (#2910). `--timeout-max` is now
+      # the RUN bound, handed to `go test -timeout`, which the Go toolchain
+      # starts when the test binary starts; `--compile-allowance` is what the
+      # compile is charged to; and their sum is the context deadline, which is
+      # all that can bound a compile that has hung.
+      #
+      # mutation-run.mjs passes the measured cycle as both, because the probe
+      # cannot separate the run from the compile inside it and the cycle is an
+      # upper bound on each — so neither bound can starve an honest mutant. An
+      # undersized budget is visibly RED rather than quietly scored as a
+      # detection, so erring high here is the cheap direction.
+      #
+      # MIN is the floor: a probe that cannot measure anything (no `go` on
+      # PATH, a build error) leaves the lane on exactly the 15s it ran on
+      # before. MAX is the ceiling: one pathological measurement cannot spend
+      # the job's whole wall-clock allowance on hung mutants. 120s is roughly
+      # the largest budget the derivation can ask for (internal/chsql's ~14.4s
+      # cycle x 4 concurrent mutants x2 headroom), so it bounds the outlier
+      # without clipping the legs it is sized for. The job's own
+      # `timeout-minutes` below is the backstop beyond it, and a leg that hits
+      # that reports cancelled, which the `mutation` aggregator fails.
+      #
+      # The coefficient is still pinned by mutation-run.mjs, for the reason it
+      # always was: gremlins derives the deadline as
+      # `min(timeout-coefficient x the coverage run's wall time, timeout-max)`,
+      # and the coverage run's wall time collapses to gremlins' 1s floor
+      # whenever the Go build cache is already warm (as it is for
+      # mutation-run.mjs's second, full-fallback invocation). Left alone, the
+      # budget silently lowered itself to 5s on exactly the path a pull request
+      # takes, under internal/promql's real per-mutant recompile+link+run, and
+      # the leg reported 0.00% efficacy (#2692).
+      #
+      # The budget bounds TIME. It does not, and cannot, bound ALLOCATION, and
+      # the lane needs both. A mutant that inverts or removes a scanner's
+      # loop-advance never terminates and allocates per iteration:
+      # internal/logql/logpattern's `i += size` -> `i = size` mutant reaches
+      # 5 GiB of RSS in 3.3s, so it exhausts a 16 GB runner in about ten seconds
+      # — UNDER the 15s floor above, and far under the ~63s that leg's own
+      # compile cycle makes the derivation ask for. There is no leash value that
+      # is both long enough for the compile and short enough for the memory; the
+      # window is empty, not narrow, so capping MUTANT_TIMEOUT_MAX cannot be the
+      # fix (#2919). GOMEMLIMIT cannot either — it is soft, and Go's GC CPU
+      # limiter guarantees the mutator half the CPU, so a live heap still grows
+      # (measured: 2.6x slower, not bounded).
+      #
+      # mutation-run.mjs therefore wires .github/scripts/mutant-memory-guard.mjs
+      # in front of every test binary gremlins launches, as a `go test -exec`
+      # supervisor, and gives it a per-mutant RSS ceiling. A mutant that breaches
+      # it is killed and then HELD, so the deadline that records it is the
+      # compile+run BACKSTOP — status TIMED OUT, unadjudicated, counted in the
+      # denominator, credited to nobody. It is deliberately not allowed to reach
+      # gremlins as an exit code: `go test` collapses every test-binary failure
+      # into its own exit 1, which gremlins reads as a KILL, and paying a leg
+      # efficacy for a mutant nobody adjudicated is the accounting #2903 removed.
+      # It stays uncredited now that a RUN-phase timeout is credited (#2944),
+      # and not by a second rule: killing the child destroys the only evidence
+      # that credit is read from — the test binary's own timeout panic — so a
+      # reaped mutant cannot be scored as a detection (#2921).
+      #
+      # The clean fix is upstream of all of this: #2910 splits gremlins' single
+      # deadline into an overall one and a run-only one, and a run-only leash is
+      # tight enough to bound allocation without starving an honest mutant.
+      #
+      # Do NOT "fix" a recurrence by excluding whichever file the log names:
+      # that relocates the file's runaway mutants into whichever leg still owns
+      # it, and burns real mutation coverage. The two bounds are the fix.
+      # mutation-run.mjs owns the changed-line/full decision and validates that
+      # the final report executed at least one mutant. Keeping the zero-mutant
+      # fallback out of shell prevents a missing or malformed JSON field from
+      # being read as a cheap successful phase.
+      - name: gremlins unleash
+        env:
+          MUTANT_TIMEOUT_MIN: 15s
+          MUTANT_TIMEOUT_MAX: 120s
+          SCOPE: ${{ matrix.scope }}
+          WORKERS: ${{ matrix.workers }}
+          EXCLUDE_FILES: ${{ matrix.exclude_files }}
+          DIFF_REF: ${{ matrix.diff_ref }}
+          REPORT: gremlins.json
+        run: node .github/scripts/mutation-run.mjs
+      # The lane withholds --threshold-efficacy from gremlins on purpose and
+      # gates in gremlins-threshold.mjs against the parsed report JSON
+      # (measured < threshold -> fail). The pinned fork DOES exit non-zero on a
+      # violation; it just does so mid-run, before the report is written and
+      # uploaded, leaving an opaque `gremlins exited N` and no artifact.
+      - name: enforce efficacy threshold
+        run: node .github/scripts/gremlins-threshold.mjs
+        env:
+          REPORT: gremlins.json
+          THRESHOLD: ${{ matrix.efficacy }}
+      - name: upload gremlins report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: gremlins-${{ matrix.phase }}
+          path: gremlins.json
+          retention-days: 14
+
+  # Single rolled-up check context (mirrors compose-smoke), named `mutation`
+  # rather than any per-phase `gremlins …` name — not a branch-protection
+  # required context (#2230), but still the one name a reader or a future
+  # re-promotion resolves. The matrix above exposes ONE .result to dependents:
+  # `success` only if EVERY selected phase succeeded, `failure`/`cancelled` if
+  # any did, `skipped` when nothing in any phase scope changed. `if: always()`
+  # guarantees the context always REPORTS (never resolves to "Expected" /
+  # never-reports, which would deadlock the merge queue this workflow still
+  # triggers on).
+  #
+  # The gate is a decision table over TWO facts, not one, and that is the point:
+  # a skipped matrix is green ONLY when `select` succeeded AND reported that it
+  # chose no phases. A skip for any other reason — the selector crashed, the
+  # matrix was dropped — is a failure. Reading `mutate.result == skipped` alone
+  # is what made this check hollow before.
+  mutation:
+    name: mutation
+    needs: [select, mutate]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: gate on every mutation phase
+        run: |
+          echo "select = ${{ needs.select.result }} (has_phases = '${{ needs.select.outputs.has_phases }}')"
+          echo "mutate = ${{ needs.mutate.result }}"
+
+          # An unknown selection is never a pass: without it there is no claim
+          # about what was or wasn't checked.
+          if [ "${{ needs.select.result }}" != "success" ]; then
+            echo "::error::mutation-select did not succeed (${{ needs.select.result }}) — the set of phases this change needs is unknown, so this check cannot report green."
+            exit 1
+          fi
+
+          if [ "${{ needs.mutate.result }}" = "skipped" ]; then
+            if [ "${{ needs.select.outputs.has_phases }}" = "true" ]; then
+              echo "::error::mutation-select chose phases to run but the matrix was skipped — the required check would otherwise pass over work that never ran."
+              exit 1
+            fi
+            echo "no changed path falls in any mutation phase scope — nothing for this lane to check."
+            exit 0
+          fi
+
+          # Strict != 'success' catches failure AND cancelled (a contains-failure
+          # check would miss a cancelled phase). fail-fast:false keeps a real
+          # efficacy failure a clean `failure`, not an ambiguous `cancelled`.
+          if [ "${{ needs.mutate.result }}" != "success" ]; then
+            echo "::error::one or more mutation phases failed/cancelled (rolled-up: ${{ needs.mutate.result }})."
+            exit 1
+          fi
+          echo "all selected mutation phases green."

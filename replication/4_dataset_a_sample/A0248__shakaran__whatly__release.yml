@@ -1,0 +1,26 @@
+name: Release
+
+on:
+  workflow_dispatch:
+
+jobs:
+  Release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v5
+      - name: Go Semantic Release
+        uses: go-semantic-release/action@v1.17.0
+        id: semrel
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          changelog-file: "CHANGELOG.md"
+          changelog-generator-opt: "emojis=true"
+          prepend: true
+      - name: Git Commit Changelog
+        uses: stefanzweifel/git-auto-commit-action@v4
+        with:
+          commit_message: "docs(changelog): update cl & ver after release"
+          file_pattern: CHANGELOG.md

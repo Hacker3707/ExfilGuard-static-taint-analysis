@@ -1,0 +1,114 @@
+name: Build and Push to Container Registry
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - ".devcontainer/**"
+      - ".github/**"
+      - "terraform/**"
+      - "decisions/**"
+      - "backlog/**"
+
+env:
+  GITHUB_SHA: ${{ github.sha }}
+  REGISTRY: 283582579564.dkr.ecr.ca-central-1.amazonaws.com
+
+permissions:
+  id-token: write
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Audit DNS requests
+        uses: cds-snc/dns-proxy-action@main
+        env:
+          DNS_PROXY_FORWARDTOSENTINEL: "true"
+          DNS_PROXY_LOGANALYTICSWORKSPACEID: ${{ secrets.LOG_ANALYTICS_WORKSPACE_ID }}
+          DNS_PROXY_LOGANALYTICSSHAREDKEY: ${{ secrets.LOG_ANALYTICS_WORKSPACE_KEY }}
+
+      - name: Checkout
+        uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # v3.6.0
+
+      - name: Configure aws credentials using OIDC
+        uses: aws-actions/configure-aws-credentials@master
+        with:
+          role-to-assume: arn:aws:iam::283582579564:role/sre-bot-apply
+          role-session-name: SREBotGitHubActions
+          aws-region: "ca-central-1"
+
+      - name: Download GeoDB from S3
+        run: |
+          aws s3 cp s3://${{ secrets.GEO_DB_BUCKET }}/GeoLite2-City.tar.gz ./GeoLite2-City.tar.gz
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@5a88a04c91d5c6f97aae0d9be790e64d9b1d47b7 # v1.7.1
+
+      - name: Build container
+        working-directory: ./
+        run: |
+          docker build \
+          --build-arg git_sha=$GITHUB_SHA \
+          -t $REGISTRY/sre-bot:$GITHUB_SHA-`date '+%Y-%m-%d'` \
+          -t $REGISTRY/sre-bot:latest .
+
+      - name: Push containers to Amazon ECR
+        working-directory: ./app
+        run: |
+          docker push $REGISTRY/sre-bot:$GITHUB_SHA-`date '+%Y-%m-%d'`
+          docker push $REGISTRY/sre-bot:latest
+
+      - name: Restart ECS
+        run: |
+          aws ecs update-service --cluster sre-bot-cluster --service sre-bot-service --force-new-deployment > /dev/null 2>&1
+      
+     # Allow this step to fail so we can handle success/failure and report it to slack. By default it waits for 10 minutes
+      - name: Wait for ECS Stability
+        id: ecs_wait
+        continue-on-error: true
+        run: |
+          echo "Wait for 15 minutes for ECS to stabilize.."
+          sleep 300 # Sleep for 5 minutes. The ecs wait command waits for an additional 10 minutes
+          aws ecs wait services-stable \
+            --cluster sre-bot-cluster \
+            --services sre-bot-service 
+
+      # Slack notification on successful ECS wait
+      - name: Slack Notify Success
+        if: steps.ecs_wait.outcome == 'success'
+        run: |
+          curl -X POST -H 'Content-type: application/json' \
+          --data '{"text": "✅ ECS deployment for sre-bot succeeded!"}' \
+          ${{ secrets.SLACK_SUCCESS_WEBHOOK}}
+
+      # Slack notification on failed ECS wait
+      - name: Slack Notify Failure
+        if: steps.ecs_wait.outcome == 'failure'
+        run: |
+          curl -X POST -H 'Content-type: application/json' \
+          --data '{"text": "❌ ECS deployment for sre-bot failed to stabilize."}' \
+          ${{ secrets.SLACK_WEBHOOK_URL}}
+
+      - name: Report deployment to Sentinel
+        if: steps.ecs_wait.outcome == 'success'
+        uses: cds-snc/sentinel-forward-data-action@main
+        with:
+          input_data: '{"product": "sre-bot", "version": "${{ github.sha }}", "repository": "${{ github.repository }}", "environment": "production"}'
+          log_type: CDS_Product_Deployment_Data
+          log_analytics_workspace_id: ${{ secrets.LOG_ANALYTICS_WORKSPACE_ID }}
+          log_analytics_workspace_key: ${{ secrets.LOG_ANALYTICS_WORKSPACE_KEY }}
+
+      - name: Docker generate SBOM
+        uses: cds-snc/security-tools/.github/actions/generate-sbom@12a0cdea1c5a515dfcbe353693db804a1793c0ed # v4.0.1 
+        env:
+          TRIVY_DB_REPOSITORY: ${{ vars.TRIVY_DB_REPOSITORY }}
+        with:
+          docker_image: "${{ env.REGISTRY }}/sre-bot:latest"
+          dockerfile_path: "./Dockerfile"
+          sbom_name: "sre-bot"
+          token: "${{ secrets.GITHUB_TOKEN }}"

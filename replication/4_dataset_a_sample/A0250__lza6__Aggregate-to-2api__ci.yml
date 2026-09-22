@@ -1,0 +1,160 @@
+name: CI
+
+on:
+  push:
+    branches: [main, 'v*']
+    paths-ignore:
+      - 'docs/**'
+      - '**.md'
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: 测试 (${{ matrix.python-version }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      matrix:
+        python-version: ['3.11']
+        os: [ubuntu-latest]
+      fail-fast: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: 安装依赖
+        run: |
+          pip install --no-cache-dir -r requirements.txt
+          pip install pytest pytest-asyncio pytest-cov httpx pytest-timeout pytest-benchmark
+
+      - name: 单元测试（排除集成/混沌；slow=真实网络也不跑）
+        run: |
+          pytest tests/ -q -m "not integration and not chaos and not slow" --cov=api --cov-report=term --cov-fail-under=80 --timeout=120 --timeout-method=thread -p faulthandler -p no:cacheprovider
+        env:
+          IF_ACCOUNT_AUTO: "0"
+          IF_MOCK_REGISTER: "1"
+          IF_DB_FILE: "data/test.db"
+
+      - name: 启动 mock cf_solver 并运行集成测试
+        # v7.7 缓解组合串扰：integration 与 chaos 分两轮跑（各自 fresh 进程内状态），
+        # 避免混沌注入的 IP 桶/限流状态污染集成用例（本地 3 轮复现→分轮后收敛）。
+        run: |
+          python scripts/mock_cfsolver.py --port 8001 &
+          for i in $(seq 1 10); do
+            curl -sf http://127.0.0.1:8001/turnstile?url=x\&sitekey=x > /dev/null 2>&1 && break
+            sleep 1
+          done
+          # v7.7.5：集成轮单独跑覆盖率仅 ~44%（只覆盖 integration 路径），
+          # --cov-fail-under=80 必然 fail。覆盖率门禁只在单测轮卡（单测轮 82% 达标）。
+          # 集成轮只验证集成路径正确性，不卡覆盖率；chaos 轮同理（仅 --cov-append 累加）。
+          pytest tests/integration/ -q -m "integration" --cov=api --cov-report=term --timeout=120 --timeout-method=thread -p no:cacheprovider
+          pytest tests/ -q -m "chaos" --cov=api --cov-report=term --cov-append --timeout=120 --timeout-method=thread
+        env:
+          IF_ACCOUNT_AUTO: "0"
+          IF_MOCK_REGISTER: "1"
+          IF_CF_SOLVER_URL: "http://127.0.0.1:8001"
+          IF_DB_FILE: "data/test-ci.db"
+          IF_TURNSTILE_POLL_INTERVAL: "0.2"
+          IF_TOKEN_POOL_SIZE: "2"
+
+  lint:
+    name: 代码检查
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: 安装 ruff
+        # 锁定版本：与本地开发环境一致（0.15.x 默认规则集变更会引入 BLE001/SIM102 等噪声）
+        run: pip install "ruff==0.14.9"
+      - name: 运行 ruff check（失败则 CI 失败）
+        run: ruff check api/ --no-fix
+
+  # ── P0-2：前端版本一致性门禁（防 landing dist 版本漂移）──────────────
+  # 背景：landing/dist 被 .gitignore 忽略（第 65-69 行），本地版本 bump 若只改 package.json
+  # 不重跑 npm run build，产物就落后于源码版本；而 ci.yml 的 test job 从未构建 landing，
+  # 导致 TestFrontendVersionConsistency::test_landing_built_dist_version_matches_source 在 CI 中
+  # 永远走 pytest.skip，无法拦截漂移。
+  # 本 job 强制从源码重跑构建并断言 __APP_VERSION__ 注入 = 三处版本一致，失败即 CI 变红。
+  frontend-version-gate:
+    name: 前端版本一致性门禁（构建 landing + 断言版本）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 先用 Node 从源码强制构建 landing（每次落地最新 package.json 的版本号）
+      - name: 设置 Node.js（构建 landing）
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: landing/package-lock.json
+      - name: npm ci && npm run build (landing)
+        run: |
+          cd landing && npm ci && npm run build
+
+      # 再装 Python 依赖并跑版本一致性契约（此 job 里构建过 dist，故 dist 断言不会 skip）
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: 安装依赖
+        run: |
+          pip install --no-cache-dir -r requirements.txt
+          pip install pytest pytest-asyncio pytest-cov httpx pytest-timeout pytest-benchmark
+      - name: 版本一致性断言（失败则 CI 失败）
+        run: |
+          pytest tests/test_openapi_contract.py::TestFrontendVersionConsistency -v
+        env:
+          IF_ACCOUNT_AUTO: "0"
+          IF_MOCK_REGISTER: "1"
+          IF_DB_FILE: "data/test-ci.db"
+
+  # ── v7.7：frontend 管理面板 CI 门禁 ───────────────────────────────
+  # 背景：landing 有 frontend-version-gate，但 frontend/src（React 管理面板）
+  # 的 tsc/vitest/build 从无 CI 门禁——类型错误或用例回归只能靠本地自觉。
+  # 本 job 补齐：tsc 0 error + vitest 全绿 + vite build 成功三道闸。
+  frontend-gate:
+    name: 前端管理面板门禁（tsc + vitest + build）
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - name: 设置 Node.js（构建 frontend）
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+      - name: npm ci
+        run: cd frontend && npm ci
+      - name: TypeScript 类型检查 + 构建（tsc -b && vite build）
+        run: cd frontend && npm run build
+      - name: Vitest 单测
+        run: cd frontend && npm run test
+
+  docker:
+    name: Docker 构建验证
+    runs-on: ubuntu-latest
+    needs: [test, lint]
+    steps:
+      - uses: actions/checkout@v4
+      - name: 构建 API 镜像
+        run: docker build -f deploy/Dockerfile.api -t imagefree-api:ci .
+      - name: 验证镜像
+        run: |
+          SIZE=$(docker image inspect imagefree-api:ci --format='{{.Size}}')
+          echo "镜像大小: $((SIZE / 1024 / 1024))MB"
+          test $SIZE -lt $((300 * 1024 * 1024))

@@ -1,0 +1,247 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "release/**"]
+  pull_request:
+    branches: [main, "release/**"]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # Per-PR cost control. The FULL adapter suite (`-c FULL`, which starts
+        # Postgres/Redis/Elasticsearch/MSSQL/MessageDB) is the expensive part, so
+        # only the newest stable Python runs it (check `Python 3.14 Full`); the
+        # other stable versions run the fast in-memory CORE suite with no Docker.
+        # The lowest-direct leg (`Python 3.14 Tests`) re-resolves the dependencies
+        # to their floor and runs CORE, proving the floors resolve/install on the
+        # newest stable Python without a Docker spin-up. The full `-c FULL` matrix
+        # across every Python runs nightly on `main` (nightly.yml), which is where
+        # a version-specific adapter regression on 3.11-3.13 is caught. See
+        # ADR-0020.
+        #
+        # 3.15 (prerelease) does NOT run per-PR. The ecosystem ships no cp315
+        # wheels yet, so a per-PR leg builds its native-extension dependencies
+        # (grpcio, pydantic-core, psycopg2, pyodbc, and more) from source on every
+        # run, which dominates the job. nightly.yml runs 3.15 with the full adapter
+        # suite and files an issue on failure, the right cadence for a non-blocking
+        # prerelease canary. Add a per-PR 3.15 CORE leg here once cp315 wheels land
+        # and the build is fast; move the FULL/lowest-direct roles to it once 3.15
+        # is the newest stable. The floor leg stays on 3.14: the floors are pinned
+        # to first-cp314-wheel versions and need not have a cp315 wheel yet.
+        include:
+          - { python-version: "3.11", full: false, resolution: highest }
+          - { python-version: "3.12", full: false, resolution: highest }
+          - { python-version: "3.13", full: false, resolution: highest }
+          - { python-version: "3.14", full: true, resolution: highest }
+          - { python-version: "3.14", full: false, resolution: lowest-direct }
+    # Check names are branch-protection contexts. The CORE legs and the
+    # lowest-direct leg on 3.14 are `Python X Tests`; the FULL adapter leg is
+    # `Python 3.14 Full` (add it to the required checks so it gates merges).
+    name: ${{ matrix.full && 'Python 3.14 Full' || (matrix.resolution == 'lowest-direct' && 'Python 3.14 Tests') || format('Python {0} Tests', matrix.python-version) }}
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - uses: ./.github/actions/test-suite
+        with:
+          python-version: ${{ matrix.python-version }}
+          full: ${{ matrix.full }}
+          resolution: ${{ matrix.resolution }}
+          # Enforce + upload coverage only from the FULL adapter leg (the only
+          # per-PR leg that reaches the full-suite figure the threshold assumes).
+          enforce-coverage: ${{ matrix.full && matrix.resolution == 'highest' }}
+          upload-coverage: ${{ matrix.full && matrix.resolution == 'highest' }}
+          codecov-token: ${{ secrets.CODECOV_TOKEN }}
+
+  mypy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    name: Mypy (src/protean)
+    # Static type gate. src/protean must pass mypy with the quarantine config in
+    # pyproject.toml — a clean run is green and NEW errors outside the quarantine
+    # fail CI. The quarantine shrinks per type-safety sub-issue (see ADR-0018).
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: uv sync --all-extras --all-groups
+
+      - name: Mypy
+        run: uv run mypy src/protean
+
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    name: Lint (ruff)
+    # Fast, service-free quality gate. Runs the same ruff lint + format checks
+    # as the pre-commit hook, but in CI where they can't be bypassed (hooks not
+    # installed, `--no-verify`, web edits, bot commits). Format is verified with
+    # `--check`, never applied. Uses the ruff pinned in uv.lock so CI and local
+    # runs stay on the same version.
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      # Ruff only reads source files and its pyproject config; it does not import
+      # protean, so the default sync (project + dev group, no adapter extras) is
+      # all it needs and keeps this job fast.
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Ruff lint
+        run: uv run ruff check
+
+      - name: Ruff format check
+        run: uv run ruff format --check
+
+  dx-pack:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    name: DX pack (clean install)
+    # Builds the wheel and installs it into a clean virtualenv that cannot see
+    # the source tree, then asserts the DX pack (src/protean/dx/pack) shipped as
+    # package data and is readable through the importlib.resources accessor. The
+    # unit suite reads the pack from the source tree; only a clean-install check
+    # proves the data survived the build into the wheel. Hatchling ships the pack
+    # with no build-config change (its packages target includes every file under
+    # src/protean), so this job guards against silent loss of that data: an
+    # uncommitted, deleted, or moved file.
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Build wheel
+        run: uv build --wheel
+
+      - name: Install the wheel into a clean venv and read the pack
+        # `python -` reads the check from stdin, so sys.path[0] is the repo root,
+        # which has no top-level `protean` package to shadow the installed wheel.
+        run: |
+          python -m venv /tmp/pack-venv
+          /tmp/pack-venv/bin/pip install --upgrade pip
+          /tmp/pack-venv/bin/pip install dist/*.whl
+          # Explicit raises, not asserts: `python -O` would strip asserts, and a
+          # guard whose job is to fail loudly must not be optimizable away. The
+          # SKILL.md check covers every shipped skill, not just the first.
+          /tmp/pack-venv/bin/python - <<'PY'
+          import protean
+          from protean import dx
+
+          if dx.PACK_VERSION != protean.__version__: raise SystemExit("PACK_VERSION drifted from the framework version")
+
+          agents = dx.load_agents_source()
+          if not agents.strip(): raise SystemExit("AGENTS.md source is empty")
+
+          skills = dx.iter_skills()
+          if not skills: raise SystemExit("no skills shipped in the DX pack")
+
+          empty = [name for name in skills if not dx.read_pack_text(dx.SKILLS_DIR, name, dx.SKILL_FILE).strip()]
+          if empty: raise SystemExit(f"skills with an empty SKILL.md: {empty}")
+
+          print(f"DX pack OK: version={dx.PACK_VERSION}, skills={skills}")
+          PY
+
+  # Publishes the docs via the GitHub Actions Pages pipeline (build the site,
+  # then deploy the artifact) instead of `mkdocs gh-deploy` to the gh-pages
+  # branch. The legacy branch-based Pages builder proved unreliable (builds
+  # intermittently stuck/errored), freezing the live site on a stale snapshot;
+  # the Actions deployment removes that GitHub-side build step entirely.
+  #
+  # Not gated on `test`: the rendered docs don't depend on the DB integration
+  # matrix, and gating publication on a 30-min (occasionally flaky) suite means
+  # a single flake strands the docs. Runs on main only.
+  docs-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: github.ref == 'refs/heads/main'
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    # Serialize Pages deployments; never cancel one mid-publish.
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: 3.x
+
+      - run: echo "cache_id=$(date --utc '+%V')" >> $GITHUB_ENV
+
+      - uses: actions/cache@v6
+        with:
+          key: mkdocs-material-${{ env.cache_id }}
+          path: .cache
+          restore-keys: |
+            mkdocs-material-
+
+      - name: Install dependencies
+        run: uv sync --group docs --no-dev
+
+      - name: Build site
+        run: uv run mkdocs build
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: site
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5

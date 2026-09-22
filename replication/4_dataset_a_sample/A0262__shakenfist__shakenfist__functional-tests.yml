@@ -1,0 +1,806 @@
+name: Functional tests
+
+permissions:
+  contents: read
+
+# The can_enqueue / can_merge scheme is as described at:
+# https://boinkor.net/2023/11/neat-github-actions-patterns-for-github-merge-queues/
+#
+# Docs-only changes are detected by the check_paths job and skip the
+# heavy test jobs. The can_enqueue / can_merge gates treat skipped
+# dependencies as success, so docs-only PRs and merge queue entries
+# pass through quickly.
+
+on:
+  workflow_dispatch:
+  merge_group:
+  pull_request:
+    branches:
+      - develop
+      - v*-releases
+
+
+env:
+  http_proxy: http://192.168.1.15:3128
+  https_proxy: http://192.168.1.15:3128
+  PIP_INDEX_URL: https://devpi.home.stillhq.com/root/pypi/+simple/
+
+jobs:
+  # Check if the last commit was from the bot to prevent infinite loops in
+  # automated fixer jobs. This runs early so other jobs can depend on it.
+  check_bot_commit:
+    name: "Check bot commit"
+    if: github.event_name == 'pull_request'
+    runs-on: [self-hosted, static]
+    # A checkout and one git command. These small jobs are not on the
+    # scarce claude-code runners, but a wedged one still occupies a
+    # static runner for GitHub's six hour default, and a gate job which
+    # has not finished in minutes is never going to.
+    timeout-minutes: 10
+    outputs:
+      is_bot: ${{ steps.check.outputs.is_bot }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Check if last commit was from bot
+        id: check
+        run: |
+          LAST_AUTHOR_EMAIL=$(git log -1 --format='%ae')
+          echo "Last commit author: $LAST_AUTHOR_EMAIL"
+          if [ "$LAST_AUTHOR_EMAIL" = "bot@shakenfist.com" ]; then
+            echo "is_bot=true" >> $GITHUB_OUTPUT
+            echo "Last commit was from bot - automated fixers will be skipped"
+          else
+            echo "is_bot=false" >> $GITHUB_OUTPUT
+          fi
+
+  # Detect docs-only changes so we can skip heavy tests. For
+  # workflow_dispatch the filter step is skipped and the output defaults
+  # to code_changed=true so all tests run.
+  check_paths:
+    name: "Check paths"
+    runs-on: [self-hosted, static]
+    timeout-minutes: 10
+    outputs:
+      code_changed: ${{ steps.filter.outputs.code || 'true' }}
+      plans_changed: ${{ steps.filter.outputs.plans || 'true' }}
+    steps:
+      - uses: actions/checkout@v7
+        if: github.event_name != 'workflow_dispatch'
+      - uses: dorny/paths-filter@v4
+        id: filter
+        if: github.event_name != 'workflow_dispatch'
+        with:
+          # By default a file matches the filter if it matches ANY listed
+          # pattern, which makes '**' match everything and silently
+          # defeats the '!docs/**' exclusions. 'every' requires a file to
+          # match ALL patterns, which is the correct semantics for an
+          # "everything except docs" filter.
+          predicate-quantifier: 'every'
+          filters: |
+            code:
+              - '**'
+              - '!docs/**'
+              - '!mkdocs.yml'
+              - '!mkdocs.yml.tmpl'
+            # A plan-only edit is docs-only, so it does not match 'code'
+            # and would skip the unit tests -- including the guard which
+            # recomputes the plan index. That is exactly the change the
+            # guard exists to catch, so it gets its own output.
+            #
+            # Exactly one pattern, deliberately. predicate-quantifier is a
+            # step-level input, so 'every' applies to this filter too, and
+            # a file cannot be both under docs/plans/ and be a file at the
+            # repository root: a second pattern here makes the filter match
+            # nothing at all. PLAN-TEMPLATE.md does not need naming anyway,
+            # because it is not under docs/ and so already matches 'code'.
+            #
+            # A plan-only change therefore runs the whole sanity_checks job
+            # -- flake8, mypy, ansible-lint and the unit suite -- to reach a
+            # checker which finishes in under a second. That is a cost we
+            # are choosing: a separate cheap job would need its own entry in
+            # branch protection, and one gate in one place is worth more
+            # than the runner minutes.
+            plans:
+              - 'docs/plans/**'
+
+  # Scan git history for leaked credentials. Deliberately not gated on
+  # check_paths: a credential pasted into documentation is still a
+  # credential, and the one real key secret this scan found in our own
+  # history was published in the user guide.
+  #
+  # gitleaks is downloaded rather than apt-installed because the shared
+  # static pool does not grant passwordless sudo. Version and checksum
+  # are both pinned: .gitleaks.toml is written against 8.16's schema
+  # (per-rule allowlists changed shape in a later release), and a
+  # detector which silently changes behaviour under us is worse than no
+  # detector. To move the pin, run tools/gitleaks-scan.sh against the new
+  # version locally first and check the positive control still passes.
+  credential_scan:
+    name: "Credential scan"
+    runs-on: [self-hosted, static]
+    # The scan itself is about three seconds over five and a half
+    # thousand commits. This is the backstop for the checkout.
+    timeout-minutes: 10
+    steps:
+      # fetch-depth: 0 is load bearing. The scan covers every commit
+      # reachable from HEAD, and tools/gitleaks-scan.sh refuses to run
+      # against a shallow clone rather than reporting a clean history it
+      # never looked at.
+      - name: Checkout code with full history
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install gitleaks
+        run: |
+          curl -sSLo /tmp/gitleaks.tar.gz https://github.com/gitleaks/gitleaks/releases/download/v8.16.0/gitleaks_8.16.0_linux_x64.tar.gz
+          echo "f8d4fabedaeaabd2a3e7e7b96394b8ddeff0be32941a1719aedee08fc8678601  /tmp/gitleaks.tar.gz" | sha256sum -c -
+          tar xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+
+      - name: Scan history for credentials
+        run: tools/gitleaks-scan.sh --gitleaks /tmp/gitleaks
+
+  # These sanity checks used to be three separate jobs, but are now combined
+  # to save a little time and reduce CI runner churn.
+  #
+  # NOTE(mikal): this job builds no nested cluster and needs no KVM -- it is
+  # just lint, mypy and unit tests -- so it runs on the shared
+  # [self-hosted, static] runners rather than hogging an ephemeral VM. The
+  # static base image (built in mach33labs/33fl) is expected to already
+  # provide gh, git, and the python build toolchain (python3, python3-venv,
+  # python3-dev, python3-pip, python3-wheel, python3-cffi). The old inline
+  # "sudo apt-get install libmariadb-dev python3-mysqldb" was dropped: the
+  # test venv is isolated (no --system-site-packages) and mysqlclient is not
+  # a dependency, so the mariadb driver is never imported by the unit tests
+  # (they mock the database). If a run ever shows those packages are needed,
+  # add them to the runner image in mach33labs/33fl rather than apt-installing
+  # on the shared runner.
+  sanity_checks:
+    name: "Sanity checks"
+    permissions:
+      contents: read
+      pull-requests: write
+    runs-on: [self-hosted, static]
+    # The steps below carry their own timeouts, which add up to forty
+    # minutes; this is the backstop for the checkout and for any step
+    # added later without one.
+    timeout-minutes: 45
+    needs: [check_paths]
+    if: >-
+      needs.check_paths.outputs.code_changed != 'false'
+      || needs.check_paths.outputs.plans_changed == 'true'
+    outputs:
+      flake8_failed: ${{ steps.flake8.outcome == 'failure' }}
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}-lint
+      cancel-in-progress: true
+
+    steps:
+      - name: Checkout code with two commits
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Upgrade base test tools
+        timeout-minutes: 5
+        run: |
+          rm -rf /tmp/venv-test
+          python3 -mvenv /tmp/venv-test
+          . /tmp/venv-test/bin/activate
+          pip3 install uv
+          uv pip install tox 'tox-uv<1.33.2'
+
+      - name: Lint with flake8
+        id: flake8
+        timeout-minutes: 5
+        run: |
+          . /tmp/venv-test/bin/activate
+          tox -eflake8
+
+      - name: Type check with mypy
+        timeout-minutes: 10
+        run: |
+          . /tmp/venv-test/bin/activate
+          tox -emypy
+
+      - name: Lint Ansible playbooks
+        timeout-minutes: 5
+        run: |
+          . /tmp/venv-test/bin/activate
+          uv pip install ansible-lint
+          ansible-lint --config-file shakenfist/deploy/collection/.ansible-lint \
+              shakenfist/deploy/collection/
+
+      - name: Attempt to install requirements
+        timeout-minutes: 5
+        run: |
+          rm -rf /tmp/venv-reqs
+          python3 -mvenv /tmp/venv-reqs
+          . /tmp/venv-reqs/bin/activate
+          pip3 install uv
+          uv pip install -r pyproject.toml
+
+      # So that test_the_generated_promql_parses validates
+      # examples/prometheus-database-load-rules.yaml as PromQL rather than
+      # skipping. Cached on the runner between jobs; see the script.
+      - name: Install promtool
+        timeout-minutes: 5
+        run: tools/ci-install-promtool.sh >> "$GITHUB_PATH"
+
+      - name: Run python3 unit tests and gather coverage data
+        id: py3_tests
+        timeout-minutes: 10
+        run: |
+          . /tmp/venv-test/bin/activate
+          tox -ecover
+          zip -r cover.zip cover
+
+      - name: List failing tests
+        if: ${{ failure() && steps.py3_tests.outcome == 'failure' }}
+        id: failures
+        run: |
+          echo "Gathering list of failed tests..."
+          touch /tmp/failed
+          . /tmp/venv-test/bin/activate
+          tox -efailing > /tmp/failed || true
+          echo
+
+          failed=$(cat /tmp/failed | egrep "^FAIL: " | \
+              sed -z 's/FAIL: shakenfist_ci\.//g;s/\n/, /g;s/, $/\n/')
+
+          echo "Failed tests:"
+          cat /tmp/failed
+          echo
+
+          echo "failures<<EOF" >> ${GITHUB_OUTPUT}
+          echo "${failed}" >> ${GITHUB_OUTPUT}
+          echo "EOF" >> ${GITHUB_OUTPUT}
+          echo "GITHUB_OUTPUT is:"
+          cat ${GITHUB_OUTPUT}
+
+      - name: Post failing tests to PR
+        if: ${{ failure() && steps.py3_tests.outcome == 'failure' && github.event_name == 'pull_request' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Build the comment body
+          cat > /tmp/pr-comment.md << 'COMMENT_EOF'
+          ## Unit Test Failures
+
+          The following unit tests failed:
+
+          ```
+          COMMENT_EOF
+
+          cat /tmp/failed >> /tmp/pr-comment.md
+
+          cat >> /tmp/pr-comment.md << 'COMMENT_EOF'
+          ```
+
+          [View full test output](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+          COMMENT_EOF
+
+          # Post the comment
+          gh pr comment ${{ github.event.pull_request.number }} --body-file /tmp/pr-comment.md
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: coverage
+          retention-days: 90
+          if-no-files-found: error
+          path: cover.zip
+
+  # Runs if the "Lint with flake8" step in the sanity_checks job fails.
+  # Uses always() so it runs even when sanity_checks fails.
+  # Skip if the last commit was from the bot (checked by check_bot_commit job).
+  automated_delinter:
+    name: "Automated delinter"
+    runs-on: [self-hosted, claude-code]
+    # Without this the job inherits the six hour GitHub default, so a
+    # wedged Claude run would hold a scarce claude-code runner for the
+    # rest of the day.
+    timeout-minutes: 60
+    needs: [sanity_checks, check_bot_commit]
+    # The same-repo check keeps fork PRs from running their own copy of the
+    # delinter script on the credential-bearing claude-code runners.
+    if: >-
+      ${{ always() &&
+          needs.sanity_checks.outputs.flake8_failed == 'true' &&
+          needs.check_bot_commit.outputs.is_bot != 'true' &&
+          (github.event_name != 'pull_request' ||
+           github.event.pull_request.head.repo.full_name == github.repository) }}
+    # github.ref is the right key on every event except merge_group,
+    # where it is the per-attempt queue branch
+    # gh-readonly-queue/develop/pr-<N>-<SHA> and GitHub mints a fresh
+    # SHA every time it rebuilds the group -- which it does on every
+    # push to develop. Keyed on that, every rebuild landed in a group
+    # of its own, cancel-in-progress never matched, and superseded
+    # merge groups ran to completion on the shared under-cloud. See
+    # shakenfist/kerbside#284, which recorded this repository's
+    # superseded merge groups starving a neighbour's, and
+    # shakenfist/development audits/merge-group-cancellation.md.
+    #
+    # Cancelling is safe because this queue is serial
+    # (max_entries_to_build: 1), so any other in-flight merge_group run
+    # is by definition superseded and its queue branch already
+    # abandoned. The merge_group- prefix keeps a queue run from sharing
+    # a group with a workflow_dispatch run on develop, whose github.ref
+    # is the same string.
+    concurrency:
+      group: >-
+        ${{ github.workflow }}-delinter-${{
+        github.event_name == 'merge_group'
+        && format('merge_group-{0}', github.event.merge_group.base_ref)
+        || github.ref }}
+      cancel-in-progress: true
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          # Use DEPENDENCIES_TOKEN (a PAT) instead of GITHUB_TOKEN so that
+          # commits pushed by this workflow will trigger other workflows.
+          # The default GITHUB_TOKEN deliberately doesn't trigger workflows
+          # to prevent infinite loops.
+          token: ${{ secrets.DEPENDENCIES_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "Claude Code run by Shakenfist Bot"
+          git config user.email "bot@shakenfist.com"
+
+      - name: Run automated delinter
+        run: |
+          tools/fix-lint-with-claude.sh --ci
+
+  smoke_collection:
+    name: "Smoke tests (collection)"
+    # The same-repo check is defense in depth: it keeps fork PRs off the
+    # self-hosted runners even if the repository's fork-approval setting is
+    # ever relaxed. Fork contributions are rare enough that a maintainer
+    # re-pushing the branch is an acceptable cost.
+    if: >-
+      always() && github.event_name != 'merge_group'
+      && needs.check_paths.outputs.code_changed != 'false'
+      && (github.event_name != 'pull_request'
+          || github.event.pull_request.head.repo.full_name == github.repository)
+    needs: [check_paths]
+    uses: shakenfist/actions/.github/workflows/smoke-cluster.yml@main
+    secrets: inherit
+    with:
+      component: shakenfist
+      component_ref: ${{ github.sha }}
+      tier: smoke
+
+  automated_reviewer:
+    name: "Automated reviewer"
+    # The needs: list is the "review only once CI has passed" gate:
+    # a job skipped because a dependency failed never starts the
+    # reusable workflow. Everything else about the reviewer lives in
+    # the shared workflow, so it stays in step with the rest of the
+    # fleet instead of drifting per project. Specifically, the review
+    # job there:
+    #
+    #   * runs on [self-hosted, claude-code] with timeout-minutes: 60,
+    #   * is guarded by "github.event_name == 'pull_request' &&
+    #     github.event.pull_request.head.repo.full_name ==
+    #     github.repository", so merge_group, workflow_dispatch and
+    #     fork PRs never reach it,
+    #   * declares its own concurrency group
+    #     "pr-auto-review-<repo>-<pr number>" with
+    #     cancel-in-progress: true, which is a narrower group than the
+    #     per-workflow one this job used to carry,
+    #   * checks the head commit's author over the API (by head SHA,
+    #     not the paged commits list) and skips when it is
+    #     bot@shakenfist.com or noreply@anthropic.com, before it even
+    #     checks the repository out. That is the same loop protection
+    #     check_bot_commit gives automated_delinter below, done
+    #     without a runner and matching one more address.
+    #
+    # Those guards are deliberately not repeated here: the shared
+    # workflow owns them so no project can lose one by editing its own
+    # CI.
+    needs: [sanity_checks, smoke_collection]
+    # A cross-repository reusable workflow cannot grant itself more
+    # token scope than its caller has, so the permissions go here.
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    # No "secrets: inherit": neither this workflow nor the
+    # review-pr-with-claude action it calls reads a secret -- both
+    # authenticate with github.token, which comes from the permissions
+    # above. Inheriting would hand every secret this repository has,
+    # including DEPENDENCIES_TOKEN, to a workflow in another
+    # repository for no benefit.
+    uses: shakenfist/actions/.github/workflows/pr-auto-review.yml@main
+
+  # Multi-node merge-queue functional coverage: each matrix entry deploys a
+  # topology (slim-primary / slim-tier) via the shakenfist.shakenfist collection
+  # (the reusable smoke-cluster workflow) and runs its stestr suite. Gated by
+  # can_merge.
+  functional_matrix_merge_collection:
+    name: "${{ matrix.merge.name }} (collection)"
+    if: >-
+      (github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch')
+      && needs.check_paths.outputs.code_changed != 'false'
+    needs: [check_paths]
+    strategy:
+      fail-fast: false
+      matrix:
+        merge: [
+          {
+            name: 'Debian 12 cluster',
+            job_name: 'debian-12-slim-primary',
+            base_image: 'sf://label/ci-images/debian-12',
+            base_image_user: 'debian',
+            topology: 'slim-primary',
+            concurrency: 5,
+            stestr_config: 'cluster-ci.conf',
+            timeout_minutes: 60
+          },
+          {
+            name: 'Ubuntu 24.04 cluster',
+            job_name: 'ubuntu-2404-slim-primary',
+            base_image: 'sf://label/ci-images/ubuntu-2404',
+            base_image_user: 'ubuntu',
+            topology: 'slim-primary',
+            concurrency: 5,
+            stestr_config: 'cluster-ci.conf',
+            timeout_minutes: 60
+          },
+          {
+            name: 'Guests',
+            job_name: 'guests',
+            base_image: 'sf://label/ci-images/debian-12',
+            base_image_user: 'debian',
+            topology: 'slim-primary',
+            concurrency: 5,
+            stestr_config: 'guest-ci.conf',
+            timeout_minutes: 60
+          },
+          {
+            # slim-tier runs the same cluster suite on roughly half
+            # slim-primary's hypervisor capacity, so it needs more wall-clock
+            # headroom under under-cloud contention: the suite passes, it
+            # just runs slower (observed 30-50 minutes depending on load).
+            name: 'Debian 12 tier',
+            job_name: 'debian-12-slim-tier',
+            base_image: 'sf://label/ci-images/debian-12',
+            base_image_user: 'debian',
+            topology: 'slim-tier',
+            concurrency: 5,
+            stestr_config: 'cluster-ci.conf',
+            timeout_minutes: 70
+          }
+        ]
+    uses: shakenfist/actions/.github/workflows/smoke-cluster.yml@main
+    secrets: inherit
+    with:
+      component: shakenfist
+      component_ref: ${{ github.sha }}
+      tier: full
+      topology: ${{ matrix.merge.topology }}
+      base_image: ${{ matrix.merge.base_image }}
+      base_image_user: ${{ matrix.merge.base_image_user }}
+      stestr_config: ${{ matrix.merge.stestr_config }}
+      test_concurrency: ${{ matrix.merge.concurrency }}
+      test_timeout_minutes: ${{ matrix.merge.timeout_minutes }}
+      concurrency_key: ${{ matrix.merge.job_name }}
+
+  # Native-module lifecycle CI: deploys via the reusable smoke-cluster workflow
+  # (slim-primary) and runs ansiblemoduletests.sh against the installed
+  # shakenfist.shakenfist collection. Gated by can_merge.
+  ansible_modules_collection:
+    name: "Ansible modules (collection)"
+    if: >-
+      (github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch')
+      && needs.check_paths.outputs.code_changed != 'false'
+    needs: [check_paths]
+    uses: shakenfist/actions/.github/workflows/smoke-cluster.yml@main
+    secrets: inherit
+    with:
+      component: shakenfist
+      component_ref: ${{ github.sha }}
+      tier: full
+      topology: slim-primary
+      base_image: 'sf://label/ci-images/debian-12'
+      base_image_user: debian
+      test_kind: ansible-modules
+      concurrency_key: ansible-modules
+
+  # Node lifecycle CI: deploys via the collection, then runs
+  # nodelifecycletests.sh, which disturbs the cluster (powers nodes off), hence
+  # the under-cloud node restart, ServerAlive ssh and node-lifecycle log tag in
+  # the teardown. Does not use the reusable workflow (its teardown assumes nodes
+  # stay up); only the deploy is shared. Gated by can_merge.
+  node_lifecycle_collection:
+    name: "Node lifecycle (collection)"
+    if: >-
+      (github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch')
+      && needs.check_paths.outputs.code_changed != 'false'
+    needs: [check_paths]
+    # Carries a size element for the same reason smoke-cluster.yml does:
+    # without one the conductor falls back to xs (1 vCPU / 2048 MB), and
+    # this job drives a full ansible deploy from the runner. Measured
+    # demand is ~2.5-2.7 GB against 1927 MB usable and no swap. See
+    # shakenfist/shakenfist#3696.
+    runs-on: [self-hosted, vm, debian-12, s]
+    # The deploy and test steps below are capped at 90 and 60 minutes;
+    # this is the backstop for the setup and teardown around them, and
+    # is still far short of GitHub's six hour default.
+    timeout-minutes: 180
+    concurrency:
+      group: >-
+        ${{ github.workflow }}-nodelifecycle-collection-${{
+        github.event_name == 'merge_group'
+        && format('merge_group-{0}', github.event.merge_group.base_ref)
+        || github.ref }}
+      cancel-in-progress: true
+
+    steps:
+      - name: Setup test environment
+        uses: shakenfist/actions/setup-test-environment@main
+
+      # The deploy is the build-smoke-cluster composite action (shared with
+      # the reusable smoke-cluster workflow); only this job's teardown is
+      # bespoke, because the lifecycle test powers nodes off.
+      - name: Build the smoke cluster
+        timeout-minutes: 90
+        uses: shakenfist/actions/build-smoke-cluster@main
+        with:
+          topology: slim-primary
+
+      # The lifecycle test kills nodes, so upload the cached image to a
+      # random hypervisor rather than the primary the action selected --
+      # matching the getsf-era behaviour of exercising non-primary uploads.
+      - name: Choose a random upload target
+        run: |
+          nodes=(10.0.0.20 10.0.0.21 10.0.0.22 10.0.0.23 10.0.0.24)
+          random_index=$(( RANDOM % 5 ))
+          echo "UPLOAD_TARGET=${nodes[$random_index]}" >> $GITHUB_ENV
+
+      - name: Import cached images to the random target
+        run: |
+          set -e
+          . ${GITHUB_WORKSPACE}/ci-environment.sh
+
+          setup="export PATH=$PATH:/srv/shakenfist/venv/bin;"
+          setup="${setup} . /etc/sf/sfrc;"
+          setup="${setup} export SHAKENFIST_API_URL=http://localhost:13000;"
+          setup="${setup} /srv/shakenfist/venv/bin/sf-client artifact upload"
+
+          ssh -i /srv/github/id_ci -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+              debian@${UPLOAD_TARGET} \
+              "${setup} debian-12 /srv/ci/debian:12 --shared --no-checksum"
+
+
+      - name: Run node lifecycle tests
+        timeout-minutes: 60
+        run: |
+          . ${GITHUB_WORKSPACE}/ci-environment.sh
+          scp -rp -i /srv/github/id_ci -o StrictHostKeyChecking=no \
+              -o UserKnownHostsFile=/dev/null \
+              ${GITHUB_WORKSPACE}/shakenfist \
+              debian@$primary:shakenfist
+          # The lifecycle test terminates its victim node via the
+          # under-cloud API (in-guest kills are not durable -- see the
+          # under-cloud kill comment in nodelifecycletests.sh), so it
+          # needs this runner's under-cloud credentials and the node
+          # name -> under-cloud instance uuid map from ci-environment.sh.
+          scp -i /srv/github/id_ci -o StrictHostKeyChecking=no \
+              -o UserKnownHostsFile=/dev/null \
+              ${HOME}/.shakenfist \
+              debian@$primary:undercloud-creds.json
+          scp -i /srv/github/id_ci -o StrictHostKeyChecking=no \
+              -o UserKnownHostsFile=/dev/null \
+              ${GITHUB_WORKSPACE}/ci-environment.sh \
+              debian@$primary:ci-environment.sh
+          ssh -i /srv/github/id_ci -o StrictHostKeyChecking=no \
+              -o UserKnownHostsFile=/dev/null \
+              debian@$primary "chmod u=r,go= undercloud-creds.json"
+          # ServerAliveInterval/ServerAliveCountMax: if the remote host
+          # goes down (e.g. a lifecycle test bug takes out the script's
+          # own host), the TCP connection can sit half-open until the
+          # default TCP keepalive eventually times out -- hours later,
+          # well past the GitHub step budget. With these options ssh
+          # notices a dead connection in roughly 30 s and the step fails
+          # fast instead.
+          ssh -i /srv/github/id_ci -o StrictHostKeyChecking=no \
+              -o UserKnownHostsFile=/dev/null \
+              -o ServerAliveInterval=10 -o ServerAliveCountMax=3 \
+              debian@$primary "cd shakenfist/shakenfist/deploy; . /etc/sf/sfrc; bash nodelifecycletests.sh"
+
+      - name: Check logs
+        id: check_logs
+        if: always()
+        run: |
+          . ${GITHUB_WORKSPACE}/ci-environment.sh
+          cd ${GITHUB_WORKSPACE}/actions
+          tools/run_remote ${primary} "sudo bash tools/ci_log_checks_loki.sh develop node-lifecycle"
+
+      - name: Dump systemd state and journals
+        if: always() && steps.check_logs.outcome == 'failure'
+        run: |
+          . ${GITHUB_WORKSPACE}/ci-environment.sh
+          cd ${GITHUB_WORKSPACE}/actions
+          tools/run_remote ${primary} 'echo "=== systemctl --failed (primary) ==="; sudo systemctl --failed --no-pager; echo "=== journalctl sf-* (primary, last 200 warn+) ==="; sudo journalctl -u "sf-*.service" -p warning -n 200 --no-pager' || true
+
+      - name: Restart Shaken Fist nodes so we can collect logs
+        if: always()
+        # Log collection is best effort: the functional tests above are
+        # the merge gate. Nodes failing to return from the post-test
+        # reboot has burned three merge queue attempts where the tests
+        # themselves passed. The script still dumps instance state and
+        # guest consoles so the boot wedge stays diagnosable.
+        continue-on-error: true
+        run: |
+          . ${GITHUB_WORKSPACE}/ci-environment.sh
+          bash ${GITHUB_WORKSPACE}/shakenfist/tools/ci-restart-cluster-nodes.sh debian
+
+      - name: Per-node system-level checks
+        if: always()
+        run: |
+          . ${GITHUB_WORKSPACE}/ci-environment.sh
+          cp /srv/github/id_ci /home/debian/.ssh/id_rsa
+          cp /srv/github/id_ci.pub /home/debian/.ssh/id_rsa.pub
+          chown -R debian.debian /home/debian/.ssh
+          ansible-playbook -i /srv/github/ci-inventory.yaml \
+              --extra-vars "base_image_user=debian node_checks_job_name=node-lifecycle ansible_ssh_common_args='-o StrictHostKeyChecking=no'" \
+              ${GITHUB_WORKSPACE}/actions/ansible/ci-node-checks.yml
+
+      - name: Gather logs
+        if: always()
+        # Best effort for the same reason as the restart step above --
+        # this job deliberately breaks nodes, and a node that never
+        # returns makes log gathering fail through no fault of the code
+        # under test.
+        continue-on-error: true
+        run: |
+          # We need the ssh key in the place ansible expects it to be, which isn't
+          # true on the CI worker node.
+          cp /srv/github/id_ci /home/debian/.ssh/id_rsa
+          cp /srv/github/id_ci.pub /home/debian/.ssh/id_rsa.pub
+          chown -R debian.debian /home/debian/.ssh
+
+          ansible-playbook -i /srv/github/ci-inventory.yaml \
+              --extra-vars "base_image_user=debian ansible_ssh_common_args='-o StrictHostKeyChecking=no'" \
+              ${GITHUB_WORKSPACE}/actions/ansible/ci-gather-logs-loki.yml
+
+      - name: Capture py-spy thread dumps
+        if: always()
+        continue-on-error: true
+        run: |
+          ansible-playbook -i /srv/github/ci-inventory.yaml \
+              --extra-vars "ansible_ssh_common_args='-o StrictHostKeyChecking=no'" \
+              ${GITHUB_WORKSPACE}/shakenfist/tools/ci_capture_pyspy.yml || true
+
+      - name: Bundle artifacts
+        if: always()
+        run: |
+          cd /srv/github
+          sudo chown -R debian:debian /srv/github
+          sudo find . -ls
+          echo
+          mkdir -p /srv/github/artifacts /srv/github/bundle
+          zip -rq artifacts/bundle.zip bundle/* || true
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: bundle-functional-node-lifecycle-collection
+          retention-days: 90
+          if-no-files-found: error
+          path: /srv/github/artifacts/bundle.zip
+
+  # MariaDB ENUM columns freeze their permitted values at CREATE TABLE
+  # time, so a Python enum gaining a member silently breaks existing
+  # databases while greenfield CI deploys keep passing -- which is how
+  # ObjectType.NAMESPACE_KEY shipped without a widening migration and
+  # broke namespace key writes on upgraded clusters. The functional
+  # matrix cannot catch this class of bug because it always deploys a
+  # fresh schema. This job installs a real MariaDB on an ephemeral VM
+  # runner, builds the schema, shrinks each ENUM column back one member
+  # (what a pre-upgrade database looks like), and verifies the
+  # ensure_schema() reconciliation pass widens them and the newest
+  # values become writable. Gated by can_merge.
+  schema_enum_widening:
+    name: "Schema ENUM widening"
+    if: >-
+      (github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch')
+      && needs.check_paths.outputs.code_changed != 'false'
+    needs: [check_paths]
+    runs-on: [self-hosted, vm, debian-12]
+    timeout-minutes: 30
+    concurrency:
+      group: >-
+        ${{ github.workflow }}-schema-enum-widening-${{
+        github.event_name == 'merge_group'
+        && format('merge_group-{0}', github.event.merge_group.base_ref)
+        || github.ref }}
+      cancel-in-progress: true
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Install MariaDB
+        timeout-minutes: 10
+        run: |
+          sudo bash tools/ci-install-mariadb.sh \
+              tools/bootstrap-mariadb.sql '' ci-test-password
+
+      - name: Run live ENUM widening tests
+        timeout-minutes: 15
+        run: bash tools/ci-enum-widening-test.sh ci-test-password
+
+  # The scheduler capacity reconciler's live tests
+  # (test_mariadb_capacity_reconcile_live.py) also run in the job
+  # above: its script runs every shakenfist/tests/test_mariadb_*_live.py
+  # module, because installing MariaDB is the expensive part and any
+  # test needing a real server belongs behind the same setup. They need
+  # one because the reconciler's other tests assert the shape of the
+  # SQL rather than its behaviour, and its likely failure modes (uuid
+  # form joins, JSON_TABLE defaults, nullable-column filters, enum
+  # storage conventions under a case-sensitive collation) are silently
+  # wrong numbers rather than errors.
+
+  can_see_status:
+    name: "Can see status"
+    runs-on: [self-hosted, static]
+    # Runs "true", so five minutes is generous even on a busy runner.
+    timeout-minutes: 5
+    steps:
+      - name: "Immediate success"
+        run: true
+
+  can_enqueue:
+    name: "Can enqueue"
+    needs:
+      - smoke_collection
+      - sanity_checks
+      - check_paths
+      - credential_scan
+    if: always() && github.event_name != 'merge_group'
+    permissions:
+      actions: read
+    runs-on: [self-hosted, static]
+    # A jq expression over the needs context.
+    timeout-minutes: 5
+    steps:
+      - env:
+          NEEDS_JSON: "${{toJSON(needs)}}"
+        name: Transform outcomes
+        run: |
+          echo "ALL_SUCCESS=$(echo "$NEEDS_JSON" | jq '. | to_entries | map([.value.result == "success", .value.result == "skipped"] | any) | all')" >>$GITHUB_ENV
+      - name: Check outcomes
+        run: "[ $ALL_SUCCESS == true ]"
+
+  can_merge:
+    name: "Can merge"
+    needs:
+      - functional_matrix_merge_collection
+      - ansible_modules_collection
+      - node_lifecycle_collection
+      - schema_enum_widening
+      - check_paths
+      - credential_scan
+    if: always() && github.event_name == 'merge_group'
+    permissions:
+      actions: read
+    runs-on: [self-hosted, static]
+    # A jq expression over the needs context.
+    timeout-minutes: 5
+    steps:
+      - env:
+          NEEDS_JSON: "${{toJSON(needs)}}"
+        name: Transform outcomes
+        run: |
+          echo "ALL_SUCCESS=$(echo "$NEEDS_JSON" | jq '. | to_entries | map([.value.result == "success", .value.result == "skipped"] | any) | all')" >>$GITHUB_ENV
+      - name: Check outcomes
+        run: "[ $ALL_SUCCESS == true ]"

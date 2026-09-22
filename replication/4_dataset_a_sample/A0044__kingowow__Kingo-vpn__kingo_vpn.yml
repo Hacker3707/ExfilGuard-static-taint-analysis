@@ -1,0 +1,112 @@
+name: Kingo VPN Configs
+
+permissions:
+  contents: write
+
+on:
+  schedule:
+    - cron: '0 */5 * * *'
+  workflow_dispatch:
+
+jobs:
+  merge:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout with PAT
+      uses: actions/checkout@v3
+      with:
+        token: ${{ secrets.PAT_TOKEN }}
+        persist-credentials: false
+
+    - name: Download, process and merge configs
+      run: |
+        mkdir -p server
+        echo "# Merged VPN Config - Updated on $(date -u)" > server/KingoVpn.txt
+        echo "" >> server/KingoVpn.txt
+
+        SOURCES="
+        https://raw.githubusercontent.com/hello-world-1989/cn-news/main/end-gfw-together|base64
+        https://raw.githubusercontent.com/V2RayRoot/V2RayConfig/refs/heads/main/Config/vless.txt|plain
+        https://raw.githubusercontent.com/4n0nymou3/multi-proxy-config-fetcher/refs/heads/main/configs/proxy_configs_tested.txt|plain
+        "
+
+        COUNT=1
+        while IFS= read -r line; do
+          [ -z "${line}" ] && continue
+          echo "$line" | grep -qE '^[[:space:]]*#' && continue
+
+          URL=$(echo "$line" | awk -F'|' '{print $1}' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+          TYPE=$(echo "$line" | awk -F'|' '{print $2}' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+          [ -z "$TYPE" ] && TYPE="plain"
+
+          echo "## Source $COUNT (Type: $TYPE)" >> server/KingoVpn.txt
+
+          if [ "$TYPE" = "base64" ]; then
+            curl -sL "$URL" | base64 -d 2>/dev/null | sed '/^[[:space:]]*$/d' | sed 's/#.*//g' >> server/KingoVpn.txt || echo "# Warning: Failed to decode base64 from $URL" >> server/KingoVpn.txt
+          else
+            curl -sL "$URL" | sed '/^[[:space:]]*$/d' | sed 's/#.*//g' >> server/KingoVpn.txt || echo "# Warning: Failed to download from $URL" >> server/KingoVpn.txt
+          fi
+
+          echo "" >> server/KingoVpn.txt
+          echo "" >> server/KingoVpn.txt
+          COUNT=$((COUNT+1))
+        done <<< "$SOURCES"
+
+    - name: Rename servers to Kingo ping N format
+      run: |
+        TMP_FILE=$(mktemp)
+        KINGO_COUNT=1
+
+        while IFS= read -r line; do
+          if [ -z "$line" ] || echo "$line" | grep -qE '^#'; then
+            echo "$line" >> "$TMP_FILE"
+            continue
+          fi
+
+          if echo "$line" | grep -qE '^(vless|vmess|trojan|ss|ssr|hysteria|hy2|tuic|socks5|http)://'; then
+            PROTOCOL=$(echo "$line" | sed 's/:\/\/.*//')
+
+            if [ "$PROTOCOL" = "vmess" ]; then
+              BASE64_PART=$(echo "$line" | sed 's/^vmess:\/\///')
+              DECODED=$(echo "$BASE64_PART" | base64 -d 2>/dev/null)
+
+              if [ -n "$DECODED" ]; then
+                if echo "$DECODED" | grep -q '"ps"'; then
+                  MODIFIED=$(echo "$DECODED" | sed 's/"ps"[[:space:]]*:[[:space:]]*"[^"]*"/"ps":"Kingo ping '$KINGO_COUNT'"/g')
+                else
+                  MODIFIED=$(echo "$DECODED" | sed 's/}$/,"ps":"Kingo ping '$KINGO_COUNT'"}/')
+                fi
+                ENCODED=$(printf '%s' "$MODIFIED" | base64 -w 0 2>/dev/null || printf '%s' "$MODIFIED" | base64 | tr -d '\n')
+                echo "vmess://${ENCODED}" >> "$TMP_FILE"
+              else
+                echo "${line}#Kingo ping ${KINGO_COUNT}" >> "$TMP_FILE"
+              fi
+            else
+              if echo "$line" | grep -q '#'; then
+                CLEAN_LINE=$(echo "$line" | sed 's/#.*$//')
+                echo "${CLEAN_LINE}#Kingo ping ${KINGO_COUNT}" >> "$TMP_FILE"
+              else
+                echo "${line}#Kingo ping ${KINGO_COUNT}" >> "$TMP_FILE"
+              fi
+            fi
+            KINGO_COUNT=$((KINGO_COUNT+1))
+          else
+            echo "$line" >> "$TMP_FILE"
+          fi
+        done < server/KingoVpn.txt
+
+        mv "$TMP_FILE" server/KingoVpn.txt
+
+    - name: Commit and push changes
+      env:
+        PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
+      run: |
+        git config user.name "GitHub Actions"
+        git config user.email "actions@github.com"
+        git remote set-url origin https://x-access-token:${PAT_TOKEN}@github.com/${{ github.repository }}.git
+        git add server/KingoVpn.txt
+        git diff --cached --quiet || (
+          git commit -m "Auto update server/KingoVpn.txt"
+          git push origin HEAD:${{ github.ref_name }}
+        )

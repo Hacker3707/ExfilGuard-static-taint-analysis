@@ -1,0 +1,253 @@
+
+name: win32-msvc
+
+on:
+  push:
+    tags:
+      - 'nightly'
+
+
+permissions:
+  contents: write        
+  packages: write        
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      # Increment version. Ideally we would like to do it once for all builds,
+      # but this is complicated as we want to allow to trigger a nightly by
+      # pushing the tag, so this can't be in nightly.yml. One option would be to
+      # have another intermediate workflow, but we take the quik & dirty
+      # solution: increment it in each workflow and push it in one (linux.yml).
+      - name: Increment version
+        id: version
+        shell: bash
+        run: |
+          version=$(grep "define NIGHTLY" source/LeLib/data.cpp | awk '{ print $3 }')
+          let version=${version}+1
+          sed -i "s/define NIGHTLY .*/define NIGHTLY $version/" source/LeLib/data.cpp
+          version=$(grep "define \(MAJOR\|FEATURE\|NIGHTLY\)" source/LeLib/data.cpp | awk '{ print $3 }' | xargs | sed 's/ /\./g')
+          echo "TRSE_VERSION=${version}" >> $GITHUB_OUTPUT
+      - uses: microsoft/setup-msbuild@v3
+
+      - uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.9.1'
+          tools: 'tools_ifw tools_qtcreator,qt.tools.qtcreator'
+
+
+      - name: Build TRSE
+        shell: cmd
+        run: |
+          for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -find VC\Auxiliary\Build\vcvarsall.bat`) do call "%%i" x86_amd64
+          qmake TRSE.pro
+          D:\a\TRSE\Qt\Tools\QtCreator\bin\jom\jom.exe -j 4 -f Makefile.Release
+
+      # OK64 doesn't build with Qt 6.0 or Qt 6.1 (no Qt Multimedia). Hopefully this will be fixed with Qt 6.2.
+      #- name: Build OK64
+      #  shell: cmd
+      #  run: |
+      #    git clone https://github.com/leuat/OK64.git
+      #    cd OK64/OK64
+      #    call "C:\Program Files (x86)\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x86_amd64
+      #    qmake INCLUDEPATH=$OK64dir/resid/include QMAKE_LFLAGS=-Wl,-L$OK64dir/resid/lib/ OK64.pro
+      #    D:\a\TRSE\Qt\Tools\QtCreator\bin\jom.exe -j 2 -f Makefile.Release
+
+      # We do not reuse Publish/publish_win/PublishWindows.cmd because copying the libs & plugins is easier with bash
+      - name: Build zip
+        shell: bash
+        run: |
+          mkdir Publish/publish_win/trse
+          cd Publish/publish_win/trse
+          cp ../../../release/trse.exe .
+          # Copy themes, tutorials, project_templates and units
+          cp -r ../../source/* .
+          cp -r ../../tutorials .
+          cp -r ../../project_templates .
+          cp -r ../../../units .
+          # The files are converted to dos format at checkout, we don't want the carriage returns.
+          dos2unix ../plugins.txt
+          dos2unix ../ignore_dlls.txt
+          # Never bundle DLLs taken from the runner's Windows directory: they are
+          # newer than the ones on the user's machine and, since Windows prefers
+          # the application directory, they shadow the local ones and fail to
+          # load (which breaks the qwindows platform plugin, among other things).
+          win_dir=$(cygpath -u "${SYSTEMROOT:-${SystemRoot:-C:\\Windows}}" | tr -d '\r')
+          echo "Skipping dependencies from '${win_dir}'"
+          copy_deps() {
+            local deps dep
+            # The dependency list is collected before the loop rather than piped
+            # into it: `tee /dev/stderr` is not usable in this shell and, with
+            # `set -o pipefail`, a grep that filters out every line (exit code
+            # 1) would abort the whole step.
+            deps=$(ldd "$1" \
+              | grep -v -i -f ../ignore_dlls.txt \
+              | sed -n 's/^.* => \(.*\) (0x[0-9a-fA-F]*)$/\1/p' \
+              | grep -v -i "^${win_dir}/" \
+              | sort -u) || true
+            while IFS= read -r dep
+            do
+              [ -n "${dep}" ] || continue
+              # Anything already here was put there on purpose (windeployqt,
+              # ../dll): copying it onto itself is an error, so skip it.
+              if [ -e "./${dep##*/}" ]
+              then
+                echo "      ${dep} (already present)"
+              else
+                echo "      ${dep}"
+                cp "${dep}" ./ || echo "      failed to copy ${dep}"
+              fi
+            done <<< "${deps}"
+          }
+          # qt_bin_dir and qt_plugin_dir are taken from qmake so that we always
+          # pick the tools and plugins of the Qt we linked against, and never the
+          # ones bundled with Qt Creator or the installer framework.
+          qt_bin_dir=$(qmake -query QT_HOST_BINS | tr -d '\r' | xargs cygpath -u)
+          qt_plugin_dir=$(qmake -query QT_INSTALL_PLUGINS | tr -d '\r' | xargs cygpath -u)
+          echo "qt_bin_dir: '${qt_bin_dir}'"
+          echo "qt_plugin_dir: '${qt_plugin_dir}'"
+          # windeployqt cannot be called through the PATH: only some of the Qt
+          # directories are added to it by the install action, and the tool has
+          # moved around between Qt releases. Look it up next to qmake instead.
+          windeployqt="${qt_bin_dir}/windeployqt.exe"
+          if [ ! -f "${windeployqt}" ]
+          then
+            echo "windeployqt not found in '${qt_bin_dir}', which contains:"
+            ls -l "${qt_bin_dir}"
+            windeployqt=$(find "${qt_bin_dir}/.." -name 'windeployqt*.exe' | head -n 1)
+            if [ -z "${windeployqt}" ]
+            then
+              echo "No windeployqt under '$(dirname "${qt_bin_dir}")'"
+              exit 1
+            fi
+          fi
+          echo "windeployqt: '${windeployqt}'"
+          # windeployqt.exe needs its own Qt DLLs in PATH to load; add the Qt
+          # bin dir explicitly since this bash step starts without it.
+          export PATH="${qt_bin_dir}:${PATH}"
+          # When a native .exe cannot be started (typically because one of the
+          # DLLs it imports fails to load) bash reports exit code 127, which
+          # looks exactly like a missing command. Probe it first so that the log
+          # shows what is actually wrong instead of a bare 127.
+          if ! "${windeployqt}" --version
+          then
+            echo "windeployqt could not be started. Its dependencies:"
+            ldd "${windeployqt}" || true
+            exit 1
+          fi
+          "${windeployqt}" --release --compiler-runtime trse.exe
+          # opengl32sw.dll is not available on the GitHub machine but seems
+          # necessary for windows machines that don't have hardware acceleration
+          # and don't have the DLL on the system directory from another source.
+          # The OpenMP and OpenSSL runtimes live in the system directory on the
+          # runner and are therefore skipped by the dependency copy below, so
+          # they have to be shipped from here too.
+          # This is done *after* windeployqt on purpose: Windows also searches
+          # the current directory when loading DLLs, and the MSVC runtime in
+          # ../dll is from the VS2015/2017 era, so having it here breaks every
+          # Qt tool we run from this directory. The matching runtime is copied
+          # by windeployqt --compiler-runtime, we must not overwrite it either.
+          cp ../dll/opengl32sw.dll ../dll/vcomp140.dll ../dll/libeay32.dll ../dll/ssleay32.dll ./
+          echo "Copy all required plugins"
+          while read plugin
+          do
+            echo "  Looking for '${plugin}'"
+            lib="${qt_plugin_dir}/${plugin}"
+            if [ ! -f "${lib}" ]
+            then
+              echo "  - ${lib} NOT FOUND"
+            else
+              echo "  - ${lib} (${plugin})"
+              mkdir -p $(dirname "${plugin}")
+              cp "${lib}" "${plugin}"
+              echo "    Copying its dependencies:"
+              copy_deps "${lib}"
+            fi
+          done < ../plugins.txt
+          echo "Copy trse.exe dependencies"
+          copy_deps trse.exe
+          cd ..
+          echo "Copy OK64 from old archive"
+          mkdir tmp # Separate directory as the archive contain a trse dir that would clash with our own
+          cd tmp
+          curl https://www.irio.co.uk/trse/nightly_build/trse_win_nightly.zip -o trse_win_nightly.zip
+          unzip trse_win_nightly.zip
+          cp -r trse/OK64 ../trse/
+          cd ..
+          7z a trse_win.zip trse
+
+      - name: Publish zip
+        uses: softprops/action-gh-release@v3
+        with:
+          name: nightly
+          body: TRSE ${{ steps.version.outputs.TRSE_VERSION }} <br/> The latest automated nightly build of TRSE which succeeded. This is the recommended version to use.
+          files: Publish/publish_win/trse_win.zip
+          prerelease: false
+          make_latest: true
+          draft: false
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Discord notification
+        if: always()
+        shell: bash
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          STATUS="SUCCESS"
+          if [ "${{ job.status }}" != "success" ]; then
+            STATUS="FAILURE"
+          fi
+
+          VERSION="${{ steps.version.outputs.TRSE_VERSION }}"
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          CONTENT=$(printf '**Windows Nightly Build: %s**\nVersion: %s\nRun: %s' "$STATUS" "$VERSION" "$RUN_URL")
+
+          if [ -z "$DISCORD_WEBHOOK_URL" ]; then
+            echo "DISCORD_WEBHOOK_URL is empty; skipping Discord notification"
+            exit 0
+          fi
+
+          # Build JSON safely to avoid invalid payloads when values contain special characters.
+          payload=$(jq -nc \
+            --arg content "$CONTENT" \
+            '{content: $content}')
+
+          response_file=$(mktemp)
+          http_code=$(curl -sS -o "$response_file" -w "%{http_code}" \
+            -X POST \
+            --connect-timeout 10 \
+            --max-time 20 \
+            -H "Content-Type: application/json" \
+            -d "$payload" \
+            "$DISCORD_WEBHOOK_URL")
+
+          if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
+            echo "Discord webhook failed with HTTP $http_code"
+            cat "$response_file"
+            exit 1
+          fi
+
+      - name: Build notification
+        if: failure()
+        continue-on-error: true
+        shell: bash
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          if [ -z "$SLACK_WEBHOOK_URL" ]; then
+            echo "SLACK_WEBHOOK_URL is empty; skipping Slack notification"
+            exit 0
+          fi
+
+          payload=$(printf '{"channel":"#bugs","text":"[GitHub Actions Notification] Windows build failed: %s/%s/actions/runs/%s"}' \
+            "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID")
+          curl -sS \
+            --connect-timeout 10 \
+            --max-time 20 \
+            -X POST \
+            -H 'Content-type: application/json' \
+            --data "$payload" \
+            "$SLACK_WEBHOOK_URL"

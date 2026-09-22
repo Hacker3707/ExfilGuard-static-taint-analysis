@@ -1,0 +1,5 @@
+Cau hinh                TP  FP  TN  FN   Recall Precision
+1. YAML-only             0   0  12  18     0.0%      0.0%
+2. + Bash               11   0  12   7    61.1%    100.0%
+3. + Python             15   0  12   3    83.3%    100.0%
+4. Full (+ Node.js)     18   0  12   0   100.0%    100.0%

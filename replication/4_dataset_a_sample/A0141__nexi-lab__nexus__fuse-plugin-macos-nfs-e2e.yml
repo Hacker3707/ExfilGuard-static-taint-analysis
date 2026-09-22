@@ -1,0 +1,300 @@
+name: FUSE Plugin macOS NFS E2E
+
+# Runs `tests/e2e/macos/test_fuse_plugin_nfs_e2e.py` against a real NFS
+# localhost mount on a `macos-latest` runner.
+#
+# When FUSE-T is broken on macOS (Tahoe: go-nfsv4 panic, SMB EOF, FSKit
+# entitlement missing), the FUSE plugin falls back to an in-process
+# NFSv3 server mounted via `mount_nfs`.  This suite exercises that
+# fallback path.
+#
+# Flow: build nexusd-cluster + plugin → spawn cluster with NFS fallback
+# active → pytest workflows with gRPC cross-check → teardown.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, develop]
+    paths:
+      - 'rust/services/fuse-plugin/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'tests/e2e/macos/**'
+      - 'scripts/wedge_probe.py'
+      - '.github/workflows/fuse-plugin-macos-nfs-e2e.yml'
+  pull_request:
+    branches: [main, develop]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fuse-plugin-macos-nfs-e2e:
+    name: FUSE Plugin macOS NFS E2E
+    runs-on: macos-latest
+    # 12-min budget is a safety net, not a gate.  Layers that catch
+    # wedges BEFORE this triggers:
+    #   * readiness poll below — bounded mount probe (wedge_probe.py
+    #     --readonly) on a 180s wall-clock deadline, so a mounted-but-
+    #     not-yet-serving backend can never block the poll;
+    #   * per-test pytest-timeout via `wedge_watchdog` marker
+    #     (tests/e2e/macos/conftest.py — 60s per test);
+    #   * pre-pytest wedge probe below — stat+readdir+mkdir+rmdir on the
+    #     mount with hard subprocess timeouts.
+    # In practice this workflow completes in <8min warm-cache and
+    # <15min cold.  If we approach 12min it means something below the
+    # test layer failed (build hung, cargo install hung, or the
+    # wedge-probe itself hung — all with in-workflow diagnostics).
+    timeout-minutes: 12
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect macOS-NFS-relevant changes
+        id: changes
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git fetch --no-tags --prune origin "${{ github.base_ref }}"
+          git diff --name-only "origin/${{ github.base_ref }}"...HEAD > /tmp/changed_files.txt
+          cat /tmp/changed_files.txt
+          if grep -Eq '^(rust/services/fuse-plugin/|Cargo\.toml$|Cargo\.lock$|tests/e2e/macos/|scripts/wedge_probe\.py$|\.github/workflows/fuse-plugin-macos-nfs-e2e\.yml$)' /tmp/changed_files.txt; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Skip — no relevant changes
+        if: steps.changes.outputs.run != 'true'
+        run: |
+          echo "No FUSE-plugin-relevant macOS changes; skipping."
+
+      - name: Install Rust toolchain
+        if: steps.changes.outputs.run == 'true'
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+
+      - name: Install Python 3.14
+        if: steps.changes.outputs.run == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+
+      - name: Rust cache
+        if: steps.changes.outputs.run == 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: fuse-plugin-macos-nfs-e2e
+
+      # FUSE-T provides libfuse3 headers + runtime dylib needed to
+      # compile and load the fuser crate.  On CI runners, FUSE-T's
+      # go-nfsv4 backend is broken (the bug that motivated this PR),
+      # so fuser::spawn_mount2 will fail → NFS fallback triggers.
+      # We install via brew (not .pkg) because brew doesn't need
+      # system prompts or kext loading.
+      - name: Install FUSE-T (libfuse3 build + runtime dependency)
+        if: steps.changes.outputs.run == 'true'
+        run: brew install fuse-t
+
+      # protobuf-build 0.14.1 hard-codes `major == 3 && minor >= 1` in
+      # its version check.  Newer protoc (v27+) uses a different major
+      # version scheme.  The bundled protoc fallback also fails on
+      # macOS aarch64 (no match in the OS/arch table).  Fix: install
+      # protoc 3.x and point PROTOC to it.
+      - name: Install protoc 3.x (protobuf-build compatible)
+        if: steps.changes.outputs.run == 'true'
+        run: |
+          set -euo pipefail
+          # Download protoc 3.21.12 (last release with 3.x version output).
+          # protoc v22+ changed versioning to drop the 3. prefix.
+          curl -fsSL -o /tmp/protoc.zip \
+            "https://github.com/protocolbuffers/protobuf/releases/download/v21.12/protoc-21.12-osx-universal_binary.zip"
+          sudo unzip -o /tmp/protoc.zip -d /usr/local bin/protoc
+          protoc --version
+          echo "PROTOC=/usr/local/bin/protoc" >> "$GITHUB_ENV"
+
+      - name: Read NEXUS_VFS_REV from Cargo.toml
+        if: steps.changes.outputs.run == 'true'
+        id: vfs_rev
+        run: |
+          sha=$(grep -oP '(?<=rev = ")[a-f0-9]{40}' Cargo.toml | sort -u | head -1)
+          if [ -z "$sha" ]; then
+            # macOS grep doesn't support -P; fallback to sed.
+            sha=$(sed -n 's/.*rev = "\([a-f0-9]\{40\}\)".*/\1/p' Cargo.toml | sort -u | head -1)
+          fi
+          if [ -z "$sha" ]; then
+            echo "::error::Could not parse nexus-vfs SHA from Cargo.toml"
+            exit 1
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      - name: Install nexusd-cluster from nexus-vfs (pinned)
+        if: steps.changes.outputs.run == 'true'
+        env:
+          REV: ${{ steps.vfs_rev.outputs.sha }}
+        run: |
+          set -euo pipefail
+          cargo install --locked \
+            --git https://github.com/nexi-lab/nexus-vfs \
+            --rev "$REV" \
+            --bin nexusd-cluster nexus-cluster
+
+      - name: Build + sign FUSE plugin dylib
+        if: steps.changes.outputs.run == 'true'
+        env:
+          PLUGIN_SIGNING_PRIVKEY: ${{ secrets.PLUGIN_SIGNING_PRIVKEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "$PLUGIN_SIGNING_PRIVKEY" ]; then
+            echo "::error::PLUGIN_SIGNING_PRIVKEY secret is not available"
+            exit 1
+          fi
+          cargo build --release -p nexus-fuse-plugin
+          pip install --quiet cryptography
+          python scripts/sign_plugin.py \
+            target/release/libnexus_fuse_plugin.dylib
+
+      - name: Prepare plugin dir + mount point
+        if: steps.changes.outputs.run == 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.nexus/plugins
+          cp target/release/libnexus_fuse_plugin.dylib ~/.nexus/plugins/
+          cp target/release/libnexus_fuse_plugin.dylib.sig ~/.nexus/plugins/
+          mkdir -p /tmp/nexus-nfs-e2e
+
+      - name: "Run FUSE plugin macOS NFS E2E (daemon + tests)"
+        if: steps.changes.outputs.run == 'true'
+        env:
+          NEXUS_FUSE_MACOS_NFS_E2E: "1"
+          NEXUS_CLUSTER_GRPC: "127.0.0.1:2126"
+          NEXUS_FUSE_MOUNT_POINT: "/tmp/nexus-nfs-e2e"
+          NEXUS_FUSE_VFS_ROOT: "/"
+          NEXUS_BIND_ADDR: "127.0.0.1:2126"
+          NEXUS_NO_TLS: "true"
+        run: |
+          set -euo pipefail
+          DATADIR="$HOME/.nexus/data"
+          PLUGINDIR="$HOME/.nexus/plugins"
+          mkdir -p "$DATADIR"
+
+          # Phase G (nexus-vfs #118): no --bootstrap-mode; empty
+          # data_dir + no peers + no federation env => row 2
+          # (RootlessDynamic).  Runtime API drives zone formation
+          # via the plugin.
+          nexusd-cluster \
+            --plugin-dir "$PLUGINDIR" \
+            --bind-addr "127.0.0.1:2126" \
+            --data-dir "$DATADIR" \
+            --no-tls \
+            > nexusd.log 2> >(tee nexusd.err.log) &
+          DAEMON_PID=$!
+          echo "nexusd-cluster started, pid=$DAEMON_PID"
+
+          # Wait for gRPC + NFS mount ready, on a hard 180s wall-clock
+          # deadline — NOT an iteration count.  The mount probe can take
+          # up to its per-op timeout on a not-yet-serving mount, so a
+          # fixed `seq` loop would let slow probes overshoot the job
+          # budget; the deadline keeps total readiness wait bounded.
+          READY=false
+          READY_DEADLINE=$(( $(date +%s) + 180 ))
+          i=0
+          while [ "$(date +%s)" -lt "$READY_DEADLINE" ]; do
+            i=$((i + 1))
+            GRPC_OK=false
+            if nc -z 127.0.0.1 2126 2>/dev/null; then
+              GRPC_OK=true
+            fi
+            # Mount liveness = it answers a *bounded* read (stat + readdir).
+            # A bare `ls` here blocks forever on macOS's hard NFS mount when
+            # the backend mounted but cannot yet serve, defeating the
+            # deadline; wedge_probe.py --readonly caps every syscall.
+            MOUNT_OK=false
+            if python3 scripts/wedge_probe.py "$NEXUS_FUSE_MOUNT_POINT" --readonly --per-op-timeout 5 >/dev/null 2>&1; then
+              MOUNT_OK=true
+            fi
+            if [ "$GRPC_OK" = "true" ] && [ "$MOUNT_OK" = "true" ]; then
+              echo "Cluster healthy (gRPC + NFS mount) after ${i} probes"
+              READY=true
+              break
+            fi
+            if [ $((i % 10)) -eq 1 ]; then
+              ALIVE=$(kill -0 "$DAEMON_PID" 2>/dev/null && echo "yes" || echo "no")
+              echo "iter=$i grpcOK=$GRPC_OK mountOK=$MOUNT_OK alive=$ALIVE"
+            fi
+            sleep 2
+          done
+
+          TEST_RC=1
+          if [ "$READY" = "true" ]; then
+            # ── Pre-pytest wedge probe ──
+            #
+            # Ready-check above tests port-open + `ls mount` responds.
+            # That's necessary but not sufficient — a wedged FUSE
+            # backend can pass both and then hang on a subsequent
+            # `stat` / `mkdir`.  This probe exercises the actual test
+            # syscalls via Python's `subprocess.run(timeout=...)` (GNU
+            # `timeout` is not on macOS by default) so a wedge surfaces
+            # BEFORE pytest builds up 30 seconds of daemon log noise.
+            echo "=== wedge probe (stat + mkdir + rmdir) ==="
+            python3 scripts/wedge_probe.py /tmp/nexus-nfs-e2e && PROBE_OK=true || PROBE_OK=false
+            if [ "$PROBE_OK" != "true" ]; then
+              echo "=== mount output (5s timeout via Python) ==="
+              python3 -c "import subprocess; print(subprocess.run(['mount'], capture_output=True, text=True, timeout=5).stdout)" || echo "(mount hung)"
+              echo "=== daemon alive? ==="
+              kill -0 "$DAEMON_PID" 2>/dev/null && echo "yes (alive but wedged)" || echo "no (exited)"
+            else
+              # Export daemon PID so the pytest wedge-diagnostic hook
+              # can `ps -o stat` the daemon on any test failure.
+              export NEXUSD_PID="$DAEMON_PID"
+              pip install -e ".[test]"
+              python -m pytest tests/e2e/macos/test_fuse_plugin_nfs_e2e.py -v --no-header -o "addopts=" && TEST_RC=0 || TEST_RC=$?
+            fi
+          else
+            echo "::error::Timed out waiting for cluster ready (180s)"
+            echo "=== mount output (5s timeout via Python) ==="
+            python3 -c "import subprocess; print(subprocess.run(['mount'], capture_output=True, text=True, timeout=5).stdout)" || echo "(mount hung)"
+            echo "=== daemon alive? ==="
+            kill -0 "$DAEMON_PID" 2>/dev/null && echo "yes" || echo "no (exited)"
+          fi
+
+          # Teardown — force-unmount BEFORE killing daemon so the NFS
+          # server's tokio runtime doesn't block on active connections.
+          umount -f /tmp/nexus-nfs-e2e 2>/dev/null || true
+
+          # SIGTERM first, then SIGKILL after 5s grace period.
+          # `wait` can hang indefinitely if the NFS server's tokio
+          # runtime has active connections; the SIGKILL ensures we
+          # never exceed the job timeout on teardown.
+          kill "$DAEMON_PID" 2>/dev/null || true
+          for i in $(seq 1 10); do
+            kill -0 "$DAEMON_PID" 2>/dev/null || break
+            sleep 0.5
+          done
+          kill -9 "$DAEMON_PID" 2>/dev/null || true
+          wait "$DAEMON_PID" 2>/dev/null || true
+
+          echo "=== nexusd.log (last 100 lines) ==="
+          tail -100 nexusd.log 2>/dev/null || true
+          echo "=== nexusd.err.log (last 100 lines) ==="
+          tail -100 nexusd.err.log 2>/dev/null || true
+
+          exit $TEST_RC
+
+      - name: Upload daemon logs as artifact
+        if: always() && steps.changes.outputs.run == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: nexusd-nfs-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            nexusd.log
+            nexusd.err.log
+          if-no-files-found: warn
+          retention-days: 14

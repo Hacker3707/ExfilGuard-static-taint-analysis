@@ -1,0 +1,291 @@
+# .github/workflows/ci-scripts-build.yml for use with EPICS Base ci-scripts
+# (see: https://github.com/epics-base/ci-scripts)
+
+# This is YAML - indentation levels are crucial
+
+name: PVXS EPICS
+
+# Trigger on pushes and PRs to any branch
+on:
+  push:
+    paths-ignore:
+      - .appveyor.yml
+      - setup.py
+      - MANIFEST.in
+      - pyproject.toml
+      - python/*
+  pull_request:
+  workflow_dispatch:
+
+env:
+  SETUP_PATH: .ci-local
+  CMP: gcc
+  _PVXS_ABORT_ON_CRIT: 1
+  PVXS_LOG: pvxs.*=WARN
+
+jobs:
+  native:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    # Set environment variables from matrix parameters
+    env:
+      SET: ${{ matrix.set || 'defaults' }}
+      CMP: ${{ matrix.cmp }}
+      BCFG: ${{ matrix.configuration }}
+      BASE: ${{ matrix.base }}
+      CI_CROSS_TARGETS: ${{ matrix.cross }}
+      LIBEVENT_TAG: ${{ matrix.libevent }}
+      TEST: ${{ matrix.test }}
+      EXTRA: ${{ matrix.extra }}
+      VV: "1"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Native Linux (WError)
+            os: ubuntu-latest
+            cmp: gcc
+            configuration: default
+            base: "7.0"
+            extra: "CMD_CPPFLAGS=-Werror"
+            doc: 1
+
+          - name: Native Linux (libc++ debug)
+            os: ubuntu-latest
+            cmp: gcc
+            configuration: default
+            base: "7.0"
+            # https://gcc.gnu.org/onlinedocs/libstdc++/manual/using_macros.html
+            extra: "CMD_CPPFLAGS=\"-D_GLIBCXX_ASSERTIONS -D_GLIBCXX_DEBUG -D_GLIBCXX_DEBUG_PEDANTIC\""
+            doc: 1
+
+          - name: Native Linux (c++17)
+            os: ubuntu-latest
+            cmp: gcc
+            configuration: default
+            base: "7.0"
+            extra: "CMD_CXXFLAGS=-std=c++17"
+
+          - name: Cross mingw64 DLL
+            os: ubuntu-latest
+            cmp: gcc
+            configuration: default
+            base: "7.0"
+            cross: "windows-x64-mingw"
+
+          - name: Cross mingw64 static
+            os: ubuntu-latest
+            cmp: gcc
+            configuration: static
+            base: "7.0"
+            cross: "windows-x64-mingw"
+
+          - name: RTEMS5
+            os: ubuntu-22.04
+            cmp: gcc
+            configuration: default
+            base: "7.0"
+            cross: "RTEMS-pc686-qemu@5"
+ 
+          - name: Native Linux with clang
+            os: ubuntu-latest
+            cmp: clang
+            configuration: default
+            base: "7.0"
+
+          - name: Native Linux with clang ubsan
+            os: ubuntu-latest
+            cmp: clang
+            configuration: default
+            base: "7.0"
+            extra: "CMD_CFLAGS=-fsanitize=undefined CMD_CXXFLAGS=-fsanitize=undefined CMD_LDFLAGS=-fsanitize=undefined"
+
+          - name: Native Linux with libevent stable
+            os: ubuntu-latest
+            cmp: gcc
+            configuration: default
+            base: "7.0"
+            libevent: "release-2.1.12-stable"
+
+          - name: Native Linux with 7.0.2
+            os: ubuntu-latest
+            cmp: gcc
+            configuration: default
+            set: "nofortify"
+            base: "R7.0.2"
+            extra: "CMD_CPPFLAGS=\"-U_FORTIFY_SOURCE\""
+
+          - name: Native Linux with 3.15
+            os: ubuntu-latest
+            cmp: gcc
+            configuration: default
+            set: "nofortify"
+            base: "3.15"
+            extra: "CMD_CPPFLAGS=\"-U_FORTIFY_SOURCE\""
+
+          - name: Native Linux with 3.14
+            os: ubuntu-latest
+            cmp: gcc
+            configuration: default
+            set: "nofortify"
+            base: "3.14"
+            extra: "CMD_CPPFLAGS=\"-U_FORTIFY_SOURCE\""
+
+          - name: OSX
+            os: macos-latest
+            cmp: clang
+            configuration: default
+            base: "7.0"
+
+          - name: vs2022 DLL
+            os: windows-2022
+            cmp: vs2022
+            configuration: debug
+            base: "7.0"
+            extra: "CMD_CXXFLAGS=-analyze"
+
+          - name: vs2022 static
+            os: windows-2022
+            cmp: vs2022
+            configuration: static-debug
+            base: "7.0"
+            extra: "CMD_CXXFLAGS=-analyze"
+
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        submodules: true
+    - name: "apt-get install"
+      run: |
+        sudo apt-get update
+        sudo apt-get -y install libreadline-dev g++-mingw-w64-x86-64 cmake gdb qemu-system-x86
+      if: runner.os == 'Linux'
+    - name: Automatic core dumper analysis
+      uses: mdavidsaver/ci-core-dumper@master
+    - name: Prepare and compile dependencies
+      run: python .ci/cue.py prepare
+    - name: Build libevent
+      run: python .ci/cue.py exec python .ci-local/libevent.py
+    - name: Build main module
+      run: python .ci/cue.py build
+    - name: Generate Docs
+      if: matrix.doc
+      run: |
+        sudo apt-get -y install doxygen python-is-python3 python3-breathe inkscape
+        make -C documentation
+    - name: otool
+      if: ${{ always() && runner.os == 'macOS' }}
+      run: otool -D -L -l bundle/usr/*/lib/*.dylib lib/*/*.dylib bin/*/pvxinfo
+    - name: readelf
+      if: ${{ always() && runner.os == 'Linux' && matrix.base != '3.14' }}
+      run: find bundle/usr lib -name '*.so' -print0 | xargs -0 readelf -d bin/linux-*/pvxinfo
+    - name: Host info
+      if: ${{ matrix.base != '3.14' }}
+      run: python .ci/cue.py --add-path "{TOP}/bin/{EPICS_HOST_ARCH}" --add-path "{TOP}/bundle/usr/{EPICS_HOST_ARCH}/lib" exec pvxinfo -D
+    - name: Test env setup
+      run: echo "UBSAN_OPTIONS=log_path=$PWD/UBSAN:suppressions=$PWD/.ci-local/ubsan.supp:report_error_type=1:print_stacktrace=1" >> $GITHUB_ENV
+    - name: Run main module tests
+      run: python -m ci_core_dumper exec python .ci/cue.py -T 5M --add-path "{TOP}/bundle/usr/{EPICS_HOST_ARCH}/lib" test
+    - name: Collect and show test results
+      if: ${{ always() }}
+      run: python .ci/cue.py test-results
+    - name: Show UBSAN logs
+      shell: bash
+      if: ${{ always() }}
+      run: |
+        ret=0
+        for ff in `find . -name 'UBSAN*'`
+        do
+          echo "==== $ff ===="
+          cat "$ff"
+          ret=1
+        done
+        exit $ret
+    - name: CDT Check
+      run: ./.ci-local/cdt-check.sh
+      if: runner.os == 'Linux'
+    - name: Troubleshoot
+      if: ${{ always() }}
+      shell: bash
+      run: grep . cfg/*
+    - name: Upload tapfiles Artifact
+      if: ${{ always() }}
+      uses: actions/upload-artifact@v7
+      with:
+        name: tapfiles ${{ matrix.name }}
+        path: '**/O.*/*.tap'
+        if-no-files-found: ignore
+
+  docker:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    env:
+      CMP: ${{ matrix.cmp }}
+      BCFG: ${{ matrix.configuration }}
+      BASE: ${{ matrix.base }}
+      LIBEVENT_TAG: ${{ matrix.libevent }}
+      EXTRA: ${{ matrix.extra }}
+      VV: "1"
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux CentOS 7
+            image: centos:7
+            cmp: gcc
+            configuration: default
+            base: "7.0"
+
+          - name: Linux fedora latest
+            image: fedora:latest
+            cmp: gcc
+            configuration: default
+            base: "7.0"
+
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        submodules: true
+
+    - name: Run...
+      run: |
+        env > env.list
+        cat <<EOF > runit.sh
+        #!/bin/sh
+        set -e -x
+        cd /io
+        id
+
+        if [ "${{ matrix.image }}" = "centos:7" ]
+        then
+            sed -i s/mirror.centos.org/vault.centos.org/g /etc/yum.repos.d/*.repo
+            sed -i s/^#.*baseurl=http/baseurl=http/g /etc/yum.repos.d/*.repo
+            sed -i s/^mirrorlist=http/#mirrorlist=http/g /etc/yum.repos.d/*.repo
+            yum -y install epel-release
+            alias dnf=yum
+        fi
+        dnf -y install \
+          curl make gcc curl-devel expat-devel gettext-devel openssl-devel zlib-devel perl-ExtUtils-MakeMaker \
+          python3 gdb make perl gcc-c++ glibc-devel readline-devel ncurses-devel perl-devel libevent-devel \
+          sudo re2c git
+
+        # fake out cue.py
+        ln -s /bin/true /usr/bin/apt-get
+
+        # quiet warnings spam from perl
+        export LANG=C
+
+        python3 --version
+        python3 .ci/cue.py prepare
+        python3 .ci/cue.py build
+        python3 .ci/cue.py -T 15M test
+        python3 .ci/cue.py test-results
+        EOF
+        chmod +x runit.sh
+        docker run --rm --quiet \
+         --pull=always \
+         --env-file env.list \
+         -v `pwd`:/io \
+         ${{ matrix.image }} \
+         /io/runit.sh

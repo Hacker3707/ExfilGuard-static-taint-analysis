@@ -1,0 +1,189 @@
+name: Publish to npm
+
+# Publishes @event4u/agent-config to the npm registry via OIDC Trusted
+# Publishing whenever a bare-numeric version tag is pushed (e.g. 1.10.0,
+# 1.11.0, 2.0.0-rc.1). Tags follow the repository convention: no `v`
+# prefix, no component prefix.
+#
+# Tags are created by src/scripts/release.ts, invoked either via
+# `task release` (local) or `.github/workflows/release.yml` (the
+# `release`-labeled-PR CI path). A tag pushed under the default
+# GITHUB_TOKEN does not trigger this workflow's `push: tags:` event, so
+# release.yml's --ci path dispatches this workflow explicitly
+# (`workflow_dispatch` with `inputs.tag`) right after tagging. The
+# "Skip if already published" step makes that dispatch idempotent against
+# the native tag-push trigger firing too (e.g. when a RELEASE_PR_TOKEN
+# PAT is configured) — this is the single publish path either way.
+
+on:
+  push:
+    tags:
+      - '[0-9]+.[0-9]+.[0-9]+'
+      - '[0-9]+.[0-9]+.[0-9]+-*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to publish (e.g. 1.10.0). Used only when the workflow file was missing at tag-push time.'
+        required: true
+        type: string
+
+concurrency:
+  # Keyed on the VERSION, never on `github.ref` — the two triggers for one
+  # release do not share a ref, so keying on the ref put them in two different
+  # groups and they raced.
+  #
+  # Measured on 14.0.0 (2026-08-18): release.ts dispatches this workflow with
+  # `--ref main` (so `github.ref` is `refs/heads/main`), while the PAT-pushed
+  # tag fires it natively with `refs/tags/14.0.0`. Both ran at 09:00, both
+  # passed the "Skip if already published" probe below because neither had
+  # published yet, both built, and the loser died on
+  # `E403 cannot publish over the previously published versions: 14.0.0`.
+  # The package shipped exactly once; the artefact was a red run on a green
+  # release, which is the kind of noise that trains people to ignore red.
+  #
+  # `github.ref_name` on a tag push is the bare version, and `inputs.tag` is
+  # the same string, so both triggers now land in one group. With
+  # cancel-in-progress false the second run waits and then finds the version
+  # on the registry — the idempotency probe becomes reachable instead of being
+  # raced past.
+  group: publish-npm-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+
+permissions:
+  contents: read
+
+jobs:
+  publish-npm:
+    name: Publish to npm
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write  # required for npm OIDC Trusted Publishing + provenance
+    steps:
+      - name: Check out released tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+          cache: 'npm'
+
+      - name: Upgrade npm (Trusted Publishing requires >= 11.5.1)
+        # Pin to the npm 11 line: npm@latest is now 12.x, which requires
+        # Node >=22 and fails EBADENGINE on this job's Node 20. npm 11 is
+        # Node-20-compatible and already satisfies the >= 11.5.1 floor.
+        run: npm install -g npm@11
+
+      - name: Resolve effective tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            tag="${{ inputs.tag }}"
+          else
+            tag="${GITHUB_REF_NAME}"
+          fi
+          echo "name=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Verify package version matches tag
+        run: |
+          tag="${{ steps.tag.outputs.name }}"
+          pkg="$(node -p "require('./package.json').version")"
+          if [ "$tag" != "$pkg" ]; then
+            echo "::error::package.json version ($pkg) does not match tag ($tag); aborting publish."
+            exit 1
+          fi
+          echo "✅  $pkg == $tag"
+
+      - name: Skip if already published (idempotency — dispatch-chained from release.yml)
+        # release.yml's --ci path explicitly dispatches this workflow after
+        # creating the GitHub Release (a bot-pushed tag does not trigger the
+        # `push: tags:` event above). If RELEASE_PR_TOKEN is ALSO configured,
+        # that same tag push fires this workflow natively too — the dispatch
+        # and the native trigger would otherwise race to `npm publish` the
+        # same version twice, and the registry hard-rejects the second
+        # attempt. Same protection covers a human re-running this workflow
+        # by hand for an already-published tag.
+        id: check
+        run: |
+          tag="${{ steps.tag.outputs.name }}"
+          if npm view "@event4u/agent-config@${tag}" version >/dev/null 2>&1; then
+            echo "already_published=true" >> "$GITHUB_OUTPUT"
+            echo "@event4u/agent-config@${tag} is already on the registry — skipping publish."
+          else
+            echo "already_published=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install npm dependencies
+        if: steps.check.outputs.already_published != 'true'
+        run: npm ci --no-audit --no-fund --prefer-offline
+
+      - name: Build CLI and UI ahead of pack (prepack chain)
+        if: steps.check.outputs.already_published != 'true'
+        run: npm run build
+
+      - name: Build discovery manifest
+        if: steps.check.outputs.already_published != 'true'
+        run: |
+          ./scripts-run src/scripts/build_discovery_manifest --write --strict
+          ./scripts-run src/scripts/lint_discovery_manifest --quiet
+
+      - name: Assert discovery manifest is in the tarball
+        if: steps.check.outputs.already_published != 'true'
+        # --ignore-scripts so the JSON output is not polluted by vite/build
+        # logs from a re-invoked prepack; manifest was already written above.
+        run: |
+          npm pack --dry-run --json --ignore-scripts --silent \
+            | jq -e '.[0].files | map(.path) | any(. == "dist/discovery/discovery-manifest.json")'
+
+      - name: Agent-security gate (hidden-unicode / confusable / instruction-smuggling)
+        if: steps.check.outputs.already_published != 'true'
+        # Fail-closed on the RELEASE path, not just the PR path: scan the exact
+        # bytes about to be published (src/ + dist/agent-src/) for hidden-Unicode,
+        # mixed-script-confusable, instruction-smuggling, mcp-config, and
+        # dangerous-frontmatter payloads. A blocking finding aborts the job before
+        # `npm publish`, so "what ships to npm is machine-checked" is a structural
+        # property of this workflow, not a branch-protection configuration.
+        run: ./scripts-run src/scripts/lint_agent_security
+
+      - name: Resolve dist-tag channel (docs/releases.md contract)
+        if: steps.check.outputs.already_published != 'true'
+        id: channel
+        # Channel routing (road-to-credible-install Phase 5): prerelease
+        # versions (any semver prerelease suffix, e.g. X.Y.Z-next.N) publish
+        # to the `next` dist-tag; plain X.Y.Z publishes to `latest`. The
+        # cadence contract lives in docs/releases.md.
+        run: |
+          tag="${{ steps.tag.outputs.name }}"
+          if [[ "$tag" == *-* ]]; then
+            echo "dist_tag=next" >> "$GITHUB_OUTPUT"
+          else
+            echo "dist_tag=latest" >> "$GITHUB_OUTPUT"
+          fi
+          echo "dist-tag channel: $(grep -o 'next\|latest' <<< "${tag/*-*/next}" | head -1)"
+
+      - name: Publish via OIDC Trusted Publishing
+        if: steps.check.outputs.already_published != 'true'
+        run: npm publish --tag "${{ steps.channel.outputs.dist_tag }}"
+
+      - name: Job summary
+        if: always()
+        run: |
+          tag="${{ steps.tag.outputs.name }}"
+          {
+            echo "## npm publish"
+            echo
+            if [ "${{ steps.check.outputs.already_published }}" = "true" ]; then
+              echo "⏭️  \`@event4u/agent-config@${tag}\` was already on the registry — nothing to do."
+            elif [ "${{ job.status }}" = "success" ]; then
+              echo "📦  Published \`@event4u/agent-config@${tag}\` to https://registry.npmjs.org"
+              echo "- https://www.npmjs.com/package/@event4u/agent-config/v/${tag}"
+            else
+              echo "❌  Publish failed (see logs)"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

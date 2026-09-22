@@ -1,0 +1,631 @@
+name: CI
+
+on:
+  # Push runs on main only. A feat/* push with an open PR double-fires
+  # (push + pull_request share one concurrency group via head_ref), the
+  # PR run cancels the push run, and branch protection's rollup then
+  # keeps the CANCELLED check runs beside the SUCCESS ones on the same
+  # SHA — mergeStateStatus BLOCKED (the rerun-the-cancelled-run dance on
+  # #519/#520/#521). PR branches get CI from the pull_request event.
+  push:
+    branches: [main]
+  pull_request:
+
+# One run per branch/PR-head at a time: a new push cancels the stale run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # The temporary limnifs-write [patch] rides a git fork (see workspace
+  # Cargo.toml; lifts when limnifs#189 ships in a release) — use the git
+  # CLI for the fetch, matching local builds.
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  # Must match the builtin-baseline in dwarfs-t/vcpkg.json (mirrors
+  # dwarfs-t's and dwarfs-rs's CI; the vendored dwarfs build needs vcpkg).
+  VCPKG_COMMIT: f14401ca0f2754347c3864da7488a9b955b4e47a
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    permissions:
+      # packages:write populates the org's GitHub Packages vcpkg binary
+      # cache (ci/vcpkg-nuget-cache.sh); fork PRs are auto-downgraded to
+      # read-only, where pushes degrade to a non-fatal vcpkg note.
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            crypto_triplet: x64-linux-dynamic
+            triplet: x64-linux-static
+          - os: macos-14
+            crypto_triplet: arm64-osx-dynamic
+            triplet: arm64-osx-static
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The dwarfs backend's path dependency (../dwarfs-rs) brings the
+          # dwarfs-t submodule with it.
+          submodules: recursive
+          path: tebako-rs
+
+      # dwarfs-rs is a sibling path dependency until it has a release.
+      - name: Checkout dwarfs-rs (sibling path dep)
+        uses: actions/checkout@v4
+        with:
+          repository: tamatebako/dwarfs-rs
+          path: dwarfs-rs
+          submodules: recursive
+
+      - name: Restore the vcpkg baseline (dwarfs-t is the single writer)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # Never fails the leg: a miss means the ports build normally.
+        # The script owns the canonical root and exports
+        # DWARFS_RS_VCPKG_INSTALLED_DIR into GITHUB_ENV.
+        run: |
+          bash dwarfs-rs/dwarfs-t/ci/vcpkg-baseline-restore.sh \
+            dwarfs-rs/dwarfs-t "${{ matrix.triplet }}" \
+            || echo "baseline miss — ports build normally"
+
+      - name: Cache the cargo target dir
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+        with:
+          workspaces: |
+            tebako-rs
+          # Triplet-scoped, never the default job+lockfile key: each matrix
+          # row is one triplet and a cache must never serve another.
+          key: test-${{ matrix.triplet }}
+
+      - name: Install toolchain (rustup)
+        uses: dtolnay/rust-toolchain@1.94.1
+        with:
+          components: clippy
+
+      - name: Install native build tools (ubuntu)
+        if: runner.os == 'Linux'
+        # libbz2-dev: rnp-rs 0.1.7 declares dylib=bz2 — give the linker a
+        # REAL shared library (base-OS dep, same class as libz; macOS links
+        # the system libbz2.dylib identically). Until rnp-rs ≥ 0.1.10.
+        # mono-complete: vcpkg's NuGet binary-cache provider drives
+        # nuget.exe through mono on non-Windows (macos runners ship mono).
+        # libjemalloc-dev: the tebako#527 e2e regression probe links a
+        # STATIC jemalloc into an --export-dynamic exe (the spec 29 link
+        # unit's shape); without it that test skips and the linux-gnu
+        # init_lock deadlock loses its in-CI pin.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build pkg-config \
+            autoconf automake autoconf-archive libtool \
+            curl zip unzip tar ca-certificates \
+            libbz2-dev mono-complete libjemalloc-dev
+
+      - name: Install native build tools (macos)
+        if: runner.os == 'macOS'
+        run: brew install ninja autoconf automake autoconf-archive libtool
+
+      - name: Set up vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT }}
+          vcpkgDirectory: ${{ github.workspace }}/.vcpkg-root
+
+      # run-vcpkg@v11 injects VCPKG_BINARY_SOURCES=clear;x-gha,readwrite,
+      # and vcpkg removed x-gha (2025.06) — that spec is zero binary cache,
+      # and it also neutered the old actions/cache over the archives dir
+      # (files provider cleared + archives path redirected). The override
+      # is the org's GitHub Packages NuGet feed; the dead cache step is
+      # gone (details in ci/vcpkg-nuget-cache.sh).
+      - name: Configure the vcpkg binary cache (GitHub Packages NuGet)
+        working-directory: tebako-rs
+        env:
+          # First-push of a new package id CANNOT be done by GITHUB_TOKEN
+          # (GitHub quirk: 403 on creation; community#159893) — the org
+          # secret (classic PAT, write:packages) owns creation when present;
+          # GITHUB_TOKEN remains the read path and the whole fallback.
+          GH_TOKEN: ${{ secrets.TEBAKO_PACKAGES_PAT || secrets.GITHUB_TOKEN }}
+        run: bash ci/vcpkg-nuget-cache.sh
+
+      # Pre-install libsquashfs & co in a serialized step: sqfs-sys's
+      # build.rs would otherwise race dwarfs-t-sys's CMake-driven vcpkg run
+      # on the vcpkg-root filesystem lock (held ~45 min on a cold cache).
+      - name: Pre-install squashfs-tools-ng (serialized)
+        working-directory: tebako-rs
+        run: |
+          if [ "${{ runner.os }}" = "Linux" ]; then TRIPLET=x64-linux-static; else TRIPLET=arm64-osx-static; fi
+          ../.vcpkg-root/vcpkg install \
+            --vcpkg-root "${{ github.workspace }}/.vcpkg-root" \
+            --x-wait-for-lock \
+            --x-manifest-root crates/sqfs-sys \
+            --x-install-root "${{ github.workspace }}/.sqfs-installed" \
+            --triplet "$TRIPLET" \
+            --overlay-triplets crates/sqfs-sys/vcpkg_triplets \
+            --overlay-ports crates/sqfs-sys/vcpkg_ports
+          echo "SQFS_SYS_VCPKG_INSTALLED_DIR=${{ github.workspace }}/.sqfs-installed/$TRIPLET" >> "$GITHUB_ENV"
+
+      # rnp-rs 0.1.7 prebuilt ships librnp+json-c statically; botan and
+      # bz2 come from crate dependencies (botan-sys vendored → botan-src,
+      # bzip2-sys) declared in tebako-signer — no crypto provisioning
+      # anywhere. (Full static botan adds ~3 MB per binary; the bootstrap
+      # size gate was raised to 6 MB accordingly — owner, 2026-07-27.)
+
+      # The tebako-pkg golden suite compares against the C++ tebakofs
+      # oracle, and tfs-cli's mkimage against mkdwarfs; use the libtfs
+      # release binaries for the runner's platform.
+      - name: Download the C++ oracle binaries (libtfs release)
+        run: |
+          mkdir -p .oracle
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            TEBAKOFS=tebakofs-linux-gnu-x86_64
+            MKDWARFS=mkdwarfs-linux-gnu-x86_64
+            BOOTSTRAP=tebako-bootstrap-0.2.0-linux-gnu-x86_64
+          else
+            TEBAKOFS=tebakofs-macos-arm64
+            MKDWARFS=mkdwarfs-macos-arm64
+            BOOTSTRAP=tebako-bootstrap-0.2.0-macos-arm64
+          fi
+          curl -fsSL -o .oracle/tebakofs \
+            "https://github.com/tamatebako/libtfs/releases/download/v0.13.0/$TEBAKOFS"
+          curl -fsSL -o .oracle/mkdwarfs \
+            "https://github.com/tamatebako/libtfs/releases/download/v0.13.0/$MKDWARFS"
+          curl -fsSL -o .oracle/tebako-bootstrap \
+            "https://github.com/tamatebako/tebako-bootstrap/releases/download/v0.2.0/$BOOTSTRAP"
+          chmod +x .oracle/tebakofs .oracle/mkdwarfs .oracle/tebako-bootstrap
+          echo "TEBAKOFS_CPP=${{ github.workspace }}/.oracle/tebakofs" >> "$GITHUB_ENV"
+          echo "TEBAKO_MKDWARFS=${{ github.workspace }}/.oracle/mkdwarfs" >> "$GITHUB_ENV"
+          echo "TEBAKO_CPP_BOOTSTRAP=${{ github.workspace }}/.oracle/tebako-bootstrap" >> "$GITHUB_ENV"
+
+      # tebako-cli's golden e2e presses side-by-side with the reference
+      # Ruby gem (the three-part model, in main since feat/ci-slim-model
+      # merged) and diffs both the press stdout and the packaged
+      # binaries' output.
+      - name: Checkout the reference gem (golden side-by-side)
+        uses: actions/checkout@v4
+        with:
+          repository: tamatebako/tebako
+          ref: main
+          path: reference-gem
+
+      - name: Set up ruby for the reference gem
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4"
+
+      - name: Install thor (the reference gem's only non-stdlib dependency)
+        run: gem install thor --no-document
+
+      - name: Point the golden test at the reference gem
+        run: echo "TEBAKO_REFERENCE_GEM=${{ github.workspace }}/reference-gem" >> "$GITHUB_ENV"
+
+      # item 22's hard gate: the Rust bootstrap must stay under 3 MB
+      # (2 MB -> 3 MB when downloads went in-process; rnp/botan is now
+      # feature-gated OUT of the shipped bootstrap — unverified-first,
+      # roadmap 72 — so the 3 MB form holds again)
+      - name: Bootstrap size gate (< 3 MB)
+        working-directory: tebako-rs
+        run: |
+          cargo build -p tebako-bootstrap --release
+          SIZE=$(stat -c %s target/release/tebako-bootstrap 2>/dev/null || stat -f %z target/release/tebako-bootstrap)
+          CPP_SIZE=$(stat -c %s ../.oracle/tebako-bootstrap 2>/dev/null || stat -f %z ../.oracle/tebako-bootstrap)
+          echo "| platform | Rust bootstrap | C++ v0.2.0 | budget |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| ${{ runner.os }} | $SIZE B | $CPP_SIZE B | < 3 MB |" >> "$GITHUB_STEP_SUMMARY"
+          echo "tebako-bootstrap: $SIZE bytes (budget 3145728)"
+          test "$SIZE" -lt 3145728
+
+      # spec 29 §5: the wrapper exe (tebako-runtime-launcher) carries the
+      # whole driver + TFS stack — its budget is single-digit MB per
+      # PLATFORM ARTIFACT, not the bootstrap's < 3 MB loader gate. The
+      # linux ship form is static-musl (spec 29 §5) — wired with the
+      # openjdk promotion (TODO.java/04); the gnu dev-config build here
+      # is measured and reported but NOT gated (the host toolchain's C++
+      # stack lands it past 10 MiB). The native macOS artifact IS the
+      # gated ship form: 10 MiB budget (measured 7.2 MiB on macos-14).
+      - name: Wrapper size (< 10 MB on the ship forms)
+        working-directory: tebako-rs
+        run: |
+          cargo build -p tebako-runtime-launcher --release
+          SIZE=$(stat -c %s target/release/tebako-runtime-launcher 2>/dev/null || stat -f %z target/release/tebako-runtime-launcher)
+          echo "| platform | tebako-runtime-launcher | budget |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| ${{ runner.os }} | $SIZE B | < 10 MB |" >> "$GITHUB_STEP_SUMMARY"
+          echo "tebako-runtime-launcher: $SIZE bytes (budget 10485760; gated on the ship forms, reported elsewhere)"
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            test "$SIZE" -lt 10485760
+          fi
+
+      # `cargo build` first: it produces the libtfs cdylib the C harness
+      # links against (cargo test alone builds deps as rlibs only).
+      - name: cargo build
+        working-directory: tebako-rs
+        env:
+          DWARFS_RS_VCPKG_ROOT: ${{ github.workspace }}/.vcpkg-root
+        run: cargo build --workspace
+
+      # Test binaries too, so the proof artifacts below are runnable
+      # (cargo build alone leaves them unbuilt).
+      - name: cargo build (libtfs-preload test binaries)
+        working-directory: tebako-rs
+        env:
+          DWARFS_RS_VCPKG_ROOT: ${{ github.workspace }}/.vcpkg-root
+        run: cargo test -p libtfs-preload --no-run
+
+      # The built preload shim as a downloadable artifact (linux-gnu):
+      # the container-proof path for preload changes — a foreign-libc
+      # repro rig (usrmerge, Rosetta, …) downloads exactly this .so
+      # instead of needing a local cross toolchain. Uploaded BEFORE the
+      # test step: a hung test must not withhold the proof artifact.
+      - name: Upload the preload shim (linux-gnu proof artifact)
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: libtfs_preload-linux-gnu-x86_64-debug
+          path: tebako-rs/target/debug/libtfs_preload.so
+          if-no-files-found: error
+
+      # The libtfs-preload unit-test binary as a runnable artifact: a
+      # hang repro rig then iterates at container speed (TEBAKO_DEBUG_TFS
+      # traces, env variations) instead of 10-minute CI cycles. Short
+      # retention — a diagnostic aid, not a product artifact.
+      - name: Upload the libtfs-preload test binaries (linux-gnu diagnosis)
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: libtfs-preload-tests-linux-gnu-x86_64-debug
+          retention-days: 1
+          path: |
+            tebako-rs/target/debug/deps/tfs_preload-*
+            !tebako-rs/target/debug/deps/*.d
+          if-no-files-found: error
+
+      # Split so a hang names itself: the workspace sweep is wrapped in a
+      # hard timeout (norm ~20 min; a wedge otherwise burns the 6 h job
+      # limit and live logs are unfetchable mid-run), and libtfs-preload
+      # — where preload interposes can deadlock a fixture — runs
+      # test-by-test with a per-test watchdog so the log's last START
+      # line IS the culprit.
+      - name: cargo test (workspace sweep)
+        working-directory: tebako-rs
+        env:
+          DWARFS_RS_VCPKG_ROOT: ${{ github.workspace }}/.vcpkg-root
+        # timeout(1) is GNU-only — macOS runners lack it (the sweep's
+        # 40 min backstop simply degrades to the job timeout there).
+        run: |
+          if command -v timeout >/dev/null; then
+            timeout 2400 cargo test --workspace --exclude libtfs-preload
+          else
+            cargo test --workspace --exclude libtfs-preload
+          fi
+
+      - name: cargo test (libtfs-preload, per-test watchdog)
+        working-directory: tebako-rs
+        env:
+          DWARFS_RS_VCPKG_ROOT: ${{ github.workspace }}/.vcpkg-root
+        run: |
+          set -e
+          shopt -s nullglob
+          # Run the test BINARIES directly (unit + e2e), not via cargo:
+          # a wedged test must stay alive past its 180 s budget so gdb
+          # can dump every thread BEFORE the kill — the log then carries
+          # the deadlock's lock graph, not just a name. (cargo forwards
+          # SIGTERM to the test child, so `timeout cargo test …` reaps
+          # the very process we need to inspect.)
+          BINS=()
+          for b in target/debug/deps/tfs_preload-* target/debug/deps/e2e-*; do
+            case "$b" in *.d) continue;; esac
+            [ -x "$b" ] && BINS+=("$b")
+          done
+          for BIN in "${BINS[@]}"; do
+            # (3.2-portable read loop — macOS runners ship bash 3.2,
+            # which has no mapfile)
+            TESTS=()
+            while IFS= read -r line; do TESTS+=("$line"); done < <("$BIN" --list 2>/dev/null | sed -n 's/: test$//p')
+            echo "== $BIN: ${#TESTS[@]} tests"
+            for t in "${TESTS[@]}"; do
+              echo "=== START $BIN :: $t"
+              "$BIN" --exact "$t" --nocapture &
+              TPID=$!
+              (
+                sleep 180
+                if kill -0 "$TPID" 2>/dev/null; then
+                  echo "=== HANG $BIN :: $t — full thread dump:"
+                  gdb -p "$TPID" -batch -ex 'set pagination off' -ex 'thread apply all bt' || true
+                  kill -9 "$TPID" 2>/dev/null
+                fi
+              ) &
+              WDOG=$!
+              wait "$TPID" && rc=0 || rc=$?
+              kill "$WDOG" 2>/dev/null || true
+              wait "$WDOG" 2>/dev/null || true
+              if [ "$rc" -gt 128 ]; then
+                echo "=== HANG/SIGNAL (rc=$rc) $BIN :: $t"
+                ps auxf || true
+                exit 124
+              fi
+              [ "$rc" = 0 ] || { echo "=== FAIL (rc=$rc) $BIN :: $t"; exit "$rc"; }
+            done
+          done
+          if command -v timeout >/dev/null; then
+            timeout 300 cargo test -p libtfs-preload --doc
+          else
+            cargo test -p libtfs-preload --doc
+          fi
+
+      - name: clippy
+        working-directory: tebako-rs
+        env:
+          DWARFS_RS_VCPKG_ROOT: ${{ github.workspace }}/.vcpkg-root
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test-pure-cargo:
+    name: test (--no-default-features, ubuntu)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: tebako-rs
+
+      # tfs's optional dwarfs-t path dependency must resolve even with the
+      # feature off, so the sibling checkout is still required.
+      - name: Checkout dwarfs-rs (sibling path dep)
+        uses: actions/checkout@v4
+        with:
+          repository: tamatebako/dwarfs-rs
+          path: dwarfs-rs
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@1.94.1
+        with:
+          components: clippy
+      # The no-dwarfs configuration must stay buildable and testable
+      # without any vcpkg involvement (dwarfs mounts then fail ENOTSUP).
+      - name: cargo test (no default features)
+        working-directory: tebako-rs
+        run: cargo test -p tfs --no-default-features
+
+  # The pure-Rust crates compile and test on the real platform (TODO.v2-1/03):
+  # no vcpkg anywhere in this job — tfs/sqfs/rnp are all out of the graph.
+  # This is where the Windows ports (bootstrap platform.rs, shim link
+  # layer) are proven; the vendored-dwarfs Windows build (TODO.v2-1/04)
+  # is the release leg's story, not this job's.
+  test-windows:
+    name: test (windows-latest)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: tebako-rs
+
+      # tpkg/tfs path deps resolve at manifest level (no submodules needed).
+      - name: Checkout dwarfs-rs (sibling path dep)
+        uses: actions/checkout@v4
+        with:
+          repository: tamatebako/dwarfs-rs
+          path: dwarfs-rs
+
+      - uses: dtolnay/rust-toolchain@1.94.1
+        with:
+          components: clippy
+
+      - name: cargo test (pure-Rust crates)
+        working-directory: tebako-rs
+        run: cargo test -p tebako-bootstrap -p tebako-shim -p tebako-resolve -p tebako-http -p tebako-term -p tebako-json -p tpkg -p tebako-bench
+
+      - name: clippy (pure-Rust crates)
+        working-directory: tebako-rs
+        run: cargo clippy -p tebako-bootstrap -p tebako-shim -p tebako-resolve -p tebako-http -p tebako-term -p tebako-json -p tpkg -p tebako-bench --all-targets -- -D warnings
+
+  # The bootstrap on the target the release binaries actually ship on
+  # (x86_64-pc-windows-gnu, ucrt64 — TODO.prepublish/03). ring does not
+  # compile under mingw, so the HTTP stack rides rustls/aws-lc-rs there
+  # (tebako-http's target-split provider); this leg proves that stack
+  # builds, tests, and stays under the standing < 3 MiB size gate on the
+  # real ucrt64 toolchain. All logic lives in ci/windows-gnu-bootstrap.sh
+  # (closed PATH, RUSTFLAGS, serialized tests, size gate) — never inline
+  # run-blocks.
+  test-windows-gnu-bootstrap:
+    name: test (windows-latest, x86_64-pc-windows-gnu, tebako-bootstrap)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: tebako-rs
+
+      # tpkg/tfs path deps resolve at manifest level (no submodules needed).
+      - name: Checkout dwarfs-rs (sibling path dep)
+        uses: actions/checkout@v4
+        with:
+          repository: tamatebako/dwarfs-rs
+          path: dwarfs-rs
+
+      # ONE toolchain across the ecosystem (the factory's ruby link uses
+      # the same ucrt64 gcc); setup-msys2's /usr/bin stays OFF PATH —
+      # the script's closed PATH takes Git's coreutils instead.
+      - name: Set up MSys2 (ucrt64 toolchain)
+        uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
+        with:
+          msystem: ucrt64
+          path-type: minimal
+          install: mingw-w64-ucrt-x86_64-toolchain
+
+      - uses: dtolnay/rust-toolchain@1.94.1
+        with:
+          targets: x86_64-pc-windows-gnu
+
+      - name: bootstrap tests + size gate (windows-gnu)
+        working-directory: tebako-rs
+        shell: bash
+        run: bash ci/windows-gnu-bootstrap.sh
+
+  # tebako-shim + tebako-resolve on the target the release binaries ship
+  # on (x86_64-pc-windows-gnu, ucrt64 — TODO.prepublish/03), mirroring
+  # the bootstrap leg. tebako-resolve rides along: its gix/reqwest TLS
+  # rides rustls/aws-lc-rs on this target (ring does not compile under
+  # mingw — the tebako-http provider split, commit 8de4335), proven here
+  # on the real toolchain. All logic lives in ci/windows-gnu-shim.sh.
+  test-windows-gnu-shim:
+    name: test (windows-latest, x86_64-pc-windows-gnu, tebako-shim)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: tebako-rs
+
+      # tpkg/tfs path deps resolve at manifest level (no submodules needed).
+      - name: Checkout dwarfs-rs (sibling path dep)
+        uses: actions/checkout@v4
+        with:
+          repository: tamatebako/dwarfs-rs
+          path: dwarfs-rs
+
+      # ONE toolchain across the ecosystem (the factory's ruby link uses
+      # the same ucrt64 gcc); setup-msys2's /usr/bin stays OFF PATH —
+      # the script's closed PATH takes Git's coreutils instead.
+      - name: Set up MSys2 (ucrt64 toolchain)
+        uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
+        with:
+          msystem: ucrt64
+          path-type: minimal
+          install: mingw-w64-ucrt-x86_64-toolchain
+
+      - uses: dtolnay/rust-toolchain@1.94.1
+        with:
+          targets: x86_64-pc-windows-gnu
+
+      - name: shim + resolve tests (windows-gnu)
+        working-directory: tebako-rs
+        shell: bash
+        run: bash ci/windows-gnu-shim.sh
+
+  # The full-stack product crates on the same target (TODO.prepublish/03):
+  # tebako-cli, tfs-cli and tebako-pkg — tfs vendored-dwarfs (dwarfs-t-sys's
+  # CMake/vcpkg build against the
+  # x64-mingw-static baseline, the dwarfs-rs leg's proven setup) and
+  # tebako-signer's vendored rnp/Botan (gcc-steered in the script) —
+  # then the serialized test run. The vcpkg baseline restore/archive
+  # cache mirrors the release link-unit leg; all build/test logic lives
+  # in ci/windows-gnu-cli.sh.
+  test-windows-gnu-cli:
+    name: test (windows-latest, x86_64-pc-windows-gnu, tebako-cli + tfs-cli + tebako-pkg)
+    runs-on: windows-latest
+    permissions:
+      # packages:write populates the org's GitHub Packages vcpkg binary
+      # cache (ci/vcpkg-nuget-cache.sh); fork PRs are auto-downgraded to
+      # read-only, where pushes degrade to a non-fatal vcpkg note.
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: tebako-rs
+
+      # The vendored dwarfs-t build needs the submodule content.
+      - name: Checkout dwarfs-rs (sibling path dep)
+        uses: actions/checkout@v4
+        with:
+          repository: tamatebako/dwarfs-rs
+          path: dwarfs-rs
+          submodules: recursive
+
+      - name: Restore the vcpkg baseline (dwarfs-t is the single writer)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # Never fails the leg: a miss means the ports build normally.
+        # The script owns the canonical root (C:/vcpkg-inst — also the
+        # MAX_PATH dodge) and exports DWARFS_RS_VCPKG_INSTALLED_DIR.
+        run: |
+          bash dwarfs-rs/dwarfs-t/ci/vcpkg-baseline-restore.sh \
+            dwarfs-rs/dwarfs-t x64-mingw-static \
+            || echo "baseline miss — ports build normally"
+
+      # cmake + ninja come from the ucrt64 toolchain (the dwarfs-rs leg's
+      # proven shape): the script's closed PATH excludes every other bin
+      # dir, so get-cmake's paths would be dead. `make` is the ucrt64
+      # mingw32-make (rnp's Botan spawns plain `make` — the script shims
+      # it onto the closed PATH).
+      - name: Set up MSys2 (ucrt64 toolchain + cmake/ninja)
+        uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
+        with:
+          msystem: ucrt64
+          path-type: minimal
+          install: mingw-w64-ucrt-x86_64-toolchain mingw-w64-ucrt-x86_64-cmake mingw-w64-ucrt-x86_64-ninja mingw-w64-ucrt-x86_64-gdb mingw-w64-ucrt-x86_64-make
+
+      - uses: dtolnay/rust-toolchain@1.94.1
+        with:
+          targets: x86_64-pc-windows-gnu
+
+      - name: Set up vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT }}
+          vcpkgDirectory: ${{ github.workspace }}/.vcpkg-root
+
+      # See the test job: run-vcpkg's injected x-gha spec is zero binary
+      # cache since vcpkg 2025.06 removed the provider; the org's GitHub
+      # Packages NuGet feed replaces it (ci/vcpkg-nuget-cache.sh).
+      - name: Configure the vcpkg binary cache (GitHub Packages NuGet)
+        working-directory: tebako-rs
+        shell: bash
+        env:
+          # First-push of a new package id CANNOT be done by GITHUB_TOKEN
+          # (GitHub quirk: 403 on creation; community#159893) — the org
+          # secret (classic PAT, write:packages) owns creation when present;
+          # GITHUB_TOKEN remains the read path and the whole fallback.
+          GH_TOKEN: ${{ secrets.TEBAKO_PACKAGES_PAT || secrets.GITHUB_TOKEN }}
+        run: bash ci/vcpkg-nuget-cache.sh
+
+      - name: Cache the cargo target dir
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+        with:
+          workspaces: |
+            tebako-rs
+          # Triplet-scoped, never the default job+lockfile key — this job
+          # builds x64-mingw-static only, and the key names it.
+          key: windows-gnu-cli-x64-mingw-static
+
+      - name: cli build + tests (windows-gnu)
+        working-directory: tebako-rs
+        shell: bash
+        env:
+          DWARFS_RS_VCPKG_ROOT: ${{ github.workspace }}/.vcpkg-root
+          VCPKG_ROOT: ${{ github.workspace }}/.vcpkg-root
+        run: bash ci/windows-gnu-cli.sh
+
+      - name: Dump vcpkg build logs on failure
+        if: failure()
+        shell: bash
+        run: |
+          for f in .vcpkg-root/buildtrees/*/build-x64-mingw-static-*-err.log .vcpkg-root/buildtrees/*/install-x64-mingw-static-*-err.log; do
+            [ -f "$f" ] || continue
+            echo "=== $f ==="
+            tail -40 "$f"
+          done
+
+  fmt:
+    name: fmt
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: tebako-rs
+
+      # cargo fmt resolves the workspace; tfs's optional dwarfs-t path
+      # dependency must exist (manifests only — no submodules needed).
+      - name: Checkout dwarfs-rs (sibling path dep)
+        uses: actions/checkout@v4
+        with:
+          repository: tamatebako/dwarfs-rs
+          path: dwarfs-rs
+
+      - uses: dtolnay/rust-toolchain@1.94.1
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+        working-directory: tebako-rs

@@ -1,0 +1,225 @@
+name: Publish VSIX to VSCode Marketplace and OpenVSX
+
+on:
+  workflow_dispatch:
+    inputs:
+      isPreRelease:
+        required: true
+        type: boolean 
+        default: false
+      vscode:
+        description: Publish to VSCode marketplace
+        type: boolean
+        required: true
+        default: false
+      openVSX:
+        description: Publish to OpenVSX marketplace
+        type: boolean
+        required: true
+        default: false
+      workflowRunId:
+        required: true
+
+permissions:
+  actions: read
+  contents: write
+
+env:
+  EXTENSION_NAME: micro-integrator
+  REPO: wso2/mi-vscode
+
+jobs:
+  publish:
+    name: Publish vsix to marketplaces
+    runs-on: codebuild-wso2_vscode-extensions-${{ github.run_id }}-${{ github.run_attempt }}
+    env:
+      THREAD_KEY: mi-release-${{ github.event.inputs.workflowRunId }}
+    steps:
+      - name: Download artifact
+        id: download-artifact
+        uses: dawidd6/action-download-artifact@v2
+        with:
+          run_id: ${{ github.event.inputs.workflowRunId }}
+          name: VSIX
+
+      - name: Unzip
+        run: |
+          unzip VSIX.zip
+          rm VSIX.zip
+
+      - name: Use Node.js 20.x
+        uses: actions/setup-node@v1
+        with:
+          node-version: 20.x
+
+      - run: |
+          npm install -g vsce
+          npm install -g ovsx
+
+      - name: Get version
+        id: vsix
+        run: |
+          file=$(ls ${EXTENSION_NAME}-[0-9]*.[0-9]*.[0-9]*.vsix)
+          fileName=${file##*-}
+          version=${fileName%.*}
+          echo "vsixName=$file" >> $GITHUB_OUTPUT
+          echo "version=$version" >> $GITHUB_OUTPUT
+          if [ "${{ github.event.inputs.isPreRelease }}" == "true" ]; then
+            echo "releaseMode=--pre-release" >> $GITHUB_OUTPUT
+          else
+            echo "releaseMode=" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Publish to VSCode marketplace
+        if: ${{ github.event.inputs.vscode == 'true' }}
+        run: vsce publish -p ${{ secrets.VSCE_TOKEN }} --packagePath ${{ steps.vsix.outputs.vsixName }} ${{ steps.vsix.outputs.releaseMode }}
+
+      - name: Publish to OpenVSX marketplace
+        if: ${{ github.event.inputs.openVSX == 'true' }}
+        run: ovsx publish -p ${{ secrets.OPENVSX_TOKEN }} --packagePath ${{ steps.vsix.outputs.vsixName }} ${{ steps.vsix.outputs.releaseMode }}
+
+      - name: Promote draft release to published in ${{ env.REPO }}
+        id: create_release
+        if: ${{ github.event.inputs.isPreRelease == 'false' }}
+        run: |
+          id=`curl -X GET -H "Accept: application/vnd.github.v3+json" \
+          -H "Authorization:token ${{ github.token }}" \
+          https://api.github.com/repos/${REPO}/releases/tags/v${{ steps.vsix.outputs.version }} \
+           | jq -r .id` && \
+           updateResponse=`curl -X PATCH -H "Accept: application/vnd.github.v3+json" \
+          -H "Authorization:token ${{ github.token }}" \
+            -d '{"draft":false,"prerelease":false}' \
+            https://api.github.com/repos/${REPO}/releases/$id`
+
+          if [ $? -eq 0 ]; then
+            echo "release_created=true" >> $GITHUB_OUTPUT
+            echo "Release successfully created/updated for version v${{ steps.vsix.outputs.version }}"
+          else
+            echo "release_created=false" >> $GITHUB_OUTPUT
+            echo "Failed to create/update release for version v${{ steps.vsix.outputs.version }}"
+            exit 1
+          fi
+
+      - name: Marketplace release notification
+        run: |
+          body=$(cat << EOF
+          {
+            "thread": {"threadKey": "${THREAD_KEY}"},
+            "cards": [
+              {
+                "header": {
+                    "title": "Marketplace Release",
+                    "subtitle": "WSO2 Integrator: MI Extension"
+                },
+                "sections": [
+                  {
+                    "widgets": [
+                      {
+                        "keyValue": {
+                          "topLabel": "VSCode Marketplace",
+                          "content": "v${{ steps.vsix.outputs.version }}",
+                          "iconUrl": "https://upload.wikimedia.org/wikipedia/commons/thumb/9/9a/Visual_Studio_Code_1.35_icon.svg/512px-Visual_Studio_Code_1.35_icon.svg.png",
+                          "button": {
+                            "textButton": {
+                              "text": "View",
+                              "onClick": {
+                                "openLink": {
+                                  "url": "https://marketplace.visualstudio.com/items?itemName=WSO2.micro-integrator"
+                                }
+                              }
+                            }
+                          }
+                        }
+                      },
+                      {
+                        "keyValue": {
+                          "topLabel": "OpenVSX Marketplace",
+                          "content": "v${{ steps.vsix.outputs.version }}",
+                          "iconUrl": "https://projects.eclipse.org/sites/default/files/open-vsx-logo-withouttext.png",
+                          "button": {
+                            "textButton": {
+                              "text": "View",
+                              "onClick": {
+                                "openLink": {
+                                  "url": "https://open-vsx.org/extension/wso2/micro-integrator"
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+          EOF
+          )
+          curl \
+            -X POST \
+            -H 'Content-Type: application/json' \
+            "${{ secrets.EDITOR_TEAM_CHAT_API }}&messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD" \
+            -d "$body"
+
+      - name: Final release announcement for MI team
+        if: ${{ github.event.inputs.isPreRelease == 'false' }}
+        run: |
+          body=$(cat << EOF
+          {
+            "cards": [
+              {
+                "header": {
+                  "title": "Final Release",
+                  "subtitle": "WSO2 Integrator: MI"
+                },
+                "sections": [
+                  {
+                    "widgets": [
+                      {
+                        "keyValue": {
+                          "topLabel": "Version",
+                          "content": "v${{ steps.vsix.outputs.version }}",
+                          "iconUrl": "https://upload.wikimedia.org/wikipedia/commons/thumb/9/9a/Visual_Studio_Code_1.35_icon.svg/512px-Visual_Studio_Code_1.35_icon.svg.png",
+                          "button": {
+                            "textButton": {
+                              "text": "Download VSIX",
+                              "onClick": {
+                                "openLink": {
+                                  "url": "https://github.com/${REPO}/releases/download/v${{ steps.vsix.outputs.version }}/${{ steps.vsix.outputs.vsixName }}"
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+          EOF
+          )
+          curl \
+            -X POST \
+            -H 'Content-Type: application/json' \
+            "${{ secrets.MI_TEAM_CHAT_API }}" \
+            -d "$body"
+
+  NotifyFailure:
+    needs: [publish]
+    if: ${{ always() && contains(needs.*.result, 'failure') && github.repository == 'wso2/mi-vscode' }}
+    runs-on: codebuild-wso2_vscode-extensions-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: "Failure Notification"
+        uses: ./.github/actions/failure-notification
+        with:
+          title: "Publish Extension Failed"
+          run_id: ${{ github.run_id }}
+          chat_api: ${{ secrets.EDITOR_TEAM_CHAT_API }}
+          repository: ${{ github.repository }}
+          thread_key: mi-release-${{ github.event.inputs.workflowRunId }}

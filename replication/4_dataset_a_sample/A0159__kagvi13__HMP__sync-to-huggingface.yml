@@ -1,0 +1,45 @@
+name: Sync to Hugging Face
+
+on:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: "blog-deploy"
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout GitHub repo
+        uses: actions/checkout@v3
+        with:
+          lfs: true
+
+      - name: Install Git LFS
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git-lfs
+          git lfs install
+
+      - name: Clone Hugging Face repo
+        run: git clone https://kagvi13:${{ secrets.HF_TOKEN }}@huggingface.co/kagvi13/HMP hf_repo
+
+      - name: Sync files excluding .git, .github, hf_repo
+        run: |
+          rsync -av --delete --exclude='.git' --exclude='.github' --exclude='hf_repo' ./ hf_repo/
+
+
+      - name: Commit and push to Hugging Face
+        run: |
+          cd hf_repo
+          git config user.email "action@github.com"
+          git config user.name "GitHub Action"
+          git lfs track "*.png"
+          git add .gitattributes || true
+          git add .
+          git commit -m "Sync from GitHub with Git LFS" || echo "Nothing to commit"
+          git push

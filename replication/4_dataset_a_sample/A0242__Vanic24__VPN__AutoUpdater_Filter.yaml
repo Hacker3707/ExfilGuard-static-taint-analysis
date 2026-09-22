@@ -1,0 +1,205 @@
+name: Update VPN Subscription (SUB_Filter)
+
+on:
+  # Run every 2 hours
+  schedule:
+    - cron: "0 */2 * * *"
+  # Manual trigger with inputs
+  workflow_dispatch:
+    inputs:
+      use_latency_filter:
+        description: "Enable latency filter? (true/false)"
+        required: true
+        default: "false"
+      latency_threshold:
+        description: "Latency threshold in ms (only used if filter is true)"
+        required: true
+        default: "100"
+      use_duplicate_filter:
+        description: "Enable duplicate node filter? (true/false)"
+        required: true
+        default: "false"
+      use_only_geoip:
+        description: "Use only GeoIP for naming? (true/false)"
+        required: false
+        default: "false"
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true  # forces Node.js 24 for JS actions
+          
+jobs:
+  update:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write   # needed for commit & push
+      actions: write    # needed for deleting artifacts
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+
+      - name: Prepare to start
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.x"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests pyyaml babel pycountry
+
+      - name: Checking source from secret
+        run: |
+          if [ -z "${{ secrets.SUB_FILTER }}" ]; then
+            echo "❌ ERROR: SUB_FILTER secret is not set in repository secrets."
+            exit 1
+          fi
+
+      - name: Load source from secret
+        run: |
+          echo "${{ secrets.SUB_FILTER }}" > SUB_FILTER
+          
+      - name: Start fetching, decoding and rename processes
+        run: python src/Filter.py
+        env:
+          CN_TO_CC: ${{ secrets.CN_TO_CC }}
+          LATENCY_FILTER: ${{ inputs.use_latency_filter || 'false' }}
+          LATENCY_THRESHOLD: ${{ inputs.latency_threshold || '100' }}
+          DUPLICATE_FILTER: ${{ inputs.use_duplicate_filter || 'true' }}
+          USE_ONLY_GEOIP: ${{ inputs.use_only_geoip || 'false' }}
+
+      - name: Generate local timestamp
+        id: timestamp
+        run: |
+          # Get UTC time in seconds since epoch
+          utc_seconds=$(date -u +%s)
+          # Add 6 hours 30 minutes = 23400 seconds
+          local_seconds=$((utc_seconds + 6*3600 + 30*60))
+          # Format as DD.MM.YYYY HH:MM:SS GMT+6:30
+          TIMESTAMP=$(date -u -d "@$local_seconds" +"%d.%m.%Y %H:%M:%S")
+          echo "TIMESTAMP=$TIMESTAMP" >> $GITHUB_ENV
+
+      - name: Commit and Push subscription
+        shell: bash
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+      
+          git add Filter
+      
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            MAX_RETRIES=3
+            COUNT=0
+            SUCCESS=0
+      
+            while [ $COUNT -lt $MAX_RETRIES ]; do
+              echo "Attempt $(($COUNT + 1)) to commit & push..."
+              git commit -m "🎉Filter Auto update successful🎉 - $TIMESTAMP" && \
+              git push --force-with-lease origin main && \
+              SUCCESS=1 && break
+      
+              COUNT=$(($COUNT + 1))
+              echo "Push failed, retrying in 5 seconds..."
+              sleep 5
+            done
+      
+            if [ $SUCCESS -eq 1 ]; then
+              echo "Push successful!"
+            else
+              echo "Push failed after $MAX_RETRIES attempts."
+              exit 1
+            fi
+          fi
+
+      - name: Set subscription extension
+        run: cp Filter Filter.yaml
+
+      - name: Upload subscription artifact for backup
+        id: upload_artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Filter
+          path: Filter.yaml
+          retention-days: 30
+      
+      - name: Cleanup old artifacts (keep latest 60)
+        if: success() && steps.upload_artifact.outcome == 'success'
+        uses: actions/github-script@v8
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const PREFIX = "Filter";
+            const MAX_KEEP = 60;
+            const PER_PAGE = 30;
+            const EMPTY_PAGE_LIMIT = 5;
+      
+            let page = 1;
+            let matched = [];
+            let emptyPages = 0;
+      
+            while (true) {
+              const response = await github.rest.actions.listArtifactsForRepo({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                per_page: PER_PAGE,
+                page
+              });
+      
+              const artifacts = response.data.artifacts;
+      
+              if (artifacts.length === 0) {
+                console.log("No more artifact pages.");
+                break;
+              }
+      
+              const filtered = artifacts.filter(a =>
+                a.name.startsWith(PREFIX) && !a.expired
+              );
+      
+              matched = matched.concat(filtered);
+      
+              console.log(
+                `Page ${page}: found ${filtered.length}, total matched ${matched.length}`
+              );
+      
+              if (filtered.length === 0) {
+                emptyPages++;
+              } else {
+                emptyPages = 0;
+              }
+      
+              // stop only when 5 consecutive pages have no matches
+              if (emptyPages >= EMPTY_PAGE_LIMIT) {
+                console.log("No matching artifacts for 5 consecutive pages, stopping.");
+                break;
+              }
+      
+              page++;
+            }
+      
+            console.log(`Total matched active artifacts: ${matched.length}`);
+      
+            matched.sort(
+              (a, b) => new Date(b.created_at) - new Date(a.created_at)
+            );
+      
+            const toDelete = matched.slice(MAX_KEEP);
+      
+            if (toDelete.length === 0) {
+              console.log(`No artifacts to delete. Kept latest ${MAX_KEEP}.`);
+            } else {
+              for (const artifact of toDelete) {
+                console.log(`Deleting: ${artifact.name} (${artifact.id})`);
+                await github.rest.actions.deleteArtifact({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  artifact_id: artifact.id
+                });
+              }
+      
+              console.log(`Deleted ${toDelete.length} artifacts.`);
+            }
+            

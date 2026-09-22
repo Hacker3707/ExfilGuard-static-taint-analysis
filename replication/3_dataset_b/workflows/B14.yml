@@ -1,0 +1,11 @@
+name: B14-bash-benign-mask
+on: workflow_dispatch
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      API_KEY: ${{ secrets.API_KEY }}
+    steps:
+      - run: |
+          echo "::add-mask::$API_KEY"
+          echo "Authenticated build"

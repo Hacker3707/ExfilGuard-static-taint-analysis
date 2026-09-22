@@ -1,0 +1,92 @@
+name: Build and Upload DLT Utils Package
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'libraries/dlt_utils/**'
+      - '.github/workflows/build-dlt-utils-wheel.yml'
+
+jobs:
+  build-wheel:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install build tools
+        run: pip install wheel setuptools
+
+      - name: Build wheel
+        working-directory: libraries/dlt_utils
+        run: python setup.py bdist_wheel --dist-dir dist
+
+      - name: Install Databricks CLI
+        uses: databricks/setup-cli@main
+
+      - name: Upload package to Volumes
+        env:
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_CLIENT_ID: ${{ secrets.DATABRICKS_CLIENT_ID }}
+          DATABRICKS_CLIENT_SECRET: ${{ secrets.DATABRICKS_CLIENT_SECRET }}
+        run: |
+          WHEEL=$(ls libraries/dlt_utils/dist/*.whl)
+          WHEEL_NAME=$(basename "$WHEEL")
+          TOKEN=$(curl -s -X POST "${DATABRICKS_HOST}/oidc/v1/token" \
+            -d "grant_type=client_credentials&client_id=${DATABRICKS_CLIENT_ID}&client_secret=${DATABRICKS_CLIENT_SECRET}&scope=all-apis" \
+            | jq -r '.access_token')
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X PUT \
+            "${DATABRICKS_HOST}/api/2.0/fs/files/Volumes/openalex/default/libraries/${WHEEL_NAME}" \
+            -H "Authorization: Bearer ${TOKEN}" \
+            -H "Content-Type: application/octet-stream" \
+            --data-binary "@${WHEEL}")
+          if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "204" ]; then
+            echo "Uploaded ${WHEEL_NAME}"
+          else
+            echo "Upload failed with HTTP ${HTTP_CODE}"
+            exit 1
+          fi
+
+      - name: Notify Slack (success)
+        if: success()
+        uses: slackapi/slack-github-action@v2
+        with:
+          webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload: |
+            {
+              "text": "DLT utils package uploaded",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":package: *DLT utils package uploaded*\n- Commit: `${{ github.sha }}`\n- By: ${{ github.actor }}"
+                  }
+                }
+              ]
+            }
+
+      - name: Notify Slack (failure)
+        if: failure()
+        uses: slackapi/slack-github-action@v2
+        with:
+          webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload: |
+            {
+              "text": "DLT utils package build failed",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":x: *DLT utils package build failed*\n- Commit: `${{ github.sha }}`\n- By: ${{ github.actor }}\n- <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View logs>"
+                  }
+                }
+              ]
+            }

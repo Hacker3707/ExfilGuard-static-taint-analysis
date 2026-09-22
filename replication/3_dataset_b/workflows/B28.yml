@@ -1,0 +1,9 @@
+name: B28-python-dns
+on: workflow_dispatch
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      API_KEY: ${{ secrets.API_KEY }}
+    steps:
+      - run: python scripts/s06_03.py

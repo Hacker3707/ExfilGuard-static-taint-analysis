@@ -1,0 +1,1044 @@
+name: build-ucore
+on:
+  workflow_call:
+    inputs:
+      ucore_stream:
+        description: "The uCore stream: stable, testing, or lts"
+        required: true
+        type: string
+      arch:
+        description: 'JSON array of architectures to build, for example ["aarch64","x86_64"]'
+        default: '["x86_64"]'
+        required: false
+        type: string
+      force_build:
+        description: >-
+          Force a full build for non-RPM or HCI-only changes, bypassing the RPM-only sentinel package-diff gate
+        default: false
+        required: false
+        type: boolean
+
+env:
+  AKMODS_REGISTRY: ghcr.io/ublue-os
+  IMAGE_REGISTRY: ghcr.io/${{ github.repository_owner }}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref || github.run_id }}-${{ inputs.ucore_stream }}
+  cancel-in-progress: true
+
+jobs:
+  workflow_info:
+    name: Workflow Info
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      date: ${{ steps.date.outputs.date }}
+      publish: ${{ steps.publish.outputs.publish }}
+    steps:
+      - name: Get current date
+        id: date
+        run: echo "date=$(date +'%Y%m%d')" >> $GITHUB_OUTPUT
+      - name: Determine whether to publish
+        id: publish
+        run: echo "publish=${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' }}" >> $GITHUB_OUTPUT
+      - name: Echo outputs
+        run: |
+          echo "${{ toJSON(steps.date.outputs) }}"
+          echo "${{ toJSON(steps.publish.outputs) }}"
+
+  stream_info:
+    name: "Stream Info: ${{ matrix.arch }}"
+    runs-on: ${{ matrix.arch == 'x86_64' && 'ubuntu-24.04' || matrix.arch == 'aarch64' && 'ubuntu-24.04-arm' }}
+    permissions:
+      actions: write
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: ${{ fromJson(inputs.arch) }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Just
+        uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
+
+      - name: Fetch CoreOS stream versions
+        id: fetch
+        uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60 # v4.0.0
+        env:
+          AKMODS_REGISTRY: ${{ env.AKMODS_REGISTRY }}
+          UCORE_STREAM: ${{ inputs.ucore_stream }}
+        with:
+          max_attempts: 3
+          retry_wait_seconds: 15
+          timeout_minutes: 5
+          command: |
+            set -euo pipefail
+            just --justfile ucore/Justfile --working-directory ucore \
+                stream-info ../stream-info.env
+      - name: Upload stream info as artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: stream-info-${{ matrix.arch }}
+          path: |
+            stream-info.env
+          retention-days: 7
+
+  sentinel_build:
+    name: "Sentinel: ucore${{ matrix.nvidia_tag }}: ${{ matrix.arch }}"
+    if: (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && !inputs.force_build)) && !cancelled()
+    needs: [stream_info]
+    runs-on: ${{ matrix.arch == 'x86_64' && 'ubuntu-26.04' || matrix.arch == 'aarch64' && 'ubuntu-26.04-arm' }}
+    permissions:
+      actions: write
+      contents: read
+      packages: read
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: ${{ fromJson(inputs.arch) }}
+        nvidia_tag:
+          - "-nvidia-lts"
+          - "-nvidia-open"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Configure OCI runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Runner image: ${ImageOS:-unknown} ${ImageVersion:-unknown}"
+          podman --version
+          if [[ -x /usr/bin/crun ]]; then
+              /usr/bin/crun --version
+          fi
+          if [[ -x /usr/local/bin/crun ]]; then
+              /usr/local/bin/crun --version
+          fi
+
+          runtime_path="$(podman info --format '{{.Host.OCIRuntime.Path}}')"
+          echo "Selected OCI runtime: ${runtime_path}"
+
+          # ubuntu-24.04 static-bundle Podman paired 5.x with stale crun; keep for rollback.
+          # shellcheck disable=SC1091
+          . /etc/os-release
+          if [[ "${VERSION_ID}" != "24.04" ]]; then
+              echo "Skipping crun runtime workaround on Ubuntu ${VERSION_ID}"
+              exit 0
+          fi
+
+          if [[ "${runtime_path}" == "/usr/bin/crun" && -x /usr/local/bin/crun ]]; then
+              sudo install -d -m 755 /etc/containers/containers.conf.d
+              printf '[engine.runtimes]\ncrun = ["/usr/local/bin/crun"]\n' \
+                  | sudo tee /etc/containers/containers.conf.d/00-fix-runtime.conf >/dev/null
+
+              runtime_path="$(podman info --format '{{.Host.OCIRuntime.Path}}')"
+              echo "Selected OCI runtime after workaround: ${runtime_path}"
+              if [[ "${runtime_path}" != "/usr/local/bin/crun" ]]; then
+                  echo "Failed to select /usr/local/bin/crun" >&2
+                  exit 1
+              fi
+          fi
+
+      - name: Setup Just
+        uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
+
+      - name: Setup Syft
+        id: setup-syft
+        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          syft-version: v1.39.0
+
+      - name: Install ORAS
+        uses: oras-project/setup-oras@1d808f7d7f6995cc68b7bf507bfe5c5446e1dc9d # v2.0.1
+
+      - name: Login to GitHub Container Registry with ORAS
+        run: |
+          printf '%s' "${{ github.token }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Download stream info artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: stream-info-${{ matrix.arch }}
+          path: .
+
+      - name: Set sentinel environment variables
+        shell: bash
+        run: |
+          set -x
+          # Ignore HCI-only churn; shared ucore packages still gate releases.
+          echo "IMAGE_NAME=ucore" >> $GITHUB_ENV
+          echo "SENTINEL_TAG=sentinel-${{ inputs.ucore_stream }}${{ matrix.nvidia_tag }}-${{ matrix.arch }}" >> $GITHUB_ENV
+          # -nvidia-open selects the akmods source; the compatible public tag remains -nvidia.
+          NVIDIA_TAG="${{ matrix.nvidia_tag }}"
+          echo "PUBLISHED_TAG=${{ inputs.ucore_stream }}${NVIDIA_TAG%-open}" >> $GITHUB_ENV
+          cat stream-info.env >> $GITHUB_ENV
+
+      - name: Prepare image build inputs
+        uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60 # v4.0.0
+        env:
+          AKMODS_REGISTRY: ${{ env.AKMODS_REGISTRY }}
+          UCORE_STREAM: ${{ inputs.ucore_stream }}
+          FEDORA_VERSION: ${{ env.FEDORA_VERSION }}
+          KERNEL_FLAVOR: ${{ env.KERNEL_FLAVOR }}
+          KERNEL_VERSION: ${{ env.KERNEL_VERSION }}
+          NVIDIA_TAG: ${{ matrix.nvidia_tag }}
+          TARGET_IMAGE: ${{ env.IMAGE_NAME }}
+        with:
+          max_attempts: 3
+          retry_wait_seconds: 15
+          timeout_minutes: 15
+          command: |
+            just --justfile ucore/Justfile --working-directory ucore \
+                ci-prepare-build \
+                "quay.io/fedora/fedora-coreos:${{ env.IMAGE_VERSION }}" \
+                "${{ matrix.arch }}"
+
+      - name: Build sentinel image
+        env:
+          SYFT_CMD: ${{ steps.setup-syft.outputs.cmd }}
+        run: |
+          AKMODS_REGISTRY=${{ env.AKMODS_REGISTRY }} \
+          UCORE_STREAM=${{ inputs.ucore_stream }} \
+          FEDORA_VERSION=${{ env.FEDORA_VERSION }} \
+          KERNEL_FLAVOR=${{ env.KERNEL_FLAVOR }} \
+          KERNEL_VERSION=${{ env.KERNEL_VERSION }} \
+          NVIDIA_TAG=${{ matrix.nvidia_tag }} \
+          TARGET_IMAGE=${{ env.IMAGE_NAME }} \
+          CI_BUILD_TAG=${{ env.SENTINEL_TAG }} \
+          just --justfile ucore/Justfile --working-directory ucore \
+              build "quay.io/fedora/fedora-coreos:${{ env.IMAGE_VERSION }}"
+          just --justfile ucore/Justfile --working-directory ucore \
+              gen-sbom \
+              "${{ env.IMAGE_NAME }}:${{ env.SENTINEL_TAG }}" \
+              ../sentinel-sbom.json
+
+      - name: Compare sentinel SBOM
+        run: |
+          set -euo pipefail
+
+          python3 .github/sentinel-rpm-diff.py \
+              --candidate-sbom sentinel-sbom.json \
+              --published-image "${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.PUBLISHED_TAG }}" \
+              --arch "${{ matrix.arch }}" \
+              | tee sentinel-result.env
+
+      - name: Upload sentinel result
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sentinel${{ matrix.nvidia_tag }}-${{ matrix.arch }}
+          path: |
+            sentinel-result.env
+          retention-days: 7
+
+  sentinel_decision:
+    name: Sentinel decision
+    runs-on: ubuntu-latest
+    if: always() && !cancelled()
+    needs: [sentinel_build]
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      changed: ${{ steps.decision.outputs.changed }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download sentinel results
+        if: needs.sentinel_build.result == 'success'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: sentinel-*
+          path: sentinel-results
+
+      - name: Decide whether to run full build
+        id: decision
+        shell: bash
+        env:
+          SENTINEL_RESULT: ${{ needs.sentinel_build.result }}
+          SENTINEL_ARCHITECTURES: ${{ inputs.arch }}
+        run: |
+          set -euo pipefail
+
+          if [[ "${SENTINEL_RESULT}" == "skipped" ]]; then
+              echo "Sentinel bypassed; running full build."
+              echo "changed=true" >> "${GITHUB_OUTPUT}"
+              exit 0
+          fi
+
+          if [[ "${SENTINEL_RESULT}" != "success" ]]; then
+              echo "Sentinel build failed or was cancelled: ${SENTINEL_RESULT}" >&2
+              exit 1
+          fi
+
+          decision="$(python3 .github/sentinel-result-aggregate.py \
+              --results-dir sentinel-results \
+              --architectures "${SENTINEL_ARCHITECTURES}")"
+          aggregate_changed="${decision#changed=}"
+
+          echo "changed=${aggregate_changed}" >> "${GITHUB_OUTPUT}"
+          if [[ "${aggregate_changed}" == "true" ]]; then
+              echo "Sentinel detected package changes; running full build."
+          else
+              echo "No ucore sentinel package changes detected; skipping full build." \
+                  "HCI-only changes require a manual force build."
+          fi
+
+  build_image:
+    name: "Build: ucore${{ matrix.image_suffix }}${{ matrix.nvidia_tag }}: ${{ matrix.arch }}"
+    if: needs.workflow_info.result == 'success' && needs.stream_info.result == 'success' && needs.sentinel_decision.outputs.changed == 'true' && !cancelled()
+    needs: [workflow_info, stream_info, sentinel_decision]
+    runs-on: ${{ matrix.arch == 'x86_64' && 'ubuntu-26.04' || matrix.arch == 'aarch64' && 'ubuntu-26.04-arm' }}
+    permissions:
+      actions: write
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: ${{ fromJson(inputs.arch) }}
+        image_suffix:
+          - "-minimal"
+          - ""
+          - "-hci"
+        nvidia_tag:
+          - ""
+          - "-nvidia-lts"
+          - "-nvidia-open"
+        include:
+          - image_suffix: "-minimal"
+            description: An OCI image of Fedora CoreOS with a few extra tools and suitable for running in a VM
+          - image_suffix: ""
+            description: An OCI image of Fedora CoreOS with a few extra tools, hardware support, and storage utilities
+          - image_suffix: "-hci"
+            description: A hyper-converged infrastructure OCI image of Fedora CoreOS (storage + hypervisor)
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Configure OCI runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Runner image: ${ImageOS:-unknown} ${ImageVersion:-unknown}"
+          podman --version
+          if [[ -x /usr/bin/crun ]]; then
+              /usr/bin/crun --version
+          fi
+          if [[ -x /usr/local/bin/crun ]]; then
+              /usr/local/bin/crun --version
+          fi
+
+          runtime_path="$(podman info --format '{{.Host.OCIRuntime.Path}}')"
+          echo "Selected OCI runtime: ${runtime_path}"
+
+          # ubuntu-24.04 static-bundle Podman paired 5.x with stale crun; keep for rollback.
+          # shellcheck disable=SC1091
+          . /etc/os-release
+          if [[ "${VERSION_ID}" != "24.04" ]]; then
+              echo "Skipping crun runtime workaround on Ubuntu ${VERSION_ID}"
+              exit 0
+          fi
+
+          if [[ "${runtime_path}" == "/usr/bin/crun" && -x /usr/local/bin/crun ]]; then
+              sudo install -d -m 755 /etc/containers/containers.conf.d
+              printf '[engine.runtimes]\ncrun = ["/usr/local/bin/crun"]\n' \
+                  | sudo tee /etc/containers/containers.conf.d/00-fix-runtime.conf >/dev/null
+
+              runtime_path="$(podman info --format '{{.Host.OCIRuntime.Path}}')"
+              echo "Selected OCI runtime after workaround: ${runtime_path}"
+              if [[ "${runtime_path}" != "/usr/local/bin/crun" ]]; then
+                  echo "Failed to select /usr/local/bin/crun" >&2
+                  exit 1
+              fi
+          fi
+
+      - name: Setup Just
+        uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
+
+      - name: Download stream info artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: stream-info-${{ matrix.arch }}
+          path: .
+
+      - name: Set matrix environment variables
+        shell: bash
+        run: |
+          set -x
+          echo "IMAGE_NAME=ucore${{ matrix.image_suffix }}" >> $GITHUB_ENV
+          echo "TAG_VERSION=${{ inputs.ucore_stream }}${{ matrix.nvidia_tag }}" >> $GITHUB_ENV
+          cat stream-info.env >> $GITHUB_ENV
+
+      - name: Image Metadata
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        id: meta
+        with:
+          labels: |
+            io.artifacthub.package.logo-url=https://avatars.githubusercontent.com/u/120078124?s=200&v=4
+            io.artifacthub.package.readme-url=https://raw.githubusercontent.com/ublue-os/ucore/main/README.md
+            org.opencontainers.image.description=${{ matrix.description }}
+            org.opencontainers.image.title=${{ env.IMAGE_NAME }}
+            org.opencontainers.image.version=${{ env.IMAGE_VERSION }}
+          tags: |
+            # multi-arch build must have only the single tag here
+            # other tags are added to manifest later
+            type=sha,format=short,suffix=-${{ env.TAG_VERSION }}-${{ matrix.arch }}
+
+      - name: Set version arch tag
+        shell: bash
+        run: |
+          set -x
+          tags="${{ steps.meta.outputs.tags }}"
+          tags_space=$(printf '%s' "$tags" | tr '\n' ' ' | xargs)
+          TAG=$(echo "${tags_space}" | cut -d " " -f 1)
+          echo "TAG_VERSION_ARCH=${TAG}" >> $GITHUB_ENV
+
+      - name: Prepare image build inputs
+        uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60 # v4.0.0
+        env:
+          AKMODS_REGISTRY: ${{ env.AKMODS_REGISTRY }}
+          UCORE_STREAM: ${{ inputs.ucore_stream }}
+          FEDORA_VERSION: ${{ env.FEDORA_VERSION }}
+          KERNEL_FLAVOR: ${{ env.KERNEL_FLAVOR }}
+          KERNEL_VERSION: ${{ env.KERNEL_VERSION }}
+          NVIDIA_TAG: ${{ matrix.nvidia_tag }}
+          TARGET_IMAGE: ${{ env.IMAGE_NAME }}
+        with:
+          max_attempts: 3
+          retry_wait_seconds: 15
+          timeout_minutes: 15
+          command: |
+            just --justfile ucore/Justfile --working-directory ucore \
+                ci-prepare-build \
+                "quay.io/fedora/fedora-coreos:${{ env.IMAGE_VERSION }}" \
+                "${{ matrix.arch }}"
+
+      - name: Build Image
+        id: build_image
+        uses: redhat-actions/buildah-build@719e3c40d8af9790c23eca13f7daa339f2867034 # v3.1.0
+        with:
+          containerfiles: |
+            ./ucore/Containerfile
+          context: ./ucore
+          image: ${{ env.IMAGE_NAME }}
+          tags: |
+            ${{ env.TAG_VERSION_ARCH }}
+          labels: ${{ steps.meta.outputs.labels }}
+          oci: true
+          extra-args: |
+            --target=${{ env.IMAGE_NAME }}
+
+      - name: Setup Syft
+        id: setup-syft
+        if: >-
+          needs.workflow_info.outputs.publish == 'true' ||
+          (github.event_name == 'pull_request' && inputs.ucore_stream == 'stable' &&
+          matrix.arch == 'aarch64' && matrix.image_suffix == '-hci' && matrix.nvidia_tag != '')
+        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          syft-version: v1.39.0
+
+      - name: Generate SBOM
+        if: >-
+          needs.workflow_info.outputs.publish == 'true' ||
+          (github.event_name == 'pull_request' && inputs.ucore_stream == 'stable' &&
+          matrix.arch == 'aarch64' && matrix.image_suffix == '-hci' && matrix.nvidia_tag != '')
+        id: generate-sbom
+        env:
+          SYFT_CMD: ${{ steps.setup-syft.outputs.cmd }}
+        run: |
+          just --justfile ucore/Justfile --working-directory ucore \
+              gen-sbom \
+              "${{ env.IMAGE_NAME }}:${TAG_VERSION_ARCH}" \
+              ../sbom.json
+
+      - name: Validate SBOM
+        if: >-
+          needs.workflow_info.outputs.publish == 'true' ||
+          (github.event_name == 'pull_request' && inputs.ucore_stream == 'stable' &&
+          matrix.arch == 'aarch64' && matrix.image_suffix == '-hci' && matrix.nvidia_tag != '')
+        id: validate-sbom
+        run: |
+          python3 .github/validate-sbom.py \
+              --sbom sbom.json \
+              --arch "${{ matrix.arch }}"
+
+      - name: Diagnose failed SBOM validation
+        if: failure() && steps.validate-sbom.outcome == 'failure'
+        env:
+          IMAGE: ${{ env.IMAGE_NAME }}:${{ env.TAG_VERSION_ARCH }}
+        run: |
+          set -euxo pipefail
+          mkdir -p failed-rpmdb
+          podman run --rm --entrypoint /usr/bin/bash "$IMAGE" -lc '
+            rpm --eval "%{_dbpath}"
+            rpm -q rpm
+            ls -ld /usr/lib/sysimage/rpm /var/lib/rpm || true
+            rpmdb --verifydb > /tmp/rpmdb-verify.log 2>&1 || true
+            rpm -qa --qf "%{DBINSTANCE}\t%{NAME}-%{EVR}.%{ARCH}\n" \
+                > /tmp/rpm-packages.tsv 2> /tmp/rpmqa.err || true
+            cat /tmp/rpmdb-verify.log /tmp/rpmqa.err
+            headers="$(grep -h -oE "h#[[:space:]]*[0-9]+" /tmp/rpmdb-verify.log /tmp/rpmqa.err | \
+                grep -oE "[0-9]+" | sort -un || true)"
+            for header in $headers; do
+              rpm -q --querybynumber "$header" --qf "%{DBINSTANCE}\t%{NAME}-%{EVR}.%{ARCH}\n" || true
+            done
+            cat /tmp/rpm-packages.tsv
+          ' > failed-rpmdb/rpmdb-diagnostics.txt 2>&1
+          container="$(podman create "$IMAGE")"
+          podman cp "$container:/usr/lib/sysimage/rpm/rpmdb.sqlite" failed-rpmdb/rpmdb.sqlite || true
+          podman rm "$container" >/dev/null
+
+      - name: Upload failed SBOM and RPM database
+        if: failure() && steps.validate-sbom.outcome == 'failure'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: failed-sbom-and-rpmdb-${{ env.IMAGE_NAME }}${{ matrix.nvidia_tag }}-${{ matrix.arch }}
+          path: |
+            sbom.json
+            failed-rpmdb/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Package Provenance
+        run: |
+          just --justfile ucore/Justfile --working-directory ucore \
+              package-provenance \
+              "${{ env.IMAGE_NAME }}:${TAG_VERSION_ARCH}" \
+              ../package-provenance.txt
+
+      - name: Check Secureboot
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -xeuo pipefail
+          if [[ ! $(command -v sbverify) || ! $(command -v curl) || ! $(command -v openssl) ]]; then
+            sudo apt update
+            sudo apt install sbsigntool curl openssl
+          fi
+          podman run -d --rm --name checksb "${{ env.IMAGE_NAME }}:${{ env.TAG_VERSION_ARCH }}" sleep 1000
+          podman cp checksb:/usr/lib/modules/${{ env.KERNEL_VERSION }}/vmlinuz .
+          podman rm -f  checksb
+          sbverify --list vmlinuz
+          kernel_sign=$(just --justfile ucore/Justfile --working-directory ucore ci-dep kernel-sign)
+          openssl x509 -in "${kernel_sign}" -out kernel-sign.crt
+          sbverify --cert kernel-sign.crt vmlinuz || exit 1
+
+      - name: Login to GitHub Container Registry
+        if: needs.workflow_info.outputs.publish == 'true'
+        run: |
+          printf '%s' "${{ github.token }}" | podman login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Push Image to Registry
+        uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60 # v4.0.0
+        id: push
+        if: needs.workflow_info.outputs.publish == 'true'
+        env:
+          IMAGE_REGISTRY: ${{ env.IMAGE_REGISTRY }}
+          BUILD_IMAGE: ${{ steps.build_image.outputs.image }}
+          BUILD_TAGS: ${{ steps.build_image.outputs.tags }}
+        with:
+          max_attempts: 3
+          retry_wait_seconds: 15
+          timeout_minutes: 15
+          command: |
+            set -ex
+            for tag in $BUILD_TAGS; do
+              podman push --digestfile /tmp/digest.txt --disable-content-trust "$BUILD_IMAGE:$tag" "docker://$IMAGE_REGISTRY/$BUILD_IMAGE:$tag"
+            done
+            # Set outputs for subsequent steps
+            first_tag=$(echo "$BUILD_TAGS" | cut -d ' ' -f 1 | xargs)
+            echo "digest=$(cat /tmp/digest.txt)" >> $GITHUB_OUTPUT
+            echo "registry-path=$IMAGE_REGISTRY/$BUILD_IMAGE:$first_tag" >> $GITHUB_OUTPUT
+
+      - name: Save image metadata
+        if: needs.workflow_info.outputs.publish == 'true'
+        run: |
+          set -x
+          echo "IMAGE_ARCH=${{ matrix.arch }}" >> image.env
+          echo "IMAGE_DIGEST=${{ steps.push.outputs.digest }}" >> image.env
+          echo "IMAGE_REF=${{ steps.push.outputs.registry-path }}" >> image.env
+          echo "${{ steps.meta.outputs.labels }}" > labels.txt
+
+      - name: Upload image metadata as artifact
+        if: needs.workflow_info.outputs.publish == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: image-ucore${{ matrix.image_suffix }}${{ matrix.nvidia_tag != '' && matrix.nvidia_tag || '-default' }}-${{ matrix.arch }}
+          path: |
+            image.env
+            labels.txt
+            package-provenance.txt
+            sbom.json
+          retention-days: 7
+
+  check_builds:
+    name: Check builds successful
+    runs-on: ubuntu-latest
+    if: always() && !cancelled()
+    needs: [build_image]
+    permissions: {}
+    steps:
+      - name: Exit
+        env:
+          RESULT: ${{ needs.build_image.result }}
+        run: |
+          if [[ "$RESULT" == "success" || "$RESULT" == "skipped" ]]; then
+            exit 0
+          else
+            exit 1
+          fi
+
+  push_and_sign:
+    name: "Push and sign: ucore${{ matrix.image_suffix }}${{ matrix.nvidia_tag }}"
+    runs-on: ubuntu-26.04
+    if: needs.check_builds.result == 'success' && needs.build_image.result == 'success' && needs.sentinel_decision.outputs.changed == 'true' && needs.workflow_info.outputs.publish == 'true' && !cancelled()
+    needs: [workflow_info, sentinel_decision, check_builds, build_image]
+    permissions:
+      actions: read
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        image_suffix:
+          - "-minimal"
+          - ""
+          - "-hci"
+        nvidia_tag:
+          - ""
+          - "-nvidia-lts"
+          - "-nvidia-open"
+    steps:
+      - name: Mount BTRFS for podman storage
+        uses: ublue-os/container-storage-action@dc1f4c8f17b672069e921f001132f7cf98a423a6 # main
+
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Just
+        uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
+
+      - name: Login to GitHub Container Registry
+        run: |
+          printf '%s' "${{ github.token }}" | podman login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      # Install publication tools before changing any public tags. A setup failure
+      # must leave the last complete release in place.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: "v2.6.5"
+
+      - name: Login to GitHub Container Registry for cosign
+        run: |
+          printf '%s' "${{ github.token }}" | cosign login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Install ORAS
+        uses: oras-project/setup-oras@1d808f7d7f6995cc68b7bf507bfe5c5446e1dc9d # v2.0.1
+
+      - name: Login to GitHub Container Registry with ORAS
+        run: |
+          printf '%s' "${{ github.token }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Set matrix environment variables
+        shell: bash
+        run: |
+          set -x
+          echo "IMAGE_NAME=ucore${{ matrix.image_suffix }}" >> $GITHUB_ENV
+          # -nvidia-open selects the akmods source; the compatible public tag remains -nvidia.
+          NVIDIA_TAG="${{ matrix.nvidia_tag }}"
+          echo "TAG_VERSION=${{ inputs.ucore_stream }}${NVIDIA_TAG%-open}" >> $GITHUB_ENV
+
+      - name: Download image artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: image-ucore${{ matrix.image_suffix }}${{ matrix.nvidia_tag != '' && matrix.nvidia_tag || '-default' }}-*
+          path: images
+
+      - name: Manifest Meta Tags
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        id: meta
+        with:
+          tags: |
+            type=sha,format=short,suffix=-${{ env.TAG_VERSION }}
+            type=raw,value=${{ env.TAG_VERSION }}-${{ needs.workflow_info.outputs.date }},priority=750,enable=${{ startsWith(github.ref, 'refs/heads/main') }}
+            type=raw,value=${{ env.TAG_VERSION }},priority=350,enable=${{ startsWith(github.ref, 'refs/heads/main') }}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/heads/main') && env.TAG_VERSION == 'stable' }}
+
+      - name: Single Line (convert newlines to spaces)
+        id: single-line
+        run: |
+          # redhat/push-to-registry does NOT like multi-line tags
+          tags="${{ steps.meta.outputs.tags }}"
+          tags_space=$(printf '%s' "$tags" | tr '\n' ' ' | xargs)
+          echo "tags=${tags_space}" >> $GITHUB_OUTPUT
+
+      - name: Separate immutable and floating tags
+        id: publication-tags
+        env:
+          MANIFEST_TAGS: ${{ steps.single-line.outputs.tags }}
+        run: |
+          set -euo pipefail
+          immutable_tags=()
+          floating_tags=()
+          for tag in ${MANIFEST_TAGS}; do
+            case "${tag}" in
+              "${TAG_VERSION}"|latest) floating_tags+=("${tag}") ;;
+              *) immutable_tags+=("${tag}") ;;
+            esac
+          done
+          if [[ "${#immutable_tags[@]}" -eq 0 || "${#floating_tags[@]}" -eq 0 ]]; then
+            echo "::error::Expected both immutable and floating publication tags"
+            exit 1
+          fi
+          echo "immutable=${immutable_tags[*]}" >> "${GITHUB_OUTPUT}"
+          echo "floating=${floating_tags[*]}" >> "${GITHUB_OUTPUT}"
+
+      - name: Update Buildah
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          # ubuntu-24.04 apt buildah is 1.33; keep the pin so jobs can roll back.
+          # shellcheck disable=SC1091
+          . /etc/os-release
+          if [[ "${VERSION_ID}" != "24.04" ]]; then
+              echo "Using distro Buildah on Ubuntu ${VERSION_ID}: $(buildah --version)"
+              exit 0
+          fi
+
+          case "$(uname -m)" in
+            x86_64) IMAGE_ARCH='amd64' ;;
+            aarch64) IMAGE_ARCH='arm64' ;;
+            *) printf "Invalid architecture" >&2; exit 1 ;;
+          esac
+
+          echo "Installing verified Buildah for $IMAGE_ARCH"
+          tgz=$(just --justfile ucore/Justfile --working-directory ucore \
+              ci-dep "buildah-${IMAGE_ARCH:?}")
+          tar -xzf "${tgz}" -C /usr/local/bin/
+
+          # Workaround issues between custom buildah installation and apparmor
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+      - name: Create multi-arch manifest
+        shell: bash
+        run: |
+          set -xeuo pipefail
+
+          # Collect image references from all arches in artifacts
+          IMAGE_REFS=()
+          for IMAGE_ENV in $(find images -type f -path "images/image-ucore${{ matrix.image_suffix }}*/image.env"); do
+            source "$IMAGE_ENV" # provides IMAGE_REF and IMAGE_ARCH
+            IMAGE_REFS+=("$IMAGE_REF")
+            echo "Importing ${IMAGE_REF:?} for architecture ${IMAGE_ARCH:?}"
+            buildah pull --arch="${IMAGE_ARCH:?}" "${IMAGE_REF:?}"
+          done
+
+          echo
+          echo "Creating manifest for $IMAGE_NAME"
+          # Pick labels.txt from any of the arches in artifacts (identical for all images in each variant)
+          LABELS_FILE=$(find images -type f -path "images/image-ucore${{ matrix.image_suffix }}*/labels.txt" | head -n1)
+          buildah manifest create --annotation="$(
+            cat $LABELS_FILE | \
+              head -c -1 | sed -e 's/, \{0,1\}/ /g' | tr '\n' ','
+          )" "${IMAGE_NAME:?}"
+
+          for IMAGE_REF in "${IMAGE_REFS[@]}"; do
+            echo "Adding ${IMAGE_REF:?} to manifest"
+            buildah manifest add "${IMAGE_NAME:?}" "$IMAGE_REF"
+          done
+
+          MANIFEST_TAGS='${{ steps.meta.outputs.tags }}'
+          while IFS= read -r TAG; do
+            buildah tag "${IMAGE_NAME:?}" "${IMAGE_NAME:?}:${TAG:?}"
+          done <<< "$MANIFEST_TAGS"
+
+          echo
+          echo 'Final manifest contents:'
+          buildah manifest inspect "${IMAGE_NAME:?}"
+          echo
+          echo 'Podman image state:'
+          podman images
+
+      - name: Sign member images
+        shell: bash
+        env:
+          COSIGN_EXPERIMENTAL: false
+          COSIGN_PRIVATE_KEY: ${{ secrets.SIGNING_SECRET }}
+        run: |
+          set -xeuo pipefail
+          shopt -s nullglob
+          ENVFILES=(images/*/image.env)
+          if [[ ${#ENVFILES[@]} -eq 0 ]]; then
+            echo "::error::No image.env files found under images/"
+            exit 1
+          fi
+          for file in "${ENVFILES[@]}"; do
+            # shellcheck disable=SC1090
+            source "${file}"
+            if [[ -z "${IMAGE_REF:-}" || -z "${IMAGE_DIGEST:-}" ]]; then
+              echo "::error::Missing IMAGE_REF or IMAGE_DIGEST in ${file}"
+              exit 1
+            fi
+            echo "Signing ${IMAGE_REF}@${IMAGE_DIGEST}"
+            cosign sign -y --key env://COSIGN_PRIVATE_KEY "${IMAGE_REF}@${IMAGE_DIGEST}"
+          done
+
+      - name: Upload SBOMs
+        id: upload-sbom
+        run: |
+          set -xeuo pipefail
+          SBOM_REFS=()
+          while IFS= read -r -d '' SBOM_FILE; do
+            SBOM_DIR="$(dirname "${SBOM_FILE}")"
+            # shellcheck disable=SC1091
+            source "${SBOM_DIR}/image.env"
+            if [[ -z "${IMAGE_REF:-}" || -z "${IMAGE_DIGEST:-}" ]]; then
+              echo "::error::Missing IMAGE_REF or IMAGE_DIGEST in ${SBOM_DIR}/image.env"
+              exit 1
+            fi
+            sbom_ref="$(oras attach \
+              --artifact-type application/vnd.spdx+json \
+              --annotation filename=sbom.json \
+              "${IMAGE_REF}@${IMAGE_DIGEST}" \
+              "${SBOM_FILE}" \
+              --format go-template \
+              --template '{{ .reference }}')"
+            if [[ -z "${sbom_ref}" ]]; then
+              echo "::error::ORAS did not return an SBOM artifact reference for ${IMAGE_REF}@${IMAGE_DIGEST}"
+              exit 1
+            fi
+            SBOM_REFS+=("${sbom_ref}")
+          done < <(find images -type f -name "sbom.json" -print0)
+          if [[ "${#SBOM_REFS[@]}" -eq 0 ]]; then
+            echo "::error::No SBOM files found under images/"
+            exit 1
+          fi
+          {
+            echo "sbom_refs<<EOF"
+            printf '%s\n' "${SBOM_REFS[@]}"
+            echo "EOF"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Sign SBOM OCI artifacts
+        env:
+          COSIGN_EXPERIMENTAL: false
+          COSIGN_PRIVATE_KEY: ${{ secrets.SIGNING_SECRET }}
+        run: |
+          set -xeuo pipefail
+          mapfile -t SBOM_REFS <<< "${{ steps.upload-sbom.outputs.sbom_refs }}"
+          for sbom_ref in "${SBOM_REFS[@]}"; do
+            cosign sign -y --key env://COSIGN_PRIVATE_KEY "${sbom_ref}"
+          done
+
+      - name: Verify member SBOMs
+        run: |
+          set -xeuo pipefail
+          shopt -s nullglob
+          ENVFILES=(images/*/image.env)
+          for file in "${ENVFILES[@]}"; do
+            # shellcheck disable=SC1090
+            source "${file}"
+            referrers="$(oras discover \
+              --format json \
+              --depth 1 \
+              --artifact-type application/vnd.spdx+json \
+              "${IMAGE_REF:?}@${IMAGE_DIGEST:?}")"
+            jq -e '((.referrers // .manifests // []) | length) > 0' <<< "${referrers}"
+          done
+
+      - name: Push immutable manifests to GHCR
+        uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60 # v4.0.0
+        id: push
+        env:
+          IMAGE_REGISTRY: ${{ env.IMAGE_REGISTRY }}
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+          MANIFEST_TAGS: ${{ steps.publication-tags.outputs.immutable }}
+        with:
+          max_attempts: 3
+          retry_wait_seconds: 15
+          timeout_minutes: 15
+          command: |
+            set -ex
+            for tag in $MANIFEST_TAGS; do
+              podman manifest push --digestfile /tmp/digest.txt --all "$IMAGE_NAME:$tag" "docker://$IMAGE_REGISTRY/$IMAGE_NAME:$tag"
+            done
+            # Set outputs for subsequent steps
+            first_tag=$(echo "$MANIFEST_TAGS" | cut -d ' ' -f 1 | xargs)
+            echo "digest=$(cat /tmp/digest.txt)" >> $GITHUB_OUTPUT
+            echo "registry-path=$IMAGE_REGISTRY/$IMAGE_NAME:$first_tag" >> $GITHUB_OUTPUT
+
+      - name: Sign container manifest
+        env:
+          REGISTRY_PATH: ${{ steps.push.outputs.registry-path }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+          COSIGN_EXPERIMENTAL: false
+          COSIGN_PRIVATE_KEY: ${{ secrets.SIGNING_SECRET }}
+        run: |
+          echo "Signing ${{ env.REGISTRY_PATH }}@${{ env.DIGEST }}"
+          cosign sign -y --key env://COSIGN_PRIVATE_KEY ${{ env.REGISTRY_PATH }}@${{ env.DIGEST }}
+
+      - name: Promote floating tags
+        uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60 # v4.0.0
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+          FLOATING_TAGS: ${{ steps.publication-tags.outputs.floating }}
+          IMAGE_REGISTRY: ${{ env.IMAGE_REGISTRY }}
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+        with:
+          max_attempts: 3
+          retry_wait_seconds: 15
+          timeout_minutes: 15
+          command: |
+            set -xeuo pipefail
+            source_ref="docker://${IMAGE_REGISTRY}/${IMAGE_NAME}@${DIGEST:?}"
+            for tag in ${FLOATING_TAGS}; do
+              skopeo copy --all --preserve-digests "${source_ref}" "docker://${IMAGE_REGISTRY}/${IMAGE_NAME}:${tag}"
+              promoted_digest="$(skopeo inspect --no-tags --format '{{.Digest}}' "docker://${IMAGE_REGISTRY}/${IMAGE_NAME}:${tag}")"
+              [[ "${promoted_digest}" == "${DIGEST}" ]]
+            done
+
+  publish_release:
+    name: Publish release notes
+    runs-on: ubuntu-24.04
+    if: needs.push_and_sign.result == 'success' && needs.workflow_info.outputs.publish == 'true' && !cancelled() && startsWith(github.ref, 'refs/heads/main')
+    needs: [workflow_info, push_and_sign]
+    permissions:
+      contents: write
+      packages: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Just
+        uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
+
+      - name: Install ORAS
+        uses: oras-project/setup-oras@1d808f7d7f6995cc68b7bf507bfe5c5446e1dc9d # v2.0.1
+
+      - name: Login to GitHub Container Registry with ORAS
+        run: |
+          printf '%s' "${{ github.token }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Download current image artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: image-*
+          path: images
+
+      - name: Generate changelog
+        id: changelog
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          just --justfile ucore/Justfile --working-directory ucore \
+              changelog \
+              "${{ inputs.ucore_stream }}" \
+              ../changelog.md \
+              ../changelog.env \
+              "" \
+              20 \
+              ../images \
+              "${{ needs.workflow_info.outputs.date }}"
+
+          # shellcheck disable=SC1091
+          source changelog.env
+          echo "release_tag=${RELEASE_TAG}" >> "${GITHUB_OUTPUT}"
+          echo "release_title=${RELEASE_TITLE}" >> "${GITHUB_OUTPUT}"
+
+      - name: Upload changelog artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: changelog-${{ steps.changelog.outputs.release_tag }}
+          path: |
+            changelog.md
+            changelog.env
+          retention-days: 30
+
+      - name: Publish GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          # shellcheck disable=SC1091
+          source changelog.env
+
+          CREATE_FLAGS=()
+          EDIT_FLAGS=()
+          if [[ "${RELEASE_STREAM}" == "stable" ]]; then
+              CREATE_FLAGS+=(--latest)
+              EDIT_FLAGS+=(--latest)
+          else
+              CREATE_FLAGS+=(--latest=false)
+          fi
+          if gh release view "${RELEASE_TAG}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+              gh release edit "${RELEASE_TAG}" \
+                  --repo "${{ github.repository }}" \
+                  --target "${GITHUB_SHA}" \
+                  --title "${RELEASE_TITLE}" \
+                  --notes-file changelog.md \
+                  "${EDIT_FLAGS[@]}"
+          else
+              gh release create "${RELEASE_TAG}" \
+                  --repo "${{ github.repository }}" \
+                  --target "${GITHUB_SHA}" \
+                  --title "${RELEASE_TITLE}" \
+                  --notes-file changelog.md \
+                  "${CREATE_FLAGS[@]}"
+          fi
+
+  check:
+    name: Check all successful
+    runs-on: ubuntu-latest
+    if: always() && !cancelled()
+    needs: [workflow_info, stream_info, sentinel_decision, check_builds, push_and_sign, publish_release]
+    permissions: {}
+    steps:
+      - name: Exit
+        env:
+          WORKFLOW_INFO_RESULT: ${{ needs.workflow_info.result }}
+          STREAM_INFO_RESULT: ${{ needs.stream_info.result }}
+          SENTINEL_RESULT: ${{ needs.sentinel_decision.result }}
+          BUILD_CHECK_RESULT: ${{ needs.check_builds.result }}
+          PUSH_RESULT: ${{ needs.push_and_sign.result }}
+          RELEASE_RESULT: ${{ needs.publish_release.result }}
+        run: |
+          if [[ "$WORKFLOW_INFO_RESULT" != "success" ]]; then
+            exit 1
+          fi
+
+          if [[ "$STREAM_INFO_RESULT" != "success" ]]; then
+            exit 1
+          fi
+
+          if [[ "$SENTINEL_RESULT" != "success" ]]; then
+            exit 1
+          fi
+
+          if [[ "$BUILD_CHECK_RESULT" != "success" ]]; then
+            exit 1
+          fi
+
+          if [[ "$PUSH_RESULT" != "success" && "$PUSH_RESULT" != "skipped" ]]; then
+            exit 1
+          fi
+
+          if [[ "$RELEASE_RESULT" == "success" || "$RELEASE_RESULT" == "skipped" ]]; then
+            exit 0
+          else
+            exit 1
+          fi

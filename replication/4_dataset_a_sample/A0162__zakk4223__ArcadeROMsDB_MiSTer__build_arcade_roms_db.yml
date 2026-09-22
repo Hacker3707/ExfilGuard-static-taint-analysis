@@ -1,0 +1,64 @@
+name: Build Arcade Roms DB
+
+permissions: write-all
+
+on:
+  schedule:
+    - cron: "15 */2 * * * "
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v2
+    - uses: fregante/setup-git-user@v2
+
+    - name: Download IA
+      run: |
+          curl -LOs https://archive.org/download/ia-pex/ia
+          chmod +x ia
+    - name: Configure IA
+      run: |
+          ./ia configure -u ${{ secrets.IA_USER }} -p ${{ secrets.IA_PASS }}
+    - name: Fallback hash DB
+      run: ./build_hash_db.sh
+      env:
+        DB_FILE: "mamemergedfallback.json"
+        SOURCE: "mame-roms-merged_"
+        ONESHOT: "1"
+    - name: Archive hash DB
+      run: ./build_hash_db.sh
+      env:
+        DB_FILE: "mamemergedarchive.json"
+        SOURCE: "retroautomate"
+        ONESHOT: "1"
+        UNIQ_PATH: "1"
+    - name: Build tmp DB for mirror
+      run: python3 build_arcade_roms_db.py
+      env:
+        BUILD_FOR_IADIFF: "1"
+        LOCAL_SAVE_FILE: "mirrordb.json"
+
+    - name: Download missing files
+      run: |
+        curl --cookie-jar ./cookie.tmp https://archive.org/account/login 
+        python3 generate_missing_rom_list.py
+        cp mamemergedarchive.json hbmamemergedarchive.json
+      env:
+        ARCADE_ROMS_DB: "./mirrordb.json"
+        IA_REPO_DB: "mamemergedarchive.json"
+        SKIP_LIST: "./skip_list.json"
+        IA_USER: ${{ secrets.IA_USER }}
+        IA_PASS: ${{ secrets.IA_PASS }}
+    - name: Sync missing files
+      run: ./upload_files.sh ./iatmp ../ia
+    - name: Build
+      run: |
+        rm -rf delme
+        python3 build_arcade_roms_db.py
+      env:
+        FORCE_MAMESOURCE: "archive"
+        GIT_PUSH_BRANCH: db
+        DB_URL: https://raw.githubusercontent.com/zakk4223/ArcadeROMsDB_MiSTer/db/arcade_roms_db.json.zip

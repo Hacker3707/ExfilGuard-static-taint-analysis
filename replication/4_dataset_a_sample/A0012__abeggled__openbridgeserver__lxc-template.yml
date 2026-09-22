@@ -1,0 +1,551 @@
+name: Build Ubuntu LXC Template
+
+on:
+  push:
+    tags:
+      - '*'
+      - '!nightly-*'  # nightly-lxc.yml creates these; must not trigger a real release/build
+
+  workflow_dispatch:
+
+env:
+  TEMPLATE_NAME: openbridgeserver
+  BASE_OS: ubuntu-resolute
+  OPS_REPO: abeggled/openbridgeserver-ops
+
+jobs:
+  # Tag pushes trigger release.yml and this workflow independently. If a tag
+  # is moved to a commit off the expected branch, release.yml's own gate
+  # aborts — but without this same gate here, this workflow would still
+  # rebuild and `--clobber` the LXC/app-bundle assets of an existing release
+  # with artifacts built from that wrong commit (issue #948 Codex review).
+  # Only runs for tag pushes; workflow_dispatch has no tag to validate.
+  validate-tag:
+    name: Validate tag
+    if: startsWith(github.ref, 'refs/tags/')
+    uses: ./.github/workflows/validate-release-tag.yml
+
+  build:
+    needs: validate-tag
+    if: always() && (needs.validate-tag.result == 'success' || needs.validate-tag.result == 'skipped')
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+            mirror: http://archive.ubuntu.com/ubuntu
+            security_mirror: http://security.ubuntu.com/ubuntu
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            mirror: http://ports.ubuntu.com/ubuntu-ports
+            security_mirror: http://ports.ubuntu.com/ubuntu-ports
+    runs-on: ${{ matrix.runner }}
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set template metadata
+        id: meta
+        env:
+          GITHUB_REF_SAFE: ${{ github.ref }}
+          GITHUB_REF_NAME_SAFE: ${{ github.ref_name }}
+        run: |
+          # On a tag push use the tag name directly; fall back for manual runs
+          if [[ "$GITHUB_REF_SAFE" == refs/tags/* ]]; then
+            VERSION="$GITHUB_REF_NAME_SAFE"
+            if ! [[ "$VERSION" =~ ^[0-9A-Za-z._-]+$ ]]; then
+              echo "Invalid tag format: $VERSION" >&2
+              exit 1
+            fi
+          else
+            VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo "0.0.0")
+          fi
+          TEMPLATE_FILE="${{ env.TEMPLATE_NAME }}-lxc_${VERSION}_${{ matrix.arch }}.tar.zst"
+          APP_BUNDLE_FILE="${{ env.TEMPLATE_NAME }}-app-bundle_${VERSION}.tar.gz"
+          {
+            echo "version=$VERSION"
+            echo "template_file=$TEMPLATE_FILE"
+            echo "app_bundle_file=$APP_BUNDLE_FILE"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Install debootstrap and tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y debootstrap zstd ubuntu-keyring
+          # Ubuntu releases all share the generic 'gutsy' debootstrap script.
+          # The runner's debootstrap may predate resolute (26.04); symlink it if missing.
+          if [[ ! -e /usr/share/debootstrap/scripts/resolute ]]; then
+            sudo ln -sf gutsy /usr/share/debootstrap/scripts/resolute
+          fi
+
+      # ── Build GUI and frontend on the runner (no Node needed in the LXC) ─────
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: 'npm'
+          cache-dependency-path: |
+            gui/package-lock.json
+            frontend/package-lock.json
+            help/package-lock.json
+
+      - name: Stamp gui/package.json version
+        run: npm pkg set version="${{ steps.meta.outputs.version }}" --prefix gui
+
+      - name: Build Admin GUI
+        run: |
+          cd gui
+          npm ci --prefer-offline
+          npm run build
+
+      - name: Build Visu Frontend
+        run: |
+          cd frontend
+          npm ci --prefer-offline
+          npm run build
+
+      - name: Build Help site
+        run: |
+          cd help
+          npm ci --prefer-offline
+          npm run build
+
+      - name: Write obs-update script
+        run: |
+          sed -e "s|__REPO__|${{ github.repository }}|g" \
+              -e "s|__OPS_REPO__|${{ env.OPS_REPO }}|g" \
+              scripts/obs-update > obs-update
+          chmod +x obs-update
+
+      - name: Stamp version file
+        run: |
+          BASE=$(grep -m1 '^## ' RELEASENOTES.md | sed 's/^## *//')
+          TAG="${{ steps.meta.outputs.version }}"
+          if [[ "$TAG" =~ (-RC[0-9]*)$ ]]; then RC="${BASH_REMATCH[1]}"; else RC=""; fi
+          echo "${BASE}${RC}" > obs/version
+
+      - name: Create app bundle
+        if: matrix.arch == 'amd64'
+        run: |
+          tar -czf "${{ runner.temp }}/${{ steps.meta.outputs.app_bundle_file }}" \
+            obs/ gui_dist/ frontend_dist/ help_dist/ requirements.txt obs-update -C scripts obs-admin
+          cd "${{ runner.temp }}"
+          sha256sum "${{ steps.meta.outputs.app_bundle_file }}" \
+            > "${{ steps.meta.outputs.app_bundle_file }}.sha256"
+          # Backward-compat: obs-update versions prior to this release verify
+          # via a .sha512 release asset. Publish it so existing LXC installs
+          # can bootstrap the self-update once before switching to SHA-256.
+          sha512sum "${{ steps.meta.outputs.app_bundle_file }}" \
+            > "${{ steps.meta.outputs.app_bundle_file }}.sha512"
+
+      # ── Base system ───────────────────────────────────────────────────────────
+      - name: Cache base system
+        id: cache-base
+        uses: actions/cache@v6
+        with:
+          path: base-system-cache.tar.zst
+          key: base-system-ubuntu-resolute-${{ matrix.arch }}-v1
+
+      - name: Create or restore base system
+        run: |
+          ROOTFS="${{ runner.temp }}/rootfs"
+          CACHE_FILE="${{ github.workspace }}/base-system-cache.tar.zst"
+
+          if [[ -f "$CACHE_FILE" ]]; then
+            echo "::notice::Restoring base system from cache..."
+            sudo mkdir -p "$ROOTFS"
+            sudo tar --zstd -xf "$CACHE_FILE" -C "$ROOTFS"
+          else
+            echo "::notice::Building fresh base system (will be cached)..."
+            sudo mkdir -p "$ROOTFS"
+
+            sudo debootstrap \
+              --arch=${{ matrix.arch }} \
+              --components=main,restricted,universe \
+              --include=systemd,systemd-sysv,dbus,apt-utils,locales,iproute2,wget,curl,ca-certificates,less,logrotate,openssh-server,ifupdown \
+              resolute \
+              "$ROOTFS" \
+              ${{ matrix.mirror }}
+
+            # Write arch-specific sources.list before entering the chroot
+            sudo tee "$ROOTFS/etc/apt/sources.list" > /dev/null <<SOURCES
+          deb ${{ matrix.mirror }} resolute main restricted universe multiverse
+          deb ${{ matrix.mirror }} resolute-updates main restricted universe multiverse
+          deb ${{ matrix.security_mirror }} resolute-security main restricted universe multiverse
+          SOURCES
+
+            sudo chroot "$ROOTFS" /bin/bash <<'BASESCRIPT'
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+
+          # Locale
+          echo "en_US.UTF-8 UTF-8" >> /etc/locale.gen
+          locale-gen
+          update-locale LANG=en_US.UTF-8
+
+          # Timezone
+          ln -sf /usr/share/zoneinfo/UTC /etc/localtime
+          echo "UTC" > /etc/timezone
+
+          # Network — minimal, Proxmox configures eth0 on container creation
+          cat > /etc/network/interfaces << 'EOF'
+          auto lo
+          iface lo inet loopback
+          EOF
+
+          # Hostname placeholder — Proxmox sets this on container creation
+          echo "localhost" > /etc/hostname
+
+          cat > /etc/hosts << 'EOF'
+          127.0.0.1   localhost
+          ::1         localhost ip6-localhost ip6-loopback
+          ff02::1     ip6-allnodes
+          ff02::2     ip6-allrouters
+          EOF
+
+          # Proxmox manages container mounts
+          echo "# Proxmox manages container mounts" > /etc/fstab
+
+          # Prevent boot delays in Proxmox LXC
+          mkdir -p /etc/systemd/system-preset
+          echo "disable systemd-networkd-wait-online.service" \
+            > /etc/systemd/system-preset/00-pve-template.preset
+
+          apt-get clean
+          rm -rf /var/lib/apt/lists/*
+          BASESCRIPT
+
+            echo "::notice::Saving base system to cache..."
+            sudo tar --zstd -cf "$CACHE_FILE" -C "$ROOTFS" .
+            sudo chown "$(id -u):$(id -g)" "$CACHE_FILE"
+          fi
+
+          echo "ROOTFS=$ROOTFS" >> "$GITHUB_ENV"
+
+      # ── APT cache for app-specific packages ───────────────────────────────────
+      - name: Cache APT packages
+        uses: actions/cache@v6
+        with:
+          path: /tmp/apt-cache
+          key: apt-obs-${{ matrix.arch }}-${{ hashFiles('requirements.txt') }}
+          restore-keys: apt-obs-${{ matrix.arch }}-
+
+      - name: Restore APT cache to rootfs
+        run: |
+          if [[ -d /tmp/apt-cache ]] && [[ -n "$(ls -A /tmp/apt-cache 2>/dev/null)" ]]; then
+            echo "::notice::Restoring APT cache..."
+            sudo mkdir -p "$ROOTFS/var/cache/apt/archives"
+            sudo cp -a /tmp/apt-cache/*.deb "$ROOTFS/var/cache/apt/archives/" 2>/dev/null || true
+          fi
+
+      # ── Install app ───────────────────────────────────────────────────────────
+      - name: Install Python dependencies and app
+        run: |
+          sudo cp /etc/resolv.conf "$ROOTFS/etc/resolv.conf"
+
+          if ! mountpoint -q "$ROOTFS/proc"; then
+            sudo mount -t proc proc "$ROOTFS/proc"
+          fi
+          cleanup() { if mountpoint -q "$ROOTFS/proc"; then sudo umount "$ROOTFS/proc" || true; fi; }
+          trap cleanup EXIT
+
+          # Copy application source and built assets into rootfs
+          sudo mkdir -p "$ROOTFS/opt/obs"
+          sudo cp -r obs              "$ROOTFS/opt/obs/"
+          sudo cp -r gui_dist         "$ROOTFS/opt/obs/"
+          sudo cp -r frontend_dist    "$ROOTFS/opt/obs/"
+          sudo cp -r help_dist        "$ROOTFS/opt/obs/"
+          sudo cp    requirements.txt "$ROOTFS/opt/obs/"
+          sudo cp    scripts/obs-admin   "$ROOTFS/opt/obs/"
+          echo "${{ steps.meta.outputs.version }}" | sudo tee "$ROOTFS/opt/obs/version" > /dev/null
+          sudo cp obs-update "$ROOTFS/usr/local/bin/obs-update"
+          sudo cp scripts/obs-admin "$ROOTFS/usr/local/bin/obs-admin"
+          sudo chmod +x "$ROOTFS/usr/local/bin/obs-admin"
+
+          sudo chroot "$ROOTFS" /bin/bash <<'INSTALL'
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+
+          apt-get update
+          apt-get install -y python3 python3-pip python3-venv gcc libffi-dev libssl-dev iputils-ping mosquitto mosquitto-clients
+
+          # Isolated venv — mirrors the --prefix=/install pattern from the Dockerfile
+          python3 -m venv /opt/obs/venv
+          /opt/obs/venv/bin/pip install --no-cache-dir -r /opt/obs/requirements.txt
+
+          # Data directory (matches Dockerfile VOLUME ["/data"])
+          mkdir -p /data
+
+          # Runtime environment defaults (overridable via mounted config.yaml)
+          cat > /etc/obs.env << 'EOF'
+          OBS_DATABASE__PATH=/data/obs.db
+          OBS_CONFIG=/data/config.yaml
+          EOF
+          chmod 600 /etc/obs.env
+
+          cat > /etc/systemd/system/obs.service << 'EOF'
+          [Unit]
+          Description=open bridge server
+          After=network.target mosquitto.service
+          Requires=mosquitto.service
+
+          [Service]
+          Type=simple
+          WorkingDirectory=/opt/obs
+          ExecStart=/opt/obs/venv/bin/python3 -m obs
+          Restart=on-failure
+          RestartSec=5
+          EnvironmentFile=/etc/obs.env
+          StandardOutput=journal
+          StandardError=journal
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
+          # Mosquitto configuration — replaces the package default (no anonymous, WebSocket, syslog)
+          cat > /etc/mosquitto/mosquitto.conf << 'MQTTCONF'
+          # No pid_file: systemd (Type=notify) manages the process lifecycle, and the
+          # Ubuntu mosquitto package ships no tmpfiles rule to create /run/mosquitto,
+          # so a pid_file there would fail on every boot (/run is a fresh tmpfs).
+
+          allow_anonymous false
+          password_file /etc/mosquitto/passwd
+
+          listener 1883
+          protocol mqtt
+
+          listener 9001
+          protocol websockets
+
+          persistence true
+          persistence_location /var/lib/mosquitto/
+
+          log_dest stdout
+          log_type error
+          log_type warning
+          log_type notice
+
+          max_connections 100
+          max_keepalive 120
+          MQTTCONF
+
+          # First-boot script: generates a unique random MQTT password per deployment
+          cat > /opt/obs/obs-first-boot.sh << 'FIRSTBOOT'
+          #!/bin/bash
+          set -euo pipefail
+
+          MQTT_PASSWORD=$(python3 -c "import secrets, string; print(''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(32)))")
+          JWT_SECRET=$(python3 -c "import secrets; print(secrets.token_urlsafe(48))")
+
+          mosquitto_passwd -c -b /etc/mosquitto/passwd obs "$MQTT_PASSWORD"
+          chmod 640 /etc/mosquitto/passwd
+          chown mosquitto:mosquitto /etc/mosquitto/passwd
+
+          cat >> /etc/obs.env << EOF
+          OBS_MQTT__HOST=localhost
+          OBS_MQTT__PORT=1883
+          OBS_MQTT__USERNAME=obs
+          OBS_MQTT__PASSWORD=$MQTT_PASSWORD
+          OBS_MOSQUITTO__PASSWD_FILE=/etc/mosquitto/passwd
+          OBS_MOSQUITTO__RELOAD_COMMAND=systemctl reload mosquitto
+          OBS_MOSQUITTO__SERVICE_USERNAME=obs
+          OBS_MOSQUITTO__SERVICE_PASSWORD=$MQTT_PASSWORD
+          OBS_SECURITY__JWT_SECRET=$JWT_SECRET
+          EOF
+          chmod 600 /etc/obs.env
+          FIRSTBOOT
+          chmod +x /opt/obs/obs-first-boot.sh
+
+          cat > /etc/systemd/system/obs-first-boot.service << 'FIRSTBOOTSVC'
+          [Unit]
+          Description=open bridge server — first-boot MQTT credential setup
+          Before=mosquitto.service obs.service
+          ConditionPathExists=!/etc/obs-first-boot-done
+
+          [Service]
+          Type=oneshot
+          ExecStart=/opt/obs/obs-first-boot.sh
+          ExecStartPost=/bin/touch /etc/obs-first-boot-done
+          RemainAfterExit=yes
+
+          [Install]
+          WantedBy=multi-user.target
+          FIRSTBOOTSVC
+
+          systemctl enable obs.service mosquitto.service obs-first-boot.service
+
+          apt-get clean
+          rm -rf /var/lib/apt/lists/*
+          INSTALL
+
+      - name: Save APT cache
+        run: |
+          sudo mkdir -p /tmp/apt-cache
+          sudo cp -a "$ROOTFS/var/cache/apt/archives"/*.deb /tmp/apt-cache/ 2>/dev/null || true
+          sudo chown -R "$(id -u):$(id -g)" /tmp/apt-cache
+
+      # ── Finalize ──────────────────────────────────────────────────────────────
+      - name: Finalize rootfs
+        run: |
+          sudo chroot "$ROOTFS" /bin/bash <<'CLEANUP'
+          set -euo pipefail
+
+          # Proxmox generates a new machine-id on first boot
+          truncate -s 0 /etc/machine-id
+
+          # Proxmox regenerates SSH host keys on first boot
+          rm -f /etc/ssh/ssh_host_*
+
+          find /var/log -type f -exec truncate -s 0 {} \;
+          apt-get clean
+          rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+          rm -f /root/.bash_history
+
+          # Proxmox configures DNS on container creation
+          truncate -s 0 /etc/resolv.conf
+          CLEANUP
+
+      # ── Package ───────────────────────────────────────────────────────────────
+      - name: Create tar.zst archive
+        run: |
+          cd "$ROOTFS"
+          sudo tar --numeric-owner --acls --xattrs \
+            -cf - . | zstd -T0 -9 -o "${{ runner.temp }}/${{ steps.meta.outputs.template_file }}"
+          cd "${{ runner.temp }}"
+          sha256sum "${{ steps.meta.outputs.template_file }}" \
+            > "${{ steps.meta.outputs.template_file }}.sha256"
+
+      - name: Upload LXC template artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: lxc-${{ matrix.arch }}
+          path: |
+            ${{ runner.temp }}/${{ steps.meta.outputs.template_file }}
+            ${{ runner.temp }}/${{ steps.meta.outputs.template_file }}.sha256
+
+      - name: Upload app bundle artifact
+        if: matrix.arch == 'amd64'
+        uses: actions/upload-artifact@v7
+        with:
+          name: app-bundle
+          path: |
+            ${{ runner.temp }}/${{ steps.meta.outputs.app_bundle_file }}
+            ${{ runner.temp }}/${{ steps.meta.outputs.app_bundle_file }}.sha256
+            ${{ runner.temp }}/${{ steps.meta.outputs.app_bundle_file }}.sha512
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    # Only upload on real tag pushes — release.yml already created the release
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+    env:
+      HAS_OPS_TOKEN: ${{ secrets.OPS_REPO_TOKEN != '' }}
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+
+      - name: Upload LXC assets to existing release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_REPO: ${{ github.repository }}
+        run: |
+          if ! [[ "$RELEASE_TAG" =~ ^[0-9A-Za-z._-]+$ ]]; then
+            echo "Invalid tag format: $RELEASE_TAG" >&2
+            exit 1
+          fi
+          find artifacts/ -type f \( -name "*.tar.zst" -o -name "*.tar.gz" -o -name "*.sha512" \) -print0 \
+            | xargs -0 gh release upload "$RELEASE_TAG" \
+              --repo "$RELEASE_REPO" \
+              --clobber
+
+      - name: Insert LXC checksums into release notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_REPO: ${{ github.repository }}
+        run: |
+          if ! [[ "$RELEASE_TAG" =~ ^[0-9A-Za-z._-]+$ ]]; then
+            echo "Invalid tag format: $RELEASE_TAG" >&2
+            exit 1
+          fi
+          gh release view "$RELEASE_TAG" \
+            --repo "$RELEASE_REPO" --json body -q .body \
+            > /tmp/release_body.txt
+
+          python3 <<'PYEOF' > /tmp/new_body.txt
+          import glob, os, re
+
+          def read(path):
+              with open(path) as f:
+                  return f.read().strip()
+
+          body = read('/tmp/release_body.txt')
+
+          entries = []
+
+          for f in sorted(glob.glob('artifacts/**/*.sha256', recursive=True)):
+              content = read(f).split()[0]
+              name = os.path.basename(f).removesuffix('.sha256')
+              entries.append((name, content))
+
+          entries.sort(key=lambda x: x[0])
+
+          marker = "<!-- LXC_INSERT -->"
+
+          # Strip any previously generated block so the step is idempotent on re-runs
+          body = re.sub(
+              r'### Checksums \(SHA-256\)\n.*?' + re.escape(marker),
+              marker,
+              body,
+              flags=re.DOTALL,
+          )
+
+          section = "### Checksums (SHA-256)\n\n"
+          for name, cs in entries:
+              if 'app-bundle' in name:
+                  section += "**App Bundle**\n\n"
+              section += f"*{name}*:\n```\n{cs}\n```\n\n"
+          section += marker
+
+          print(body.replace(marker, section), end='')
+          PYEOF
+
+          gh release edit "$RELEASE_TAG" \
+            --repo "$RELEASE_REPO" \
+            --notes-file /tmp/new_body.txt
+
+      - name: Resolve app bundle asset info
+        id: bundle-info
+        run: |
+          VERSION="${{ needs.build.outputs.version }}"
+          BUNDLE_FILE="openbridgeserver-app-bundle_${VERSION}.tar.gz"
+          SHA256=$(cut -d' ' -f1 "artifacts/app-bundle/${BUNDLE_FILE}.sha256")
+          ASSET_URL="https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/${BUNDLE_FILE}"
+          {
+            echo "version=${VERSION}"
+            echo "asset_url=${ASSET_URL}"
+            echo "sha256=${SHA256}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Update canary channel manifest (lxc)
+        if: ${{ env.HAS_OPS_TOKEN == 'true' }}
+        uses: ./.github/actions/update-ops-manifest
+        with:
+          channel: canary
+          version: ${{ steps.bundle-info.outputs.version }}
+          token: ${{ secrets.OPS_REPO_TOKEN }}
+          patch-json: >-
+            {"lxc": {"version": "${{ steps.bundle-info.outputs.version }}", "asset_url": "${{ steps.bundle-info.outputs.asset_url }}", "sha256": "${{ steps.bundle-info.outputs.sha256 }}"}}

@@ -1,0 +1,433 @@
+name: Build
+
+on:
+  push:
+    branches: [v2]
+    tags: ["v*"]
+  pull_request:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: Release channel
+        required: true
+        default: nightly
+        type: choice
+        options:
+          - nightly
+          - continuous
+
+permissions:
+  contents: read
+
+env:
+  EUPROVGUARD_VERSION: "v1.2.1"
+
+jobs:
+  prepare:
+    outputs:
+      version: ${{ steps.version.outputs.value }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417
+        with:
+          go-version-file: go.mod
+
+      - name: Test
+        run: |
+          go test -race ./...
+          go test -tags cpak_ui_builtin ./pkg/desktopui
+          go test -tags cpak_ui_adwaita ./pkg/desktopui
+          go vet ./...
+          go run . gen-schema --manifest-version 2.0 --output /tmp/manifest-v2.json
+          diff -u schema/manifest-v2.json /tmp/manifest-v2.json
+          go run . gen-schema --manifest-version 3.0 --output /tmp/manifest-v3.json
+          diff -u schema/manifest-v3.json /tmp/manifest-v3.json
+
+      - id: version
+        name: Resolve version
+        run: |
+          version="${GITHUB_REF_NAME}"
+          if [[ "${GITHUB_REF_TYPE}" != "tag" ]]; then
+            version="0.0.0-$(git rev-parse --short HEAD)"
+          fi
+          echo "value=${version}" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: read
+    # The toolkits the desktop adapters compile against live in this image
+    # rather than being installed here. Installing them on the runner hung the
+    # release twice for forty minutes without ever saying what it waited for,
+    # and a pull either works or fails in seconds.
+    container:
+      image: ghcr.io/containerpak/ci-adapters:main-${{ matrix.arch }}
+      # The image is published by the organisation and is not public, so the
+      # pull is authenticated with the run's own token rather than relying on
+      # the package being open.
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417
+        with:
+          go-version-file: go.mod
+
+      - name: Build
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+          # Go stamps the revision by shelling out to git, and inside the build
+          # container git refuses the checkout: the safe.directory entry the
+          # checkout added lives in a temporary global config this step does not
+          # read. The version is stamped through ldflags either way, so the
+          # stamp is not worth a release that does not build.
+          GOFLAGS: -buildvcs=false
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE" || true
+          mkdir -p dist
+          make installer VERSION="${VERSION}" UI_ADAPTERS=all
+          make sign
+          mv cpak "dist/cpak-linux-${ARCH}"
+          mv cpak-storaged "dist/cpak-storaged-linux-${ARCH}"
+          mv cpak-installer "dist/cpak-installer-linux-${ARCH}"
+          mv cpak-sign "dist/cpak-sign-linux-${ARCH}"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: cpak-binaries-${{ matrix.arch }}
+          path: dist
+          if-no-files-found: error
+
+  integration:
+    name: Integration
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417
+        with:
+          go-version-file: go.mod
+
+      - name: Install QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cloud-image-utils qemu-system-x86 qemu-utils
+          if [ -e /dev/kvm ]; then
+            sudo chmod 0666 /dev/kvm
+          fi
+
+      - name: Run cpak in QEMU
+        run: integration/vm.sh
+
+  x11:
+    name: Isolated X11 (${{ matrix.browser }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        browser: [google-chrome, firefox]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417
+        with:
+          go-version-file: go.mod
+
+      - name: Install X11 test servers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openbox x11-utils xdotool xserver-xephyr xvfb
+
+      - name: Test the isolated X11 desktop
+        run: |
+          unset DBUS_SESSION_BUS_ADDRESS DBUS_SYSTEM_BUS_ADDRESS WAYLAND_DISPLAY XAUTHORITY
+          Xvfb :90 -ac -nolisten tcp -screen 0 1280x800x24 >/tmp/cpak-xvfb.log 2>&1 &
+          xvfb_pid=$!
+          for attempt in $(seq 1 50); do
+            if DISPLAY=:90 xprop -root >/dev/null 2>&1; then
+              break
+            fi
+            sleep 0.1
+          done
+          DISPLAY=:90 openbox --sm-disable >/tmp/cpak-openbox.log 2>&1 &
+          openbox_pid=$!
+          trap 'kill "${openbox_pid}" "${xvfb_pid}" 2>/dev/null || true' EXIT
+          gecko_driver="$(command -v geckodriver || true)"
+          if [ -z "${gecko_driver}" ] && [ -x "${GECKOWEBDRIVER:-}/geckodriver" ]; then
+            gecko_driver="${GECKOWEBDRIVER}/geckodriver"
+          fi
+          browser="$(command -v '${{ matrix.browser }}')"
+          CPAK_X11_BROWSER="${browser}" CPAK_X11_DRIVER="${gecko_driver}" DISPLAY=:90 go test -race ./pkg/cpak -run 'TestX11(BrokerIntegratesXephyrWithTheHostDesktop|BridgeStartsAReachableDisplayOnX11)' -count=1 -v
+
+  nixos:
+    name: NixOS
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24
+
+      - name: Test flake and NixOS module
+        run: nix flake check --print-build-logs
+
+  assemble:
+    needs: [prepare, build]
+    outputs:
+      version: ${{ needs.prepare.outputs.version }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417
+        with:
+          go-version-file: go.mod
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          pattern: cpak-binaries-*
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum cpak-linux-* cpak-storaged-linux-* cpak-installer-linux-* cpak-sign-linux-* > SHA256SUMS
+
+      - name: Build signed installer catalog
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          CPAK_INSTALLER_PRIVATE_KEY: ${{ secrets.CPAK_INSTALLER_PRIVATE_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          go run ./cmd/cpak-catalog \
+            --release "${{ needs.prepare.outputs.version }}" \
+            --installer-dir dist \
+            --output dist/cpak-installer-catalog.json
+          cd dist
+          sha256sum cpak-installer-catalog.json >> SHA256SUMS
+
+      - name: Install cosign
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6
+
+      - name: Sign checksums
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          cd dist
+          cosign sign-blob --yes --bundle SHA256SUMS.sigstore.json SHA256SUMS
+
+      - name: Generate SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610
+        with:
+          path: dist
+          format: spdx-json
+          output-file: dist/cpak.spdx.json
+          upload-artifact: false
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: cpak-${{ needs.prepare.outputs.version }}
+          path: dist
+          if-no-files-found: error
+
+  compliance:
+    name: Compliance
+    needs: assemble
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Install EUProvGuard
+        run: go install github.com/fabricatorsltd/euprovguard@${{ env.EUPROVGUARD_VERSION }}
+
+      - name: Scan Cpak
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p compliance
+          euprovguard \
+            -path . \
+            -name cpak \
+            -version-tag "${{ needs.assemble.outputs.version }}" \
+            -output compliance/sbom-cpak.json \
+            -bundle compliance/report-cpak 2>&1 | tee compliance/scan-cpak.log
+
+      - name: Fail on compliance findings
+        shell: bash
+        run: |
+          set -euo pipefail
+          sbom="compliance/sbom-cpak.json"
+          log="compliance/scan-cpak.log"
+
+          recorded=$(jq '(.vulnerabilities // []) | length' "${sbom}")
+          cves=$(sed -n 's/.*CVE findings: \([0-9][0-9]*\).*/\1/p' "${log}" | tail -n 1)
+          sast=$(sed -n 's/.*Native SAST completed: found \([0-9][0-9]*\) issues.*/\1/p' "${log}" | tail -n 1)
+
+          echo "cpak: sbom=${recorded} cve=${cves:-missing} sast=${sast:-missing}"
+
+          if [ -z "${cves}" ] || [ -z "${sast}" ]; then
+            echo "::error::cpak: EUProvGuard summary could not be parsed"
+            exit 1
+          fi
+          if grep -q "OSV/EUVD query failed" "${log}"; then
+            echo "::error::cpak: vulnerability databases were unreachable"
+            exit 1
+          fi
+          if [ "${recorded}" -gt 0 ] || [ "${cves}" -gt 0 ] || [ "${sast}" -gt 0 ]; then
+            echo "::error::cpak: EUProvGuard reported findings"
+            exit 1
+          fi
+
+      - name: Upload compliance artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: compliance-reports
+          path: compliance/
+          if-no-files-found: error
+
+  publish:
+    name: Publish
+    needs: [assemble, compliance, integration, nixos, x11]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: cpak-${{ needs.assemble.outputs.version }}
+          path: dist
+
+      - name: Attest binaries
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
+        with:
+          subject-path: |
+            dist/cpak-linux-*
+            dist/cpak-storaged-linux-*
+            dist/cpak-installer-linux-*
+            dist/cpak-sign-linux-*
+
+      - name: Attest SBOM
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
+        with:
+          subject-path: |
+            dist/cpak-linux-*
+            dist/cpak-storaged-linux-*
+            dist/cpak-installer-linux-*
+            dist/cpak-sign-linux-*
+          sbom-path: dist/cpak.spdx.json
+
+      - name: Move channel tag
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/v2'))
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHANNEL: ${{ inputs.channel }}
+        run: |
+          channel="${CHANNEL}"
+          if [[ -z "${channel}" ]]; then
+            if [[ "${GITHUB_EVENT_NAME}" == "schedule" ]]; then
+              channel="nightly"
+            else
+              channel="continuous"
+            fi
+          fi
+          gh api \
+            --method PATCH \
+            "repos/${GITHUB_REPOSITORY}/git/refs/tags/${channel}" \
+            -f sha="${GITHUB_SHA}" \
+            -F force=true
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228
+        with:
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: dist/*
+
+      - name: Publish nightly
+        if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.channel == 'nightly')
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228
+        with:
+          tag_name: nightly
+          target_commitish: ${{ github.sha }}
+          prerelease: true
+          make_latest: false
+          name: Nightly Build
+          files: dist/*
+
+      - name: Publish continuous
+        if: (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/v2')) || (github.event_name == 'workflow_dispatch' && inputs.channel == 'continuous')
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228
+        with:
+          tag_name: continuous
+          target_commitish: ${{ github.sha }}
+          prerelease: true
+          make_latest: false
+          name: Continuous Build
+          files: dist/*
+
+      - name: Remove stale channel assets
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/v2'))
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHANNEL: ${{ inputs.channel }}
+        run: |
+          channel="${CHANNEL}"
+          if [[ -z "${channel}" ]]; then
+            if [[ "${GITHUB_EVENT_NAME}" == "schedule" ]]; then
+              channel="nightly"
+            else
+              channel="continuous"
+            fi
+          fi
+          while IFS=$'\t' read -r asset_id asset_name; do
+            keep=false
+            for path in dist/*; do
+              if [[ "$(basename "${path}")" == "${asset_name}" ]]; then
+                keep=true
+                break
+              fi
+            done
+            if [[ "${keep}" == false ]]; then
+              gh api --method DELETE "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}"
+            fi
+          done < <(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${channel}" --jq '.assets[] | [.id, .name] | @tsv')

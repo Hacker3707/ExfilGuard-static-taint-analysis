@@ -1,0 +1,53 @@
+name: Build/Push Server Image
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository and submodules
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Check for server image changes (PR only)
+        if: github.event_name == 'pull_request'
+        id: docker-changes
+        run: |
+          set -euo pipefail
+
+          changed_files=$(git diff --name-only "${{ github.event.pull_request.base.sha }}" HEAD)
+          printf '%s\n' "$changed_files"
+
+          if printf '%s\n' "$changed_files" | grep -Eq "^(docker/|server/|component/|shaded/|licenses/|dev/|pom\.xml$|\.gitmodules$|\.github/workflows/build-docker-server\.yml$)"; then
+            echo "changed=true" >> $GITHUB_OUTPUT
+          else
+            echo "changed=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Setup JDK8
+        if: github.event_name == 'push' || (github.event_name == 'pull_request' && steps.docker-changes.outputs.changed == 'true')
+        uses: actions/setup-java@v4
+        with:
+          java-version: '8'
+          distribution: 'temurin'
+
+      - name: Build image
+        if: github.event_name == 'push' || (github.event_name == 'pull_request' && steps.docker-changes.outputs.changed == 'true')
+        run: DOCKER_BUILDKIT=1 docker build -t bithon/server -f docker/Dockerfile-server .
+
+      - name: Log into registry
+        if: github.event_name == 'push'
+        run: echo "${{ secrets.DOCKER_ACCESS_CODE }}" | docker login -u bithon --password-stdin
+
+      - name: Push image
+        if: github.event_name == 'push'
+        run: docker push bithon/server:latest

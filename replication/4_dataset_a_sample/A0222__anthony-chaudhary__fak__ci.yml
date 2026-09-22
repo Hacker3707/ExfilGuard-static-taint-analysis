@@ -1,0 +1,1053 @@
+# CI for the fak module (lives in fak/). Runs on Linux, where `go test ./...`
+# is NOT subject to the Windows Application-Control policy that forces the local
+# WSL test runner (see fak/CLAUDE.md / fak/test.sh) — so this is the public,
+# reproducible form of the "CI green" claim: build + vet + test + the CLAIMS
+# honesty-ledger lint, the same gate as `make ci` / `scripts/ci.ps1`.
+name: ci
+
+on:
+  push:
+    branches: [main, master, fak-v0.1]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      go_test_args_json:
+        description: JSON array of arguments passed verbatim to go test
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+# Queue control (CI/CD run-speed): cancel a PR's superseded in-flight runs on a
+# re-push/force-push so its queue never carries stale work. On main — and on
+# schedule/workflow_dispatch — github.head_ref is empty, so the group key falls
+# back to the unique commit SHA: every trunk commit runs its own gate in parallel,
+# uncancelled, preserving the per-commit signal that release_decide (ci-fast) and
+# head-snapshot-build depend on.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  testroute-ci-only:
+    name: testroute CI-only / go test
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    env:
+      GOTOOLCHAIN: auto
+      GO_TEST_ARGS_JSON: ${{ inputs.go_test_args_json }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: validate and execute routed go test
+        shell: bash
+        run: |
+          if ! jq -e 'type == "array" and all(.[]; type == "string")' <<<"$GO_TEST_ARGS_JSON" >/dev/null; then
+            echo "go_test_args_json must be a JSON array of strings" >&2
+            exit 2
+          fi
+          mapfile -t go_test_args < <(jq -r '.[]' <<<"$GO_TEST_ARGS_JSON")
+          go test "${go_test_args[@]}"
+  build-vet-test:
+    if: github.event_name != 'workflow_dispatch'
+    name: build · vet · test · claims-lint
+    runs-on: ubuntu-latest
+    env:
+      # The exact toolchain comes from go.mod (go 1.26); GOTOOLCHAIN=auto lets
+      # `go` fetch it if the runner's Go is older. Job-level so every step sees it.
+      GOTOOLCHAIN: auto
+      # Serialize package/compiler fan-out below the hosted runner process ceiling.
+      # This changes no package set, test semantics, job name, or release check.
+      GOMAXPROCS: "2"
+      GOFLAGS: "-p=1"
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history + tags: the release-substrate tests read the release note
+          # AT the tag (`git show v0.30.0:docs/releases/...`), which a default shallow
+          # checkout doesn't fetch — the tag's tree is absent and the check 404s.
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false # zero external deps -> no go.sum to key a cache on
+
+      # CI-spec impact (#4757): add the committed-diff concept-admission contract.
+      # Consumer migrated: build-vet-test invokes the same Go gate as pre-commit/pre-push.
+      # Cutover is additive and rollback is removal of this step; no check name or schema changes.
+      - name: changed-corpus concept admission
+        if: github.event_name == 'pull_request'
+        run: go run ./cmd/fak concept admission --base "${{ github.event.pull_request.base.sha }}" --tip "${{ github.sha }}" --json
+
+      # CI-spec impact (#4760): generated scorecard freshness is now an unconditional CI contract.
+      # Consumer migrated: local hooks select relevant paths; CI validates the clean committed tree.
+      # Cutover is additive; rollback removes this step and leaves generation behavior unchanged.
+      - name: concept generated-artifact freshness
+        run: go run ./cmd/fak concept freshness --check --json
+
+      # Build/test cache: setup-go's built-in cache is off (no go.sum to key on), but the
+      # GOCACHE — compiled packages AND cached test results — is the biggest CI-time lever
+      # on this zero-dep module. `go build ./...` and `go test ./...` otherwise recompile and
+      # re-run the whole tree every push. Key on go.mod (the toolchain) with a per-commit save
+      # and a prefix restore, so a warm cache skips unchanged packages and unchanged tests.
+      # GOCACHE is content-addressed, so a restored entry is never wrong — a miss just rebuilds.
+      - name: cache Go build/test artifacts
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/go-build
+          key: ${{ runner.os }}-gobuild-${{ hashFiles('go.mod') }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-gobuild-${{ hashFiles('go.mod') }}-
+            ${{ runner.os }}-gobuild-
+
+      # Fleet guard installation (#19): arm git guards (leak/claim/trunk) on every CI node.
+      # A fresh clone without hooksPath set fails open; this step installs the guards
+      # so pre-commit/pre-push/commit-msg hooks fire during this CI run.
+      - name: git-guards-armed (install leak/claim/trunk hooks)
+        run: python tools/install_trunk_guard.py
+
+      - name: build
+        run: go build ./...
+
+      # Format gate (G-001/#38): BLOCKING. The ~57 unformatted trunk files were cleared by a
+      # coordinated lane-by-lane `gofmt -w .` sweep, so this ratcheted from advisory to a hard
+      # gate — any file `gofmt -l .` reports now FAILS the build (exit 1). Runs on Linux (LF),
+      # so the list is the canonical bytes, not a Windows CRLF artifact. Fix locally with
+      # `gofmt -w .` from fak/.
+      - name: gofmt (every committed .go file is gofmt-formatted)
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            n="$(printf '%s\n' "$unformatted" | grep -c .)"
+            echo "::error::gofmt: $n file(s) not formatted (run 'gofmt -w .' from fak/):"
+            printf '%s\n' "$unformatted"
+            exit 1
+          fi
+          echo "gofmt: clean"
+
+      - name: vet
+        run: go vet ./...
+
+      # The architest tier/root/chat-client gates read the repository filesystem, not
+      # only files in internal/architest. Run them uncached so a new internal leaf or a
+      # stale tier-table row cannot inherit a cached PASS from a previous commit (#1145).
+      - name: architest tier gate (uncached)
+        run: go test -count=1 ./internal/architest/ -run '^(TestEveryPackageDeclaresTier|TestNoUpwardImports|TestRootImportsNothingInternal|TestSingleOpenAIChatClient)$'
+      - name: LiveCodeBench fixture smoke (no network, no model)
+        run: |
+          go test ./internal/livecodebench/...
+          go run ./cmd/livecodebench --fixture internal/livecodebench/testdata/fixture.json --check --json > /tmp/livecodebench-smoke.json
+          grep -q '"result_claim_allowed": false' /tmp/livecodebench-smoke.json
+
+      # `dos` must be on PATH BEFORE `go test ./...`, not after (#5518). Two smokes shell
+      # to the real binary and skip gracefully when it is absent — handoff_chain_smoke_test.go
+      # and relay_handoff_rotate_close_test.go, both via the exec.LookPath("dos") pattern.
+      # dos-kernel was installed only in the dos-review step further down in THIS SAME job,
+      # ~730 lines below, so the test step above it always ran without it and those two
+      # tests have never once executed in CI. Installing here costs nothing: the later
+      # install is idempotent and becomes a no-op, and a failure here would have failed
+      # the job at that later step anyway.
+      - name: install dos-kernel before the tests (#5518)
+        run: python -m pip install --quiet --disable-pip-version-check dos-kernel
+
+      # Test + coverage profile in one run (E-002): the same `go test ./...` gate, now
+      # also writing a merged statement-coverage profile so the total is reported every
+      # run. Reporting (not a hard threshold) is the foundation — a specific floor is a
+      # follow-on tuning once the baseline is known (issue #34).
+      - name: test (+ coverage profile)
+        run: go test -coverprofile=coverage.out ./...
+
+      # Coverage report + gap analysis + trend surfacing (E-002 / #233): the profile
+      # was previously reduced to one `tail -1` line lost in the logs. This step keeps
+      # that total, adds a per-package breakdown sorted ascending with every package
+      # under the issue's 80% goal marked GAP, lists internal packages absent from the
+      # profile entirely (no test files — invisible to `go tool cover`), and writes it
+      # all to the step summary so the numbers are surfaced per run, the same trend
+      # mechanism dogfood-coverage.yml uses. Advisory by design: the hard floor is the
+      # follow-on tuning tracked in #34, per the comment above.
+      - name: coverage report (total + per-package gaps -> step summary)
+        run: |
+          total="$(go tool cover -func=coverage.out | tail -1)"
+          echo "$total"
+
+          # Per-package statement coverage from the merged profile. Profile lines are
+          # "<file>:<start>,<end> <numstmt> <count>"; summing numstmt per package dir
+          # (covered = count>0) gives the same statement metric as the total line.
+          perpkg="$(awk -F: 'NR>1 {
+            file=$1
+            sub(/\/[^\/]+$/, "", file)
+            split($2, f, " ")
+            tot[file]+=f[2]; if (f[3]>0) cov[file]+=f[2]
+          } END {
+            for (p in tot) if (tot[p]>0) {
+              pct=100*cov[p]/tot[p]
+              printf "%6.1f%%  %s  %s\n", pct, (pct<80 ? "GAP" : "ok "), p
+            }
+          }' coverage.out | sort -n)"
+          echo "$perpkg"
+
+          # Internal packages with no rows in the profile at all: `go test ./...`
+          # skips packages with no test files, so they never reach coverage.out and
+          # would otherwise be invisible in the gap list.
+          untested="$(comm -13 \
+            <(awk -F: 'NR>1 {p=$1; sub(/\/[^\/]+$/, "", p); print p}' coverage.out | sort -u) \
+            <(go list ./internal/... | sort))"
+
+          {
+            echo "## Go statement coverage (E-002 / #233)"
+            echo '```'
+            echo "$total"
+            echo '```'
+            echo "Per-package, ascending — under the 80% goal is marked GAP:"
+            echo '```'
+            echo "$perpkg"
+            echo '```'
+            if [ -n "$untested" ]; then
+              echo "Internal packages with no coverage data (no test files):"
+              echo '```'
+              echo "$untested"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Trend tracking (E-002 / #233): retain the raw merged profile per run so any
+      # two runs can be diffed (`go tool cover -func`) without re-running the suite.
+      - name: upload coverage profile (trend artifact)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-profile
+          path: coverage.out
+          if-no-files-found: ignore
+
+      # The out-of-tree driver example (#454) is a SEPARATE module under
+      # examples/extdriver, so the root `go build ./...` / `go test ./...` above
+      # do NOT descend into it. Build + run it explicitly here so it can't rot:
+      # `go run .` is self-checking (exits non-zero if the ABI round-trip fails),
+      # so this step is the witness that pkg/abi stays importable out-of-tree.
+      - name: examples/extdriver (out-of-tree pkg/abi driver builds + round-trips)
+        working-directory: examples/extdriver
+        run: |
+          go build ./...
+          go vet ./...
+          go run .
+
+      - name: disambiguation generated-index check
+        run: go run ./cmd/fak disambiguation generate --check --json
+
+      - name: claims-lint (every "- [" line in CLAIMS.md carries exactly one tag + a declared exposure state)
+        run: |
+          go test -count=1 -v -run 'TestCLAIMSLedger' ./internal/claimcheck/
+
+      - name: repo-hygiene gates (doc-placement · links · hosted-demos · demo-commands · browser-demo-contract · file-admission · secret-shapes · brand-descriptor · hardware-names)
+        working-directory: ${{ github.workspace }}
+        run: |
+          python tools/check_doc_placement.py --audit-tree
+          python tools/check_links.py --audit-tree
+          # Hosted-demo URL guard: static/no-network by default. It prevents docs/demos.html
+          # from reintroducing stale VM paths/ports or implying HTTPS support for the IP host
+          # before the public deployment actually has TLS.
+          python tools/demo_live_links.py
+          # Demo-command guard: static/no-network. It keeps run-the-demos and cmd/*/README
+          # from naming stale `go run ./cmd/...`, helper script, or python tool targets.
+          python tools/demo_command_audit.py
+          # Browser-demo contract guard: static/no-network. It keeps code default ports,
+          # local run docs, PORT examples, base-path examples, and nginx proxy snippets synced.
+          python tools/demo_browser_contract.py
+          python tools/check_committed_files.py --audit-tree
+          python tools/check_secret_shapes.py --audit-tree
+          # Brand-descriptor guard (#591), now served by the parity-proven Go hygiene
+          # gate. go run keeps this fresh-clone CI step independent of a prebuilt fak binary.
+          go run ./cmd/fak hygiene --gates BRAND_CONSISTENCY
+          # Unit test for a previously-untested load-bearing governance tool
+          # (flagged by tools/tool_coverage_audit.py): the prose hardware-name leak
+          # gate's prose/identifier boundary. HARD, then the leak gate's --check tree
+          # lint as before. (The new-leaf scaffolder is now Go: its dos.toml lane
+          # emitter invariant is covered by TestAddLeafLaneRealLayoutNotFakPrefix in
+          # internal/newleaf under `go test`.)
+          python tools/scrub_hardware_names_test.py
+          python tools/scrub_hardware_names.py --check
+          # Claude config-home guard (#606): a future tools/*.py must not re-introduce a
+          # bare ~/.claude/<store> hardcode that ignores CLAUDE_CONFIG_DIR (the fleet
+          # relocates every agent's config home), the way sync_memory.py once did
+          # (3eab69a). Flags a home-anchored bare .claude stepping into projects/memory
+          # without consulting CLAUDE_CONFIG_DIR; the all-accounts .claude* glob and the
+          # repo-root .claude/memory mirror are NOT flagged. Self-test HARD, then --check
+          # over the tracked tools tree (clean today: sync_memory/ctxcost/ctxwin pass).
+          python tools/claude_config_home_guard_test.py
+          python tools/claude_config_home_guard.py --check
+
+      - name: demo audit tool tests (registry · live-links · command refs · browser contract · smoke harnesses)
+        working-directory: ${{ github.workspace }}
+        run: |
+          python tools/demo_registry_test.py
+          python tools/demo_live_links_test.py
+          python tools/demo_command_audit_test.py
+          python tools/demo_browser_contract_test.py
+          python tools/demo_http_smoke_test.py
+          python tools/demo_headless_smoke_test.py
+
+      - name: demo HTTP smoke (browser demos build · base-path mount · page/API fetch)
+        working-directory: ${{ github.workspace }}
+        run: |
+          python tools/demo_http_smoke.py --timeout 60
+
+      - name: demo headless smoke (model-free terminal witnesses reproduce invariants)
+        working-directory: ${{ github.workspace }}
+        run: |
+          python tools/demo_headless_smoke.py --timeout 120
+
+      # Skill-frontmatter lint: the load-bearing Claude-only SKILL.md frontmatter keys
+      # (allowed-tools / disable-model-invocation / user-invocable) that opencode silently
+      # drops when a skill is cross-loaded into a mixed Claude+opencode fleet — so a
+      # read-only or operator-only skill can lose its capability boundary. The linter
+      # asserts every such load-bearing key is acknowledged. Its own unit tests run first
+      # (HARD), then --check over the skill tree. Pure-stdlib, green today, repo root like
+      # the other honesty gates — it ran in NO always-on gate at all before this.
+      - name: skill-frontmatter lint (load-bearing Claude-only SKILL.md keys acknowledged)
+        working-directory: ${{ github.workspace }}
+        run: |
+          python tools/skill_frontmatter_lint_test.py
+          python tools/skill_frontmatter_lint.py --check
+
+      # Context-tape visual renderer: the source-agnostic "how context assembles" tape
+      # (tools/context_tape.py) that reproduces the live demo panel for ANY data source —
+      # a synthetic scenario, a real session transcript, or an RSI keep/revert journal.
+      # The test locks the scenario-LCG PARITY with cmd/ctxdemo (per-agent totals), the
+      # EXACT per-turn usage bands (deduped on message.id), and well-formed/escaped SVG.
+      # Pure-stdlib and hermetic (no subprocess), green on Linux + Windows.
+      - name: context-tape visual renderer test (scenario parity · exact bands · well-formed SVG)
+        working-directory: ${{ github.workspace }}
+        run: |
+          python tools/context_tape_test.py
+
+      # vLLM first-class head-to-head harness: the gateway adjudication-tax witness
+      # (fak-fronts-vLLM vs raw-vLLM, the analog of the measured SGLang row) and the vLLM
+      # engine added to the GPU throughput bench (a first-class peer to llama.cpp). Both
+      # tests are hermetic + pure-stdlib — an in-process fake OpenAI server for the tax
+      # witness, and a rendered-driver / offline-normalizer exec for the bench engine; no
+      # GPU, no network, no real `fak serve`. They were in the un-gated tool-test tail, so
+      # a regression in the vLLM comparison harness went uncaught — gate them.
+      - name: vLLM head-to-head harness tests (adjudication-tax witness · gcp_bench vLLM engine)
+        working-directory: ${{ github.workspace }}
+        run: |
+          python tools/vllm_tax_witness_test.py
+          python tools/gcp_bench_test.py
+
+      # Tool-test no-blackhole gate (the systemic backstop the dispatch-loop step below
+      # calls for): the steps in this job hand-enumerate ~58 of 166 tools/*_test.py, so a
+      # NEWLY added tool test ran in NO gate at all (tool_coverage_audit.py only sees that a
+      # test EXISTS, not that it RUNS). gated_tool_tests.py discovers EVERY tools/*_test.py
+      # and accounts for each in exactly one bucket: gated-elsewhere (read live from THIS
+      # file, so it never drifts from the enumerated steps), quarantine (an explicit
+      # {name: reason} from a closed vocab — pytest / needs-network / needs-binary /
+      # needs-gpu / red), or HERMETIC (the default remainder — RUN here). Because the
+      # default is hermetic, a new test RUNS automatically; if it can't, the author must
+      # fix it or quarantine it with a reason — the no-future-blackhole forcing function.
+      # `--run` aggregates ALL failures (a red test never masks the rest). Its own unit
+      # tests run first (HARD), then the manifest self-check, then the ~88 hermetic tests
+      # that previously ran nowhere. Linux-authoritative (CI is ubuntu); the Windows/local
+      # mirror runs `--check` only (scripts/ci.ps1) since a few tests are platform-divergent.
+      - name: tool-test no-blackhole gate (discover + run every un-gated hermetic tools/*_test.py)
+        working-directory: ${{ github.workspace }}
+        run: |
+          python tools/gated_tool_tests_test.py
+          python tools/gated_tool_tests.py --check
+          python tools/gated_tool_tests.py --run
+
+      - name: release-substrate tests
+        working-directory: ${{ github.workspace }}
+        run: |
+          python tools/release_context_test.py
+          python tools/release_cut_test.py
+          python tools/release_manifest_test.py
+          python tools/release_dry_run_test.py
+          python tools/release_tag_test.py
+          python tools/release_publish_test.py
+          python tools/release_cadence_workflow_test.py
+          python tools/release_stale_escalate_test.py
+          python tools/release_artifacts_workflow_test.py
+          python tools/build_entrypoint_test.py
+          python tools/release_status_test.py
+          python tools/release_lock_test.py
+          python tools/scrub_public_copy_test.py
+          python tools/check_committed_files_test.py
+          python tools/memory_recall_audit_test.py
+          python tools/sync_memory_test.py
+          python tools/gofmt_debt_audit_test.py
+          python tools/safe_ff_sync_test.py
+          python tools/release_decide_test.py
+          python tools/stable_release_context_test.py
+          python tools/stable_release_promote_test.py
+          python tools/release_cut.py --json --allow-hold --limit-commits 20
+          python tools/release_dry_run.py --fast --json HEAD
+          python tools/release_dry_run.py --json HEAD
+
+      # DOS dispatch-loop tool tests: the GitHub-issue-backlog dispatch machinery
+      # (the fleet's second DOS work surface, docs/dispatch-loop.md) shipped a full
+      # test cluster, but NONE of it ran in any gate -- CI enumerated only the
+      # release/scorecard suites, so a regression in the closure auditor, the
+      # throughput meter, the issue picker, the lane router, the supervisor-status
+      # fold, or the hook-cost bench failed NOTHING (115 of 147 tool tests were
+      # un-gated). These ten are pure-stdlib and hermetic -- every gh/dos/git/claude
+      # boundary is seamed (verified: 0 real external subprocess calls) and they are
+      # green on Linux + Windows -- so they wire in HARD here. (The remaining
+      # un-gated long tail, including ~12 currently-red tool tests, is a separate
+      # cleanup; a glob-discovering runner that auto-gates new tool tests is the
+      # systemic follow-up.)
+      - name: dos dispatch-loop tool tests (closure-audit · throughput · picker · lane-router · hook-bench)
+        working-directory: ${{ github.workspace }}
+        run: |
+          python tools/issue_closure_audit_test.py
+          python tools/issue_triage_test.py
+          python tools/dispatch_throughput_test.py
+          python tools/dispatch_status_test.py
+          python tools/dispatch_preflight_test.py
+          python tools/issue_dispatch_test.py
+          python tools/issue_resolve_dispatch_test.py
+          python tools/issue_lane_router_test.py
+          python tools/dos_supervisor_status_test.py
+          python tools/dos_supervisor_watchdog_test.py
+          python tools/dos_supervisor_canary_test.py
+          python tools/dos_supervisor_canary_audit_test.py
+          python tools/dispatch_worker_test.py
+          python tools/dos_sync_test.py
+          python tools/fleet_dos_dispatch_watchdog_test.py
+          python tools/dos_hook_bench_test.py
+          python tools/dispositions_test.py
+
+      # claims-salience-register: the first WIRED consumer of the `dos salience` verdict
+      # (dos-kernel docs/391) — it routes CLAIMS.md through dos.salience.partition into a
+      # no-loss parked register so a true-but-parked [SIMULATED]/[STUB] claim is never
+      # silently dropped (see docs/notes/DOS-SALIENCE-USEFULNESS-AUDIT-2026-06-24.md). The
+      # test is HERMETIC: the dos-gated live smoke skips when the kernel isn't importable
+      # (CI has none), so this gates the pure parsing / no-loss / cross-check logic. The
+      # for-real run lives in `make ci` + scripts/ci.ps1, where the dos kernel is present.
+      - name: claims-salience-register (dos salience consumer; hermetic logic gated)
+        working-directory: ${{ github.workspace }}
+        run: python tools/claims_salience_register_test.py
+
+      # Notebook anti-rot gate: the cloud-notebook quickstarts under notebooks/ are
+      # GENERATED ARTIFACTS of tools/gen_notebooks.py. `--check` re-renders in memory and
+      # fails on drift (a hand-edited .ipynb) OR a stale repo reference (a cell points at
+      # an example/script/verb that no longer exists) — so the notebooks can't silently
+      # rot away from the commands they wrap. Runs from the repo root (notebooks/ + tools/).
+      - name: notebook-sync (cloud notebooks match tools/gen_notebooks.py + refs live)
+        working-directory: ${{ github.workspace }}
+        run: python tools/gen_notebooks.py --check
+
+      # Hero-benchmark honesty gate: the front-page headline chart + the top-10
+      # leaderboard are GENERATED from tools/hero_benchmark.data.json, not hand-
+      # maintained. --check fails the build if any committed output (the HERO doc,
+      # both SVGs, the HTML widget) drifted from the data file (someone edited an
+      # SVG/number by hand and skipped the generator). --verify-sources re-asserts
+      # every leaderboard number against its committed benchmark artifact under
+      # fak/experiments (a result file changed but the headline didn't follow).
+      # Pure stdlib — no pytest/jsonschema — so it runs anywhere the release tests
+      # do. This is what makes "generated, not hand-maintained" enforced, not a
+      # promise. (Richer dev guard: tools/hero_benchmark_gen_test.py under pytest.)
+      - name: hero-benchmark drift + source verification
+        working-directory: ${{ github.workspace }}
+        run: |
+          python tools/hero_benchmark_gen.py --check
+          python tools/hero_benchmark_gen.py --verify-sources
+          # ship-iff-cited: every experiments/ artifact + *-RESULTS.md a public doc
+          # cites must EXIST in the public tree. --verify-sources proves the number
+          # matches its artifact; this proves the artifact wasn't scrubbed away (the
+          # over-cut alarm). Regenerate the manifest with --derive as new artifacts land.
+          python tools/public_evidence_manifest.py --check
+          python tools/hero_statcard_gen.py --check
+          # the three lab-style headline visuals (BENCHMARK-GALLERY.md): one
+          # source-of-truth data.json -> one renderer -> one SVG, drift-gated.
+          python tools/hero_matrix_gen.py --check
+          go run ./cmd/fak turntax visual --check
+          python tools/hero_sweep_gen.py --check
+
+      # Docs scorecard: the whole-corpus analogue of the README freshness audit.
+      # Grades every core / reader-reachable doc on five KPIs and counts doc-debt
+      # (dead links, stale install pins, placeholders, missing titles, strawman
+      # headlines, orphans). Two tiers, matching how the gofmt gate ratcheted once
+      # the tree was clean:
+      #   * ADVISORY on --scope core for now: the public snapshot scrub removed
+      #     docs/adoption-playbook.md (an internal note) but left dead links to it
+      #     in README.md / docs/FAQ.md + the core-doc list, so core doc-debt is
+      #     currently > 0 on the public tree. Surfaced as a ::warning:: until those
+      #     dangling refs are retired with /garden-docs, then RATCHET back to HARD.
+      #   * ADVISORY on --scope reachable (the 167-doc reader surface): surfaces
+      #     the work-list as a ::warning:: without failing — reader-surface debt is
+      #     a judgment call until ratcheted (issue #95).
+      # Runs the tool's own test first. Pure-stdlib Python, repo root like the
+      # other doc-honesty gates (claims-lint, hero-benchmark, leak-scan).
+      - name: docs scorecard (5 KPIs + doc-debt; core advisory pending scrub fix)
+        working-directory: ${{ github.workspace }}
+        run: |
+          python tools/docs_scorecard_test.py
+          echo "::group::docs-scorecard (core: advisory until adoption-playbook refs retired)"
+          python tools/docs_scorecard.py --scope core \
+            || echo "::warning title=docs-debt-core::core doc-debt present (advisory) — public-scrub dangling refs (adoption-playbook.md); run /garden-docs, then re-arm the HARD gate"
+          echo "::endgroup::"
+          echo "::group::docs-scorecard (reachable: advisory)"
+          python tools/docs_scorecard.py --scope reachable \
+            || echo "::warning title=docs-debt::reader-surface doc-debt present (advisory) — run /garden-docs, see docs/DOCS-SCORECARD.md"
+          echo "::endgroup::"
+
+      # Demo-quality scorecard: the runnable-demos analogue of the docs scorecard.
+      # Grades every runnable demo (examples/* + cmd/*demo + explicit demo commands) on five axes
+      # (runnable · reproducible · honest_scope · self_contained · documented) and
+      # counts demo-debt (no one-command runner, no captured EXAMPLE-OUTPUT, no
+      # "what this does NOT claim" scope statement, state created without cleanup,
+      # missing title). The corpus is now clean, so this is HARD: demo-debt must
+      # stay at zero instead of surfacing as an advisory warning.
+      # Pure-stdlib Python, repo root like the other honesty gates.
+      - name: demo-quality scorecard (5 axes + demo-debt; HARD zero-debt gate)
+        working-directory: ${{ github.workspace }}
+        run: |
+          python tools/demo_quality_scorecard_test.py
+          echo "::group::demo-quality-scorecard (HARD zero demo-debt gate)"
+          python tools/demo_quality_scorecard.py
+          python tools/demo_quality_scorecard.py --check-doc
+          echo "::endgroup::"
+
+      # Demo-robustness scorecard: the SAME demo corpus through a second lens —
+      # not "can a skeptic trust the claim" (that's demo-quality) but "will it keep
+      # running": simple to run, fast with no surprise waits, durable over time.
+      # Three axes (simplicity · speed · durability) and a robustness-debt integer
+      # (an unbounded wait loop, an unpinned run-time dep, no stated runtime, no
+      # stability guarantee). The corpus is clean, so this is HARD: robustness-debt
+      # must stay at zero instead of surfacing as an advisory warning.
+      # Pure-stdlib Python, repo root like the other honesty gates.
+      - name: demo-robustness scorecard (3 axes + robustness-debt; HARD zero-debt gate)
+        working-directory: ${{ github.workspace }}
+        run: |
+          python tools/demo_robustness_scorecard_test.py
+          echo "::group::demo-robustness-scorecard (HARD zero robustness-debt gate)"
+          python tools/demo_robustness_scorecard.py
+          python tools/demo_robustness_scorecard.py --check-doc
+          echo "::endgroup::"
+
+      # SEO/AEO discoverability gate (the docs scorecard's discovery-side twin).
+      # The tool's own unit tests are HARD; the content checks are ADVISORY for now
+      # (the docs site + FAQ structured data are landing across commits in a shared
+      # tree). RATCHET to HARD on `gen_structured_data.py --check` once the FAQPage
+      # block has landed in docs/FAQ.md, exactly as docs-scorecard ratchets:
+      #   * gen_structured_data.py --check — the site/FAQ JSON-LD is generated and
+      #     must stay in sync with VERSION / _config.yml / FAQ.md; a drift or a raw
+      #     markdown artifact in an answer surfaces as a ::warning::.
+      #   * fak score seo --scope core — surfaces seo-debt (a page with no
+      #     meta description, a missing JSON-LD type, a dead link) as a ::warning::.
+      #     The SCORES themselves are strategic and live in the private repo
+      #     (--transfer); only the read-only work-list runs here. Pure-stdlib Python.
+      - name: seo/aeo scorecard (content checks advisory, ratchetable; unit tests now go test ./...)
+        working-directory: ${{ github.workspace }}
+        run: |
+          echo "::group::structured-data sync (advisory until FAQPage lands)"
+          python tools/gen_structured_data.py --check \
+            || echo "::warning title=jsonld-drift::structured data out of date / answer artifacts — run python tools/gen_structured_data.py"
+          echo "::endgroup::"
+          echo "::group::seo-aeo-scorecard (core: advisory)"
+          go run ./cmd/fak score seo --scope core \
+            || echo "::warning title=seo-debt::SEO/AEO discoverability debt present (advisory) — add missing front-matter title/description; see fak score seo"
+          echo "::endgroup::"
+
+      # Repo-hygiene scorecard: the structural counterpart of the docs/code
+      # scorecards. Grades the whole git-tracked tree on four groups — verbosity,
+      # organization, indexing, accessibility — and counts hygiene-debt (a
+      # duplicate or oversized doc, root clutter, a misplaced dated note, an
+      # orphan no index links, an AI-tell phrase). It is the tree-wide MEASUREMENT
+      # of the same closed-vocabulary reasons the pre-commit gates enforce one
+      # commit at a time (DOC_PLACEMENT, FILE_ADMISSION, BROKEN_LINK) — it imports
+      # their rules so the number and the gate cannot drift. Same two tiers as its
+      # siblings:
+      #   * the tool's own unit tests are HARD (a real regression suite);
+      #   * the scorecard is ADVISORY while the last structural debt is retired
+      #     (a few dated docs to move, a benchmark-dir merge), then RATCHET to
+      #     HARD — it is deterministic over the tracked tree, so a clean tree
+      #     stays clean. Pure-stdlib Python, repo root like the other gates.
+      - name: repo-hygiene scorecard (4 groups + hygiene-debt; tests HARD, scorecard advisory)
+        working-directory: ${{ github.workspace }}
+        run: |
+          python tools/repo_hygiene_scorecard_test.py
+          echo "::group::repo-hygiene-scorecard (advisory while the last structural debt is retired)"
+          python tools/repo_hygiene_scorecard.py \
+            || echo "::warning title=hygiene-debt::repo hygiene-debt present (advisory) — see docs/REPO-HYGIENE-SCORECARD.md; retire worst-first (consolidate dupes, clear root clutter, move dated docs to docs/notes/, index orphans, cut AI-tells), then re-arm the HARD gate"
+          echo "::endgroup::"
+
+      # Scorecard control pane: the RSI checking layer for the whole scorecard
+      # family. The gates above each emit ONE debt integer (doc/readme/code/appeal/
+      # seo/demo/robustness/hygiene/...); none folds them into a single portfolio
+      # number, pins a per-metric baseline, and shows the commit-over-commit
+      # trend. This aggregator does — so "is the repo getting better or worse"
+      # is one query. The README freshness score rides this same green ratchet
+      # (#779/#893), not a standalone red gate. Same two tiers as its siblings:
+      #   * the tool's own unit tests are HARD (a real regression suite);
+      #   * the folded aggregate is now a HARD ratchet (`--check`, #587): unlike
+      #     the default exit (green only at ZERO debt), `--check` is GREEN while
+      #     the portfolio holds at-or-below its pinned baseline and RED only when
+      #     debt *regresses* above it (or a scorecard goes unmeasured). The
+      #     pinned baseline (tools/scorecard_baseline.json) carries headroom over
+      #     today's debt, so a clean tree stays green; only a real regression
+      #     reds the trunk. Retire worst-first with the owning scorecard's skill,
+      #     then re-pin (`--pin`). Pure-stdlib Python.
+      #   * the GRADE axis is gated too (#1423, the "stays Excellent" half of
+      #     #1414): the baseline carries per-metric grade_weights, so a scorecard
+      #     slipping a letter (A->B) reds CI EVEN WHEN total_debt held flat — the
+      #     regression a flat raw sum would hide. Mirror of the milestone climb
+      #     ratchet (#1442). HARD by default; FAK_SCORECARD_GRADE_RATCHET=0 demotes
+      #     it to advisory for a deliberate one-off pin on a known-dirty tree.
+      - name: scorecard control pane (folds every *-debt + trend; HARD raw+grade ratchet --check)
+        working-directory: ${{ github.workspace }}
+        run: |
+          python tools/readme_freshness_audit_test.py
+          python tools/readme_freshness_audit.py --json
+          python tools/scorecard_control_pane_test.py
+          python tools/scorecard_control_pane.py --check
+
+      # Scoreboard producer (#997): publish EACH folded scorecard payload to the
+      # #scoreboard Slack workspace after the control-pane family runs. This uses
+      # the dedicated CI secrets FAK_SCOREBOARD_TOKEN / FAK_SCOREBOARD_CHANNEL —
+      # never the lab SLACK_BOT_TOKEN — and always exercises the no-network
+      # --dry-run renderer before any live post. Live posts are limited to trunk
+      # pushes with both secrets set; PRs and unprovisioned repos still render
+      # auditable cards in the step summary/artifact.
+      - name: scorecard scoreboard producer (dry-run + optional post)
+        working-directory: ${{ github.workspace }}
+        env:
+          FAK_SCOREBOARD_TOKEN: ${{ secrets.FAK_SCOREBOARD_TOKEN }}
+          FAK_SCOREBOARD_CHANNEL: ${{ secrets.FAK_SCOREBOARD_CHANNEL }}
+          FAK_SCOREBOARD_SOURCE: ci:${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          go build -o fak ./cmd/fak
+          mkdir -p scorecard-payloads scorecard-cards
+
+          python - <<'PY' > scorecard-post-plan.tsv
+          import shlex
+          import sys
+
+          sys.path.insert(0, "tools")
+          import scorecard_control_pane as scp
+
+          for card in scp.SCORECARDS:
+              if card.get("cmd"):
+                  cmd = card["cmd"]
+                  if cmd.startswith("go run ./cmd/fak "):
+                      cmd = "./fak " + cmd[len("go run ./cmd/fak "):]
+              else:
+                  cmd = shlex.join([sys.executable, "tools/" + card["script"], "--json"])
+              print("\t".join([card["key"], card["label"], card["debt"], cmd]))
+          PY
+
+          live_post=false
+          if [ "${GITHUB_EVENT_NAME}" = "push" ] &&
+             { [ "${GITHUB_REF_NAME}" = "main" ] || [ "${GITHUB_REF_NAME}" = "master" ]; } &&
+             [ -n "${FAK_SCOREBOARD_TOKEN:-}" ] &&
+             [ -n "${FAK_SCOREBOARD_CHANNEL:-}" ]; then
+            live_post=true
+          fi
+
+          rendered=0
+          posted=0
+          skipped=0
+          failed=0
+          while IFS=$'\t' read -r key label debt_key cmd; do
+            payload="scorecard-payloads/${key}.json"
+            card_text="scorecard-cards/${key}.txt"
+            echo "::group::scoreboard dry-run ${label}"
+            set +e
+            bash -lc "$cmd" > "$payload"
+            rc=$?
+            set -e
+            if ! python -m json.tool "$payload" >/dev/null 2>&1; then
+              echo "::warning title=scoreboard-producer::${label} emitted no valid JSON; skipped (exit ${rc})"
+              failed=$((failed + 1))
+              echo "::endgroup::"
+              continue
+            fi
+            if [ "$rc" -ne 0 ]; then
+              echo "::notice title=scoreboard-producer::${label} exited ${rc} after emitting JSON; posting the reported result"
+            fi
+            ./fak scoreboard post \
+              --from "$payload" \
+              --debt-key "$debt_key" \
+              --title "$label" \
+              --source "$FAK_SCOREBOARD_SOURCE" \
+              --dry-run | tee "$card_text"
+            rendered=$((rendered + 1))
+            echo "::endgroup::"
+
+            if [ "$live_post" = "true" ]; then
+              ./fak scoreboard post \
+                --from "$payload" \
+                --debt-key "$debt_key" \
+                --title "$label" \
+                --source "$FAK_SCOREBOARD_SOURCE"
+              posted=$((posted + 1))
+            else
+              skipped=$((skipped + 1))
+            fi
+          done < scorecard-post-plan.tsv
+
+          {
+            echo "## scorecard scoreboard producer"
+            echo "- dry-run rendered: ${rendered}"
+            echo "- live posted: ${posted}"
+            echo "- live skipped: ${skipped}"
+            echo "- payload failures skipped: ${failed}"
+            echo
+            echo "Live posting requires a push to main/master plus FAK_SCOREBOARD_TOKEN and FAK_SCOREBOARD_CHANNEL CI secrets."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$failed" -ne 0 ]; then
+            exit 1
+          fi
+
+      - name: upload scorecard scoreboard artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scorecard-scoreboard-cards
+          path: |
+            scorecard-post-plan.tsv
+            scorecard-payloads/
+            scorecard-cards/
+          if-no-files-found: ignore
+
+      # Learning-docs scorecard: the pedagogy measuring stick for the teaching
+      # corpus (the university, the how-to set, the explainers). It had `--json` /
+      # `--markdown` / `--stamp` but no gate — which is why the corpus drifted 34
+      # defects deep before a human noticed (cf1deba4). `--check` (#1280) is the
+      # keep-bit ratchet every #1278 child reads: GREEN while learning-debt holds
+      # at-or-below the pinned `--baseline` ceiling (45 today, matching the
+      # control-pane baseline) and RED only on a regression, so learning-debt
+      # cannot merge silently again.
+      # The tool's own unit tests are HARD; the ratchet is HARD at baseline 45.
+      - name: learning-docs scorecard (pedagogy KPIs + learning-debt; HARD ratchet --check)
+        working-directory: ${{ github.workspace }}
+        run: |
+          python tools/learning_scorecard_test.py
+          python tools/learning_scorecard.py --check --baseline 45
+
+      # Scorecard regression suites (the family that ran in NO gate): the docs / demo-quality
+      # / demo-robustness / seo-aeo / repo-hygiene scorecards each run their own *_test.py
+      # HARD above, but members of the same family — code-quality, doc-appeal, industry,
+      # tooling-quality, observability — had no test step anywhere, so a regression in any of
+      # those tools (whose debt the control pane folds) failed nothing. (agent-readiness was
+      # ported to Go — internal/agentreadinessscore — and is now gated by `go test ./...`.)
+      # Their suites are deterministic, pure-stdlib (the code-quality + tooling-quality
+      # runners were converted off the pytest subprocess to match their siblings), and green
+      # today; wired HARD here so the whole family is gated symmetrically.
+      - name: scorecard regression suites (code-quality · doc-appeal · industry · tooling-quality · observability · stability)
+        working-directory: ${{ github.workspace }}
+        run: |
+          python tools/code_quality_scorecard_test.py
+          python tools/doc_appeal_scorecard_test.py
+          python tools/industry_scorecard_test.py
+          python tools/tooling_quality_scorecard_test.py
+          python tools/observability_scorecard_test.py
+          # stability: the sentinel/invariant/revert/drift measuring stick. Its live
+          # smoke asserts the real tree folds to ZERO stability-debt (grade A) — the
+          # HARD regression sentinel for the day someone removes a gate, an invariant,
+          # a ratchet baseline, or the rollback runbook.
+          python tools/stability_scorecard_test.py
+          # guard-RSI: the RSI loop for `fak guard` scored against reality (the verdict
+          # loop closes on the real decision journal; the latency loop's hardware gate is
+          # honestly disclosed). The verdict-loop + scorecard Python tools were ported to Go
+          # (internal/guardrsi) and deleted in 6d288b9a; this runs the Go port's tests, which
+          # pin the verdict loop's presence + the honesty gate that refuses an unwitnessed /
+          # empty-journal keep.
+          go test ./internal/guardrsi/
+
+      # Behavior-contract scorecard (#2900, Hermes epic #2871): the testing-quality
+      # sibling of the code-slop stick, codifying Hermes' rubric as a fak law. It
+      # classifies every Test func as a behavior CONTRACT (asserts an invariant — a
+      # relation between two computed values) or a CHANGE-DETECTOR (only freezes a
+      # literal count / config-version / enumeration list — the test breaks on every
+      # legitimate change and asserts nothing real) and reports the change-detector
+      # debt to retire. Two-tier like its scorecard siblings:
+      #   * the tool's own unit tests are HARD — a real regression suite that locks the
+      #     deliberately low-false-positive classifier (a bare scalar compare is NOT a
+      #     freeze; a test carrying any real invariant is exonerated);
+      #   * the detector itself runs ADVISORY over the tree — the change-detector debt
+      #     is a work-list surfaced as a ::warning::, retired worst-first (replace a
+      #     frozen count/list with a relation between two computed values), then RATCHET
+      #     to HARD once the debt is driven down, exactly as docs/demo-quality did.
+      # Pure-stdlib static Go analysis (no `go` shell, no network), repo root like the
+      # other honesty gates.
+      - name: behavior-contract scorecard (contract-vs-change-detector tests; unit tests HARD, detector advisory)
+        working-directory: ${{ github.workspace }}
+        run: |
+          python tools/behavior_contract_scorecard_test.py
+          echo "::group::behavior-contract-scorecard (advisory change-detector debt work-list)"
+          python tools/behavior_contract_scorecard.py \
+            || echo "::warning title=change-detector-debt::change-detector test debt present (advisory) — a test freezes a literal count/version/enumeration and asserts no invariant; retire worst-first (assert a relation between two computed values), see tools/behavior_contract_scorecard.py and #2900"
+          echo "::endgroup::"
+
+      # Anti-change-detector structural gate (#2942, Hermes rule "Behavior contracts
+      # over snapshots"): Hermes rejects "change-detector tests" by human review — a test
+      # that freezes a current value (a magic enumeration count, a wholly-literal list
+      # equality, a pinned version string) instead of asserting how two pieces of data must
+      # relate. That review rule was enforced only by a human noticing; the
+      # CHANGE_DETECTOR_TEST boundarylint rule (internal/boundarylint/rules_changedetector.go)
+      # turns it into a mechanism. It ran ONLY transitively inside `go test ./...` (via
+      # TestTestSuitePolicy) and the purpose-built `fak boundary` binary gate ran in NO CI
+      # step at all — so this wires BOTH as an explicit, named, HARD gate on the governed
+      # _test.go paths (the peer the advisory behavior-contract scorecard above defers to):
+      #   * the golden pair (TestChangeDetectorRule) proves the rule CATCHES a real
+      #     change-detector (want=1: len frozen to a magic count, a wholly-literal deep
+      #     equality, a pinned semver) and ALLOWS a real invariant/relation test (want=0);
+      #   * the shrink-only ratchet (TestTestSuitePolicy) fails on any NEW change-detector
+      #     in a non-grandfathered file, uncached (-count=1) so a stale cache can't mask it;
+      #   * `fak boundary` is the same ratchet on the running binary — the dogfood the verb
+      #     was built for (cmd/fak/boundary.go: "wireable into make ci as a binary gate").
+      - name: anti-change-detector gate (CHANGE_DETECTOR_TEST — golden catch/allow · ratchet · fak boundary)
+        run: |
+          go test -count=1 ./internal/boundarylint -run '^(TestChangeDetectorRule|TestTestSuitePolicy)$'
+          go run ./cmd/fak boundary
+
+      # Public-copy leak gate: the machine backstop for the redact-needle floor.
+      # The local pre-commit hook (tools/githooks/pre-commit) only fires on a clone
+      # that ran `install_trunk_guard.py`; an un-armed clone — or any path that
+      # reaches the trunk without it — has NO leak gate. This runs the SAME
+      # AUDIT_NEEDLES scan over exactly the commits the push ADDS to the trunk
+      # (added lines only, SELF_REFERENTIAL exempt), failing the build on any
+      # operator-secret needle (real IP, operator path/host) reaching the trunk. Runs
+      # from the repo root (the needle list + policy live there) like dos-review.
+      - name: leak-scan (no operator-secret needle reaches the trunk)
+        working-directory: ${{ github.workspace }}
+        run: |
+          RANGE="${{ github.event.pull_request.base.sha || github.event.before }}..${{ github.sha }}"
+          # fall back to the last commit on a shallow checkout where base is absent.
+          git rev-parse "${RANGE%%..*}" >/dev/null 2>&1 || RANGE="HEAD~1..HEAD"
+          echo "leak-scan $RANGE"
+          go run ./cmd/fak public-scrub audit-range --root . "$RANGE"
+
+      # Bindable ship-stamp coverage (advisory, #517): the per-commit complement to
+      # the dos-review gate below. `dos review` witnesses each CLAIMED commit against
+      # its own diff; it does NOT report what FRACTION of recent commits carry a
+      # referee-bindable `(fak <leaf>)` stamp — so that coverage number was guessed,
+      # not watched. commit_stamp_doctor measures exactly that. Wired ADVISORY, in the
+      # same two-tier shape as the scorecard family above: the tool's own unit tests
+      # are HARD (a real regression suite), and the coverage check runs with
+      # `--min-coverage` as a ::warning:: FLOOR that never fails the build — so the
+      # number is tracked commit-over-commit without fighting the established stamping
+      # habit (off-lane stamps stay advisory-only per #517). Ratchet to HARD by dropping
+      # the `|| echo` once coverage sits durably above the floor. (#387 is the
+      # verify-referee that binds the `(fak <leaf>)` trailer this measures.)
+      - name: ship-stamp coverage (advisory; unit tests HARD, coverage a watched floor)
+        working-directory: ${{ github.workspace }}
+        run: |
+          python tools/commit_stamp_doctor_test.py
+          echo "::group::commit-stamp-doctor (bindable ship-stamp coverage, advisory)"
+          python tools/commit_stamp_doctor.py --min-coverage 60 \
+            || echo "::warning title=stamp-coverage::bindable ship-stamp coverage below the watched floor (advisory) — add a (fak <leaf>) trailer to recent ships; see tools/commit_stamp_doctor.py and #517"
+          echo "::endgroup::"
+
+      # Witness-gradeable commit-subject coverage (advisory): the subject-verb twin
+      # of the ship-stamp coverage above. The DOS commit-audit witness ABSTAINs on a
+      # noun-led subject, and ABSTAIN-with-source is the DOMINANT cause of an issue
+      # grading CLAIMED_CLOSED instead of TRUE_RESOLVED (the closure auditor measured
+      # ~13/43). commit_subject_coverage folds check_commit_msg.verdict (the SAME verb
+      # set the commit-msg hook enforces) over recent ship subjects so that abstain
+      # rate is WATCHED, not guessed. Two-tier like its siblings: the tool's unit
+      # tests are HARD; the coverage check runs --min-coverage as a ::warning:: floor
+      # that never fails the build. Pure git-log read, no gh/dos.
+      - name: commit-subject coverage (advisory; unit tests HARD, witness-gradeability a watched floor)
+        working-directory: ${{ github.workspace }}
+        run: |
+          python tools/commit_subject_coverage_test.py
+          echo "::group::commit-subject-coverage (witness-gradeable subject fraction, advisory)"
+          python tools/commit_subject_coverage.py --min-coverage 75 \
+            || echo "::warning title=subject-coverage::witness-gradeable commit-subject coverage below the watched floor (advisory) — lead the description with a recognized verb (add/fix/implement/…); see tools/check_commit_msg.py"
+          echo "::endgroup::"
+
+      # Load-bearing tool test-coverage (advisory): code_quality_scorecard grades GO
+      # only, so the python tools/ cluster (~196 modules, many a SKILL.md helper or a
+      # CI gate) had NO coverage gate -- exactly how the 470-line issue_triage.py
+      # shipped untested and invisible. tool_coverage_audit is the cheap STATIC
+      # complement (no test execution, zero added CI-time): it flags load-bearing
+      # modules (those a SKILL.md / ci.yml references) that have no sibling _test.py.
+      # Two-tier like its siblings: the unit tests are HARD, the coverage check runs
+      # --min-coverage as a ::warning:: floor. Pure filesystem read.
+      - name: tool test-coverage (advisory; unit tests HARD, load-bearing coverage a watched floor)
+        working-directory: ${{ github.workspace }}
+        run: |
+          go test ./internal/devcmd -run ToolCoverageAudit -count=1
+          echo "::group::tool-coverage-audit (load-bearing python tools/ test coverage, advisory)"
+          go run ./cmd/fak-dev tool-coverage-audit --min-coverage 75 \
+            || echo "::warning title=tool-coverage::load-bearing tool test-coverage below the watched floor (advisory) — add a sibling _test.py for the named modules; run fak-dev tool-coverage-audit"
+          echo "::endgroup::"
+
+      # DOS trust-floor gate: the verdict IS the exit code. `dos review` fails the build
+      # (exit 1) if any commit in the pushed range makes a code/test/doc claim its own diff
+      # does not witness (a "fix: X" that didn't touch X, an empty "done"). This is DOS
+      # gated INTO the build pipeline — not a post-hoc audit — per the workspace's own
+      # trust-floor thesis (CLAIMS.md, the dos-kernel plugin). Runs from the repo root
+      # (DOS reads .github/.. and dos.toml there), so it overrides the fak/ working-dir.
+      - name: dos-review (every claimed commit witnessed by its own diff)
+        working-directory: ${{ github.workspace }}
+        run: |
+          python -m pip install --quiet --disable-pip-version-check dos-kernel
+          RANGE="${{ github.event.pull_request.base.sha || github.event.before }}..${{ github.sha }}"
+          echo "dos review $RANGE"
+          # fetch the base so the range resolves on a shallow checkout; fall back to last commit.
+          git rev-parse "${RANGE%%..*}" >/dev/null 2>&1 || RANGE="HEAD~1..HEAD"
+          dos review "$RANGE"   # positional range; exit 0 clean / 1 residual / 2 unreadable
+
+      # RSI main-KPI regression gate — the rsiloop track verdict made ENFORCING.
+      # internal/rsiloop is fak's closed recursive-self-improvement loop; its
+      # keep/revert/regression verdict IS the `dos improve` contract computed in-code
+      # (docs/rsi-loop.md — the exit codes "mirror the dos improve verdict"). The
+      # `improve` arm owns the non-forgeable keep-bit; the `track` arm re-measures the
+      # deterministic main KPI (lru_hit_rate at DefaultCacheSize — wall-clock-free and
+      # RNG-free per docs/proofs/00-METHOD.md, so the value is bit-identical on the
+      # runner: a single integer hits/total division) in a worktree off HEAD and exits 3
+      # on a STRICT drop vs the committed baseline floor — the same REVERT verdict
+      # `dos improve` renders for a non-improving candidate, here made a HARD gate.
+      # Until now that verdict was INERT (nothing ran it); this gives the DOS-shaped RSI
+      # verdict teeth (retires the rsi_maturity_scorecard regression_gate_in_ci gap). A
+      # failure means main's KPI genuinely regressed (e.g. DefaultCacheSize was lowered,
+      # or the reference trace broke) — a real defect, not flakiness.
+      - name: rsi regression gate (rsiloop track — main KPI must not regress)
+        run: |
+          cp internal/rsiloop/testdata/main-kpi-baseline.jsonl "${RUNNER_TEMP:-/tmp}/rsi-track.jsonl"
+          go run ./cmd/rsiloop -mode track -repo . -baseline-ref HEAD -journal "${RUNNER_TEMP:-/tmp}/rsi-track.jsonl"
+
+  # E-001 (Go Race Detector Support): the data-race gate. The build-vet-test job
+  # above runs `go test ./...` WITHOUT instrumentation; this job re-runs the SAME
+  # suite under `-race`, which is the only thing that turns a benign-looking
+  # concurrent read/write into a hard CI failure. Kept a SEPARATE job (not a step)
+  # so the race signal is its own required check and its ~2-10x slowdown never
+  # gates the fast build/vet/test feedback.
+  #
+  # WHY THIS DOESN'T RUN LOCALLY ON EVERY BOX: `-race` requires cgo + a C
+  # compiler. The canonical Windows dev host has CGO_ENABLED=0 and no gcc/clang,
+  # so the race detector physically cannot build there (it silently produces an
+  # un-instrumented binary). ubuntu-latest ships gcc and defaults CGO_ENABLED=1,
+  # so this is the reproducible home of the "race-free" claim. See
+  # docs/testing/race-detector.md for how to run it locally (WSL/Linux/macOS).
+  race-detector:
+    if: github.event_name != 'workflow_dispatch'
+    name: race detector · go test -race ./...
+    runs-on: ubuntu-latest
+    env:
+      GOTOOLCHAIN: auto
+      # Keep race compilation under the same hosted-runner process ceiling.
+      GOFLAGS: "-p=1"
+      GOMAXPROCS: "2"
+      # Set explicitly so the job FAILS LOUDLY if it ever lands on a cgo-less
+      # image, instead of silently building a non-instrumented (race-blind) binary.
+      CGO_ENABLED: "1"
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false # zero external deps -> no go.sum to key a cache on
+
+      # Race-build cache, the single biggest CI-time win here: `-race` re-instruments and
+      # recompiles the whole tree (the reason this job carries a 25m timeout). Its GOCACHE
+      # entries are race-instrumented, so they get a SEPARATE key prefix (gorace) from the
+      # non-race build cache above — restoring it lets a push recompile only the packages
+      # that changed under instrumentation instead of all of them.
+      - name: cache Go race build cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/go-build
+          key: ${{ runner.os }}-gorace-${{ hashFiles('go.mod') }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-gorace-${{ hashFiles('go.mod') }}-
+            ${{ runner.os }}-gorace-
+
+      - name: C toolchain present (the race detector needs cgo)
+        run: cc --version
+
+      - name: go test -race ./... (zero data races)
+        # -count=1 forces a real, uncached run — the honest "fresh read-back" of
+        # the race-free claim on every push/PR, never a cached green from before.
+        # -timeout=25m: ThreadSanitizer instrumentation makes CPU-bound packages
+        # (e.g. internal/turnbench's sweep/grid tests) 5-10x slower, well past the
+        # default 10m per-package binary timeout. This only grants wall-clock; it
+        # changes nothing about which tests run.
+        run: go test -race -count=1 -timeout=25m ./...
+
+  # head-snapshot-build (#966): the build-vet-test job above builds the TIP of a
+  # push. On this high-churn shared trunk a single push often carries SEVERAL
+  # commits from a fast session, and a peer who pulls and lands on an INTERMEDIATE
+  # commit gets whatever that commit's tree compiles to — not the tip's. The escape
+  # #966 names (a path-scoped commit that referenced a symbol whose definition was
+  # only in the author's uncommitted working tree) is exactly this class: the tip
+  # built, an earlier commit did not. This job builds EACH committed snapshot in the
+  # pushed range in isolation (a clean checkout per commit, no working-tree extras),
+  # so a non-compiling intermediate commit fails CI instead of silently reaching a
+  # peer's pull. Bounded to the last 25 commits of the range (logged if truncated)
+  # so a force-rebuild or a first push can't run unbounded.
+  head-snapshot-build:
+    name: per-commit build · every pushed snapshot compiles
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    env:
+      GOTOOLCHAIN: auto
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # need the full pushed range, not a shallow tip
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: build each committed snapshot in the pushed range
+        env:
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          # Resolve the commit range. On the first push to a ref, BEFORE is all-zeros;
+          # fall back to just the tip so a new branch doesn't try to build all of history.
+          if [ -z "${BEFORE:-}" ] || ! git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
+            range="${AFTER}~1..${AFTER}"
+            git cat-file -e "${AFTER}~1^{commit}" 2>/dev/null || range="${AFTER}"
+          else
+            range="${BEFORE}..${AFTER}"
+          fi
+          # Oldest-first, so a break is reported at the first bad commit. If the range
+          # resolves to nothing (e.g. a tag push with no new commits), fall back to the tip.
+          mapfile -t commits < <(git rev-list --reverse "$range" 2>/dev/null || true)
+          if [ "${#commits[@]}" -eq 0 ]; then
+            commits=("${AFTER}")
+          fi
+          total=${#commits[@]}
+          cap=25
+          if [ "$total" -gt "$cap" ]; then
+            echo "::notice::pushed range has $total commits; building the last $cap (older commits in this push are not per-commit-built)"
+            commits=("${commits[@]: -$cap}")
+          fi
+          echo "building ${#commits[@]} committed snapshot(s) from range $range"
+          work="$(mktemp -d)"
+          git worktree add --detach "$work" "${AFTER}" >/dev/null
+          trap 'git worktree remove --force "$work" >/dev/null 2>&1 || true' EXIT
+          for sha in "${commits[@]}"; do
+            git -C "$work" checkout --quiet --detach "$sha"
+            if ! ( cd "$work" && go build ./... ); then
+              echo "::error::commit $sha does not compile in isolation (go build ./... failed). A path-scoped commit likely referenced a symbol defined only in an uncommitted/later file."
+              exit 1
+            fi
+            echo "  ok  $sha"
+          done
+          echo "all pushed snapshots compile"

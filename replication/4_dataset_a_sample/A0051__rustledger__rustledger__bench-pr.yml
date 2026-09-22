@@ -1,0 +1,450 @@
+# PR Benchmark workflow - benchmarks with PR comments
+#
+# Runs a benchmark on PRs (10K transactions) and posts results as a comment.
+# Uses same dataset size as nightly for accurate "vs main" comparison.
+#
+name: PR Benchmarks
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'crates/**/*.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      # A change to this workflow must exercise itself: the numbers it
+      # posts are only trustworthy if the measuring code has been run.
+      # Without this, a PR editing this file skips the benchmark and
+      # lands unvalidated (which is exactly what happened on #2094).
+      - '.github/workflows/bench-pr.yml'
+permissions:
+  contents: read
+  pull-requests: write
+env:
+  CARGO_TERM_COLOR: always
+jobs:
+  pr-benchmark:
+    name: PR Benchmark
+    runs-on: ubuntu-latest
+    env:
+      # ONE definition. Generation, timing, RSS and the report all read this;
+      # stating it per-step let the four drift apart, which is the same defect
+      # as the footer that claimed a run count nothing tied it to.
+      BENCH_SHAPES: simple investment fifo
+      # Same reason: hyperfine consumes this and the comment footer reports
+      # it back, and a footer describing sampling that did not happen is the
+      # exact bug this workflow already shipped once.
+      BENCH_WARMUP: 3
+    # Two release builds now (PR and base), so the budget is doubled.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The base commit is built and measured alongside the PR, so its
+          # history has to be here.
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable
+        with:
+          toolchain: 1.97.0 # pinned stable — bump deliberately, IN LOCKSTEP with rust-toolchain.toml (see #1745, #1750)
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          cache-on-failure: true
+          prefix-key: bench-pr
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          pip install beancount
+
+          # Hyperfine — use authenticated `gh api` (5000/hr rate limit
+          # vs 60/hr unauth) and `curl -f` so an HTTP error fails the
+          # step rather than piping a 404 page into tar.
+          HYPERFINE_VERSION=$(gh api repos/sharkdp/hyperfine/releases/latest --jq '.tag_name')
+          if [ -z "${HYPERFINE_VERSION:-}" ] || [ "$HYPERFINE_VERSION" = "null" ]; then
+            echo "::error::Failed to fetch hyperfine latest release tag" >&2
+            exit 1
+          fi
+          curl -sSfL "https://github.com/sharkdp/hyperfine/releases/download/${HYPERFINE_VERSION}/hyperfine-${HYPERFINE_VERSION}-x86_64-unknown-linux-gnu.tar.gz" | tar xz -C /tmp
+          sudo mv "/tmp/hyperfine-${HYPERFINE_VERSION}-x86_64-unknown-linux-gnu/hyperfine" /usr/local/bin/
+      - name: Build rustledger (PR and base)
+        run: |
+          set -euo pipefail
+          # Both sides are built here, by the same toolchain, and measured in
+          # the same hyperfine invocation below. The previous comparison read
+          # a number recorded by an earlier nightly on a different runner, so
+          # it mixed the code change with runner-to-runner variance and
+          # reported swings of 20% for changes that could not touch the
+          # measured path (#2090).
+          #
+          # `--features mimalloc` because release-build.yml ships it: the
+          # binary users run does not use the system allocator, and a
+          # benchmark on a different allocator measures a build nobody
+          # installs. This is not academic — a string-interning change
+          # measured -14% against glibc here and 0% against mimalloc, because
+          # what it was really recovering was glibc's per-allocation
+          # overhead, which mimalloc does not charge in the first place. The
+          # feature is opt-in rather than default only so that library
+          # consumers are not forced to vendor a C dependency; see the
+          # `[features]` comment in crates/rustledger/Cargo.toml.
+          cargo build --release -p rustledger --no-default-features --features mimalloc
+          cp target/release/rledger /tmp/rledger-pr
+
+          # On a pull_request event actions/checkout leaves HEAD at the
+          # merge commit GitHub computed, so the PR side already contains the
+          # base branch. Its FIRST parent is therefore exactly what this build
+          # sits on top of, and comparing against it isolates the PR's own
+          # changes. Read it from the commit rather than from the event
+          # payload's base.sha: the payload is a snapshot from when the event
+          # fired and can skew from the merge ref the runner actually checked
+          # out. Note this is the base branch HEAD, not the merge-base with
+          # it — which is the correct baseline precisely BECAUSE the PR side
+          # is a merge commit.
+          if git rev-parse -q --verify 'HEAD^2' >/dev/null 2>&1; then
+            BASE_SHA=$(git rev-parse 'HEAD^1')
+          else
+            # Not a merge commit (e.g. a checkout pinned to the PR head).
+            BASE_SHA='${{ github.event.pull_request.base.sha }}'
+          fi
+          echo "Building base $BASE_SHA"
+          git worktree add /tmp/base "$BASE_SHA"
+          # Same target directory on purpose: the two commits share their
+          # dependency graph, so this recompiles the workspace crates and
+          # reuses everything else. A separate target dir would be a cold
+          # build of every dependency, which is what would push this job past
+          # its timeout.
+          (cd /tmp/base && cargo build --release -p rustledger --no-default-features \
+             --features mimalloc --target-dir "$GITHUB_WORKSPACE/target")
+          cp "$GITHUB_WORKSPACE/target/release/rledger" /tmp/rledger-base
+      - name: Generate workloads
+        run: |
+          set -euo pipefail
+          # The generator is `scripts/gen-profile-workload.py`, the same one
+          # `profile.yml` uses, rather than a heredoc private to this file.
+          # The heredoc it replaces emitted two-posting expenses only: no cost
+          # specs, no lots, no reductions. Booking and the whole inventory
+          # engine ran zero times, so the quadratics fixed in #2083, #2086 and
+          # #2091 could not have shown up here however sound the comparison
+          # was (#2096).
+          #
+          # Shapes are seeded per-shape, so the workload is stable run to run
+          # and reproducible locally byte-for-byte.
+          for shape in $BENCH_SHAPES; do
+            python3 scripts/gen-profile-workload.py "$shape" > "bench-$shape.beancount"
+            echo "$shape: $(wc -l < "bench-$shape.beancount") lines"
+          done
+      - name: Run benchmarks (PR vs base, same runner)
+        id: benchmark
+        # One source for the sampling parameters: hyperfine reads them and the
+        # comment footer reports them back. They used to be stated twice, and
+        # the footer went stale the moment the run count changed.
+        env:
+          BENCH_RUNS: 20
+          # Both tools cache parsed output to disk, and hyperfine's warmup
+          # populates that cache — so every measured run was a cache hit.
+          # bean-check on `fifo` is 18.4s cold and 0.3s warm, a 60x
+          # difference, and rledger's own cache short-circuits the parser
+          # entirely, which is most of what `check` does. A parser regression
+          # was therefore invisible here no matter which workload ran.
+          #
+          # This env var is Python beancount's own, and rledger honors it
+          # deliberately to match, so one variable disables both.
+          BEANCOUNT_DISABLE_LOAD_CACHE: 1
+          # beancount is the context number, not the regression signal, and it
+          # is three orders of magnitude slower on some shapes (18s per run on
+          # `fifo` against ~40ms for rledger). Sampling it as heavily as the
+          # two rledger builds would dominate the job for a figure no verdict
+          # depends on.
+          # 0, not 1: the eligibility probe below is itself a full cold run
+          # of the same command, so it already does what a warmup would. With
+          # the parse caches disabled the probe cannot leave a picklecache
+          # behind either, so it warms exactly what hyperfine's own warmup
+          # would have — the page cache and Python's imports — and no more.
+          # Paying for both would add another 18s on `fifo` for nothing.
+          BEANCOUNT_WARMUP: 0
+          BEANCOUNT_RUNS: 3
+        run: |
+          set -euo pipefail
+          for shape in $BENCH_SHAPES; do
+            ledger="bench-$shape.beancount"
+            echo "=== $shape: PR vs base ==="
+            hyperfine \
+              --warmup "$BENCH_WARMUP" \
+              --runs "$BENCH_RUNS" \
+              --export-json "bench-$shape.json" \
+              --command-name 'rustledger-pr'   "/tmp/rledger-pr check $ledger" \
+              --command-name 'rustledger-base' "/tmp/rledger-base check $ledger"
+
+            # Only measure beancount on shapes it can actually process, and
+            # DETECT that rather than assume it: `investment` currently fails
+            # under bean-check (#2097), and timing a run that errors out early
+            # would report a flattering number for a comparison that never
+            # happened.
+            if bean-check "$ledger" >/dev/null 2>&1; then
+              hyperfine \
+                --warmup "$BEANCOUNT_WARMUP" \
+                --runs "$BEANCOUNT_RUNS" \
+                --export-json "beancount-$shape.json" \
+                --command-name 'beancount' "bean-check $ledger"
+            else
+              echo "::notice::bean-check reports errors on $shape; skipping its timing"
+            fi
+          done
+      - name: Measure memory usage
+        id: memory
+        env:
+          # Same reason as the timing step: a warm cache changes peak RSS as
+          # well as wall clock, and the two numbers must describe the same
+          # run.
+          BEANCOUNT_DISABLE_LOAD_CACHE: 1
+        run: |
+          set -euo pipefail
+          # Peak RSS, per shape. Explicitly the binaries at /tmp:
+          # `target/release/rledger` is whichever side was built LAST, which is
+          # the base — measuring it here would report the base's memory under
+          # the PR's name.
+          #
+          # Each is a SINGLE sample, which is why the comment reports the
+          # memory delta without a significance verdict: there is no spread to
+          # test it against. Peak RSS for a fixed binary on a fixed input is
+          # close to deterministic, so it is worth reporting — it is just not
+          # worth calling a regression on its own.
+          peak_rss_kb() {
+            # `time -v` prints a perfectly plausible report for ITSELF when the
+            # command does not exist (~0.9 MB), so a missing binary would be
+            # reported as the PR's memory rather than failing. Resolve it
+            # first.
+            if ! command -v "$1" >/dev/null 2>&1 && [ ! -x "$1" ]; then
+              echo "::error::Not executable, cannot measure: $1" >&2
+              exit 1
+            fi
+            local out
+            # `|| true` twice on purpose: the peak RSS is a valid measurement
+            # even if the child exits non-zero (a ledger with errors still
+            # ran), and a failed grep under `pipefail` would abort before the
+            # explicit check below could say what actually went wrong.
+            out=$({ /usr/bin/time -v "$@" 2>&1 >/dev/null || true; } \
+                  | grep "Maximum resident set size" | awk '{print $6}') || true
+            if [ -z "$out" ]; then
+              echo "::error::Could not read peak RSS for: $*" >&2
+              exit 1
+            fi
+            echo "$out"
+          }
+
+          for shape in $BENCH_SHAPES; do
+            ledger="bench-$shape.beancount"
+            pr_kb=$(peak_rss_kb /tmp/rledger-pr check "$ledger")
+            base_kb=$(peak_rss_kb /tmp/rledger-base check "$ledger")
+            if [ -f "beancount-$shape.json" ]; then
+              bean_kb=$(peak_rss_kb bean-check "$ledger")
+            else
+              bean_kb=""
+            fi
+            printf '{"pr_kb":%s,"base_kb":%s,"beancount_kb":%s}\n' \
+              "$pr_kb" "$base_kb" "${bean_kb:-null}" > "mem-$shape.json"
+            echo "$shape: pr=${pr_kb}KB base=${base_kb}KB beancount=${bean_kb:-n/a}KB"
+          done
+      - name: Build the comment
+        id: report
+        run: |
+          set -euo pipefail
+          python3 << 'PYEOF'
+          import importlib.util
+          import json
+          import math
+          import os
+          import pathlib
+
+          shapes = os.environ['BENCH_SHAPES'].split()
+
+          # Shape descriptions come from the generator, so the comment cannot
+          # describe a workload differently from the thing that produced it.
+          spec = importlib.util.spec_from_file_location(
+              'genworkload', 'scripts/gen-profile-workload.py')
+          gen = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(gen)
+
+          def read(path):
+              p = pathlib.Path(path)
+              return json.loads(p.read_text()) if p.exists() else None
+
+          def ms(entry):
+              return {'mean': entry['mean'] * 1000, 'stddev': entry['stddev'] * 1000,
+                      'runs': len(entry['times'])}
+
+          rows, runs_seen = [], set()
+          for shape in shapes:
+              data = read(f'bench-{shape}.json')
+              if data is None:
+                  continue
+              by_name = {r['command']: ms(r) for r in data['results']}
+              pr, base = by_name['rustledger-pr'], by_name['rustledger-base']
+              runs_seen.add(pr['runs'])
+
+              change = (pr['mean'] - base['mean']) / base['mean'] * 100 if base['mean'] else 0.0
+              # Significant only if the gap clears the uncertainty in the two
+              # MEANS — the standard error, not the spread of individual runs.
+              # Comparing means against per-run spread is conservative by a
+              # factor of sqrt(runs): at these numbers it would only fire above
+              # ~14%, so a real 10% regression would read as noise.
+              sem = math.sqrt(pr['stddev'] ** 2 / pr['runs'] + base['stddev'] ** 2 / base['runs'])
+              gap = abs(pr['mean'] - base['mean'])
+              # And an effect-size floor. This is not decoration on top of the
+              # significance test — it is doing the load-bearing work, because
+              # the standard error only describes variance WITHIN a run. Two
+              # binaries built from identical source still differ run to run
+              # through code layout, page placement and a shared runner's
+              # neighbors, and that component is invisible to the SEM: with
+              # 20 tight samples a 2ms systematic offset clears 2σ easily.
+              #
+              # 3% was measured to be too low. On #2098 — a change to this
+              # workflow file and nothing else, so both sides were the same
+              # Rust source — `simple` came back +3.1%, clearing both tests
+              # and reporting 🟡 slower. Local runs of identical builds
+              # produced -3.3%, +3.0%, +2.5% and -2.5% on various shapes.
+              # 5% covers that; the regressions this exists to catch are the
+              # #2083 class, which is +1788%.
+              #
+              # Applied PER SHAPE: a regression in one shape must not be
+              # diluted by the others holding steady. Note that testing N
+              # shapes is also N chances to trip, which is a further reason
+              # for the floor to sit above the observed noise rather than at
+              # its edge.
+              significant = gap > 2 * sem and abs(change) >= 5.0
+
+              bean = read(f'beancount-{shape}.json')
+              bean = ms(bean['results'][0]) if bean else None
+              mem = read(f'mem-{shape}.json') or {}
+
+              rows.append({'shape': shape, 'pr': pr, 'base': base, 'bean': bean,
+                           'change': change, 'significant': significant,
+                           'noise': 2 * sem, 'mem': mem})
+
+          if not rows:
+              # An empty table renders as a perfectly well-formed comment that
+              # happens to say nothing, which is indistinguishable from a run
+              # where everything was fine.
+              raise SystemExit(
+                  f'no benchmark results found for shapes {shapes!r} in '
+                  f'{pathlib.Path.cwd()}; expected bench-<shape>.json')
+
+          def verdict(row):
+              sign = '+' if row['change'] >= 0 else ''
+              txt = f"{sign}{row['change']:.1f}%"
+              if not row['significant']:
+                  return f'{txt} ✅ within noise'
+              if row['change'] > 10:
+                  return f'{txt} 🔴 regression'
+              if row['change'] > 0:
+                  return f'{txt} 🟡 slower'
+              return f'{txt} 🟢 faster'
+
+          def mb(kb):
+              return f'{kb / 1024:.1f} MB' if kb else 'n/a'
+
+          out = ['## 📊 Benchmark Results', '']
+
+          regressed = [r['shape'] for r in rows if r['significant'] and r['change'] > 0]
+          if regressed:
+              out += [f"> 🔴 **Slower than base on: {', '.join(regressed)}**", '']
+
+          out += ['| Shape | rustledger | beancount | Speedup | RSS (rledger / beancount) |',
+                  '|-------|-----------|-----------|---------|---------------------------|']
+          for r in rows:
+              b = r['bean']
+              bean_txt = f"{b['mean']:.1f}ms ± {b['stddev']:.1f}ms" if b else '—'
+              speed = f"{b['mean'] / r['pr']['mean']:.1f}x" if b and r['pr']['mean'] else '—'
+              out.append(
+                  f"| `{r['shape']}` | {r['pr']['mean']:.1f}ms ± {r['pr']['stddev']:.1f}ms | "
+                  f"{bean_txt} | {speed} | "
+                  f"{mb(r['mem'].get('pr_kb'))} / {mb(r['mem'].get('beancount_kb'))} |")
+
+          out += ['', '### vs base, measured in this run', '',
+                  '| Shape | base | this PR | Change | RSS base → PR |',
+                  '|-------|------|---------|--------|---------------|']
+          for r in rows:
+              pr_kb, base_kb = r['mem'].get('pr_kb'), r['mem'].get('base_kb')
+              if pr_kb and base_kb:
+                  d = (pr_kb - base_kb) / base_kb * 100
+                  mem_txt = f"{mb(base_kb)} → {mb(pr_kb)} ({'+' if d >= 0 else ''}{d:.1f}%)"
+              else:
+                  mem_txt = '—'
+              out.append(
+                  f"| `{r['shape']}` | {r['base']['mean']:.1f}ms ± {r['base']['stddev']:.1f}ms | "
+                  f"{r['pr']['mean']:.1f}ms ± {r['pr']['stddev']:.1f}ms | {verdict(r)} | {mem_txt} |")
+
+          noise_txt = ', '.join(f"`{r['shape']}` {r['noise']:.1f}ms" for r in rows)
+          runs = runs_seen.pop() if len(runs_seen) == 1 else min(runs_seen, default=0)
+          out += ['',
+                  f'<sub>A difference counts only when it clears the combined spread of the two '
+                  f'measurements, per shape (2σ: {noise_txt}), and is at least 5%.</sub>',
+                  f'<sub>{gen.DEFAULT_TXNS:,} transactions per shape · {runs} runs, '
+                  f"{os.environ['BENCH_WARMUP']} warmup · "
+                  f'<a href="https://github.com/sharkdp/hyperfine">hyperfine</a></sub>', '',
+                  '<details>', '<summary>What do these numbers mean?</summary>', '']
+          for r in rows:
+              out.append(f"- **`{r['shape']}`** — {gen.SHAPES[r['shape']]}")
+          out += ['- **vs base**: the PR and the base-branch commit it is built on, '
+                  'built and measured in the same job',
+                  '- **RSS**: peak resident set size, a single sample — reported without a '
+                  'verdict because there is no spread to test it against',
+                  '- A shape with no beancount column is one bean-check reports errors on; '
+                  'it is timed for rledger only',
+                  '', '</details>']
+
+          pathlib.Path('comment.md').write_text('\n'.join(out) + '\n')
+          print('\n'.join(out))
+          PYEOF
+      # Note: Criterion benchmarks aren't run here (timings are noisy on shared
+      # runners and weren't reported in the PR comment anyway). They are compiled
+      # — but not run — by the `Benchmarks Compile` job in ci.yml, which guards
+      # against the criterion bench targets bitrotting.
+      - name: Post PR comment
+        # GITHUB_TOKEN is read-only on `pull_request` workflows from forks
+        # (a GitHub security guarantee; `permissions: pull-requests: write`
+        # above does not override it). Make comment-posting best-effort so
+        # the job's success/failure reflects the actual benchmark result,
+        # not whether we could leave a comment. Fork PRs silently skip with
+        # a log line; non-fork PRs continue to receive the comment. (#1093)
+        continue-on-error: true
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            // The body is built by the previous step and read from disk.
+            // It used to be assembled here from ~15 step outputs threaded
+            // through GitHub expression interpolation, which is how the footer came to
+            // claim "5 runs, 2 warmup" for a run that used 20 and 3: nothing
+            // connects such a string to the value it describes. The Python
+            // that computes the numbers now also formats them.
+            const body = require('fs').readFileSync('comment.md', 'utf8');
+
+            // Find existing comment
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const botComment = comments.find(c =>
+              c.user.type === 'Bot' && c.body.includes('📊 Benchmark Results')
+            );
+
+            if (botComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body: body
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: body
+              });
+            }
