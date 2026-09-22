@@ -1,28 +1,35 @@
 # CHANGELOG
 
-## [e891def] - 2026-09-19 12:28:29 UTC
+## [16f417b](https://github.com/Hacker3707/ExfilGuard-static-taint-analysis/commit/16f417b2f1a8192eccc9e20a2ba73ba6e2533f51) 
+- 2026-09-22 16:53:00 UTC
+
+### Thêm reproduction package và .gitignore
+- `replication`: Chứa cả datasets, ground truth, scripts, baseline outputs và các file phục vụ tái chạy Table/Figure.
+- `.gitignore`: Bỏ qua thư mục __pycache__ ở root của project. Không commit Python cache.
+
+## [e891def](https://github.com/Hacker3707/ExfilGuard-static-taint-analysis/commit/e891defea199b5097c4409fb1bc42ce142280e85) - 2026-09-19 12:28:29 UTC
 
 ### Refactor
 - `catalogs.py`: Tập trung định nghĩa và ánh xạ Source Rule ID và Sink Rule ID theo từng category, giúp catalog trở thành nguồn thống nhất cho Rule ID được sử dụng trong quá trình phân tích và đánh giá.
 - `evaluate.py`: Rút gọn logic xử lý Rule ID bằng cách sử dụng các helper từ `catalogs.py` thay vì duy trì mapping trực tiếp trong evaluator. Evaluator tập trung vào việc chạy benchmark, tổng hợp kết quả và hiển thị detection details.
 
-## [f14b1bd] - 2026-09-19 11:58:48 UTC
+## [f14b1bd](https://github.com/Hacker3707/ExfilGuard-static-taint-analysis/commit/f14b1bd3799d6ccf8facb14dc0c540b30289783f) - 2026-09-19 11:58:48 UTC
 
 ### Sửa lỗi
 - `analyzers/yaml_analyzer.py`: Sửa lỗi resolve script path đối với layout `testcases/positive` và `testcases/negative`. Trước đó, các external script được workflow trong `testcases/positive` tham chiếu không được resolve đúng, khiến các test case P10–P22 bị đánh dấu False Negative.
 - P21 vẫn là False Negative do còn thiếu propagation rule cho GitHub Actions step outputs. Workflow truyền `${{ inputs.internal_token }}` qua `$GITHUB_OUTPUT` với tên `staged_val`, sau đó tham chiếu giá trị này bằng `${{ steps.step_source.outputs.staged_val }}` tại DNS sink. Analyzer hiện chưa propagate taint từ giá trị được ghi qua `$GITHUB_OUTPUT` sang expression tương ứng `steps.<step_id>.outputs.<output_name>`.
 
-## [660802b] - 2026-09-19 08:06:09 UTC
+## [660802b](https://github.com/Hacker3707/ExfilGuard-static-taint-analysis/commit/660802b46d2c0d91983af9283e58dc786ae42c49) - 2026-09-19 08:06:09 UTC
 
 ### Thêm test
 - `regress_test/test_cwd_invariance.sh`: cùng một workflow chạy từ hai thư mục khác
   nhau phải cho output giống hệt.
 
-## [b4e16ce] - 2026-09-09 10:06 UTC
+## [b4e16ce](https://github.com/Hacker3707/ExfilGuard-static-taint-analysis/commit/b4e16cef929912f52069d098accb1d0863145727) - 2026-09-09 10:06 UTC
 ### Fix Bug
 - _resolve_file_path giả định layout .github/workflows/ nên tính repo root cách hai mức, không xử lý được layout workflows/ cạnh scripts/. Bỏ fallback resolve theo thư mục hiện hành vì nó che lỗi: kết quả phụ thuộc vào nơi chạy lệnh.
 
-## [RELEASED] - 2026-09-08 22:30 UTC
+## [RELEASED](https://github.com/Hacker3707/ExfilGuard-static-taint-analysis/commit/5279e4d99ec7dbe3e200336076afab8665f36dcf) - 2026-09-08 22:30 UTC
 
 **Commit:** `5279e4d99ec7dbe3e200336076afab8665f36dcf`  
 **Phạm vi kiểm thử:** Chỉ Dataset B + unit test. **Chưa chạy trên Dataset A. Chưa đọc** `data/adjudication.csv` hay `data/ground_truth.csv`.

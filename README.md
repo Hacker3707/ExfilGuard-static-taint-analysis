@@ -1,7 +1,15 @@
 # ExfilGuard-static-taint-analysis
+
 ExfilGuard - Detecting Secret Exfiltration in GitHub Actions Workflows Using Static Taint Analysis.
 
-ExfilGuard is a static taint analysis framework for detecting potential secret exfiltration in GitHub Actions workflows. The framework analyzes workflow YAML files together with embedded Bash, Python, and Node.js scripts to track sensitive data flows from sources, including repository secrets and environment variables, to network-related sinks such as HTTP requests, command-line transfer utilities, and DNS queries. ExfilGuard constructs interpretable taint-flow paths and assigns risk levels to suspicious flows, enabling developers to identify both the origin and potential destination of sensitive data exposure. The framework is evaluated on two benchmarks: a controlled scenario suite, reported with precision, recall and F1-score, and a manually annotated real-world corpus, reported with false-positive rate and alert density. The real-world corpus contains no confirmed exfiltration case under the locked annotation definition, so recall is not defined there and is reported only on the controlled benchmark.
+ExfilGuard is a static taint analysis framework for detecting potential secret exfiltration in GitHub Actions workflows. The framework analyzes workflow YAML files together with embedded Bash, Python, and Node.js scripts to track sensitive data flows from sources, including repository secrets and environment variables, to network-related sinks such as HTTP requests, command-line transfer utilities, and DNS queries. ExfilGuard constructs interpretable taint-flow paths and assigns risk levels to suspicious flows, enabling developers to identify both the origin and potential destination of sensitive data exposure.
 
-About Dataset B:
-Dataset B is a controlled benchmark of 30 hand-written workflows (18 exploit, 12 benign) across six scenario families. All Dataset B workflows are syntax-validated before evaluation using validate_dsb.py; reported results use the validated benchmark version, which is frozen and versioned alongside the ExfilGuard release used for evaluation.
+The framework is evaluated on two benchmarks: a controlled scenario suite, reported with precision, recall, and F1-score, and a manually annotated real-world corpus, reported with false-positive rate and alert density. The real-world corpus contains no confirmed exfiltration case under the locked annotation definition; therefore, recall is not defined for that corpus and is reported only for the controlled benchmark.
+
+## Dataset B
+
+Dataset B is a controlled benchmark of 30 hand-written workflows, consisting of 18 exploit cases and 12 benign cases across six scenario families. All Dataset B workflows are syntax-validated before evaluation using `validate_dsb.py`. The reported results use the validated benchmark version, which is frozen and versioned alongside the ExfilGuard release used for evaluation.
+
+### Dataset B Validation
+
+python3 replication/3_dataset_b/validate_dsb.py replication/3_dataset_b
