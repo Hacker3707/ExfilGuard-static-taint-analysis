@@ -1,5 +1,10 @@
 # CHANGELOG
 
+## [9c61afa]([https://github.com/Hacker3707/ExfilGuard-static-taint-analysis/commit/16f417b2f1a8192eccc9e20a2ba73ba6e2533f51](https://github.com/Hacker3707/ExfilGuard-static-taint-analysis/commit/9c61afa01db13de6167f03bd51c9f288d68a213e)) -  2026-09-23 03:40:14
+
+- ### Added
+- `run_ablation.py`: Added `--dataset` argument to run ablation experiments on a specified dataset, enabling reproduction of Figure 4 using Dataset B while preserving the existing default behavior on `testcases/`.
+
 ## [16f417b](https://github.com/Hacker3707/ExfilGuard-static-taint-analysis/commit/16f417b2f1a8192eccc9e20a2ba73ba6e2533f51) - 2026-09-22 16:53:00 UTC
 
 ### Thêm reproduction package và .gitignore
