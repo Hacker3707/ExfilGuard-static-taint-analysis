@@ -197,3 +197,18 @@ Câu dùng cho bài:
 - [ ] Chốt policy hash: Dataset B gán B18 (hash → HTTP) là exploit, B10/B19 (hash → log)
       là benign, tức hash KHÔNG phải sanitizer. Nếu ExfilGuard coi hash là barrier thì
       B18 thành FN oan. README Dataset B yêu cầu ghi rõ policy này trong bài.
+
+---
+
+## Đính chính
+
+Bảng phân bố rule của zizmor ở trên liệt kê 15 rule, cộng lại được 2312. Đếm lại
+đầy đủ từ `out/zizmor_findings.jsonl` thì tổng là **2318**: bảng bỏ sót năm rule
+hiếm là `unpinned-tools` (2), `bot-conditions` (1), `obfuscation` (1), `misfeature`
+(1) và `unsound-ternary` (1). Số finding liên quan secret vẫn đúng là **21**, nên
+tỉ lệ 21/2318 = 0,9% không đổi. Poutine: 555 finding, trong đó 4 thuộc rule
+`job_all_secrets`, tức 0,7%.
+
+Log này được viết ở giai đoạn ground truth v1 (SHA `e9e819f9`, 265 eval + 35
+UNCLEAR) nên vài con số trung gian trong đó phản ánh v1. Kết quả cuối cùng trong
+bài lấy theo v2 (262 eval + 38 UNCLEAR), tính bằng `src/12_build_master_results.py`.

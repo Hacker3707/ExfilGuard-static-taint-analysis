@@ -1,0 +1,301 @@
+sample_id,final_label,source,sink,path_type,exfilguard_result,zizmor_result,poutine_result,gitleaks_result,error_type
+A0001,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0002,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,NO_EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0003,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0004,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0005,NO_EXFIL,"GPG_PRIVATE_KEY@165, GITHUB_TOKEN@201",-,local-only,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0006,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0007,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0008,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0009,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0010,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0011,NO_EXFIL,AUR_SSH_PRIVATE_KEY@27,"ssh://aur@aur.archlinux.org@33 (dich co dinh, hardcode)",auth-to-owner,NO_EXFIL,NO_EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0012,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0013,UNCLEAR,ADD_TO_PROJECT_PAT@17,khong xac dinh duoc,unresolved-action,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,excluded-unclear
+A0014,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0015,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0016,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0017,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0018,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,NO_EXFIL,EXFIL,NO_EXFIL,TN
+A0019,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0020,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0021,UNCLEAR,"SCCACHE_CACHE_ACCESS_KEY@56, SCCACHE_CACHE_SECRET_KEY@57, DOCKER_SECRET@67",khong xac dinh duoc,unresolved-action,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,excluded-unclear
+A0022,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0023,UNCLEAR,"BUILDBUDDY_API_KEY@278, CARGOKIT_PRIVATE_KEY@349",khong xac dinh duoc,unresolved-repo-script,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,excluded-unclear
+A0024,NO_EXFIL,"HOMEBREW_KOLMAFIA_TOKEN@132, GITHUB_TOKEN@112","curl@129 -> https://api.github.com/repos/kolmafia/homebrew-kolmafia/dispatches@133 (hardcode, repo cua chinh to chuc)",auth-to-owner,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0025,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0026,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,NO_EXFIL,EXFIL,NO_EXFIL,TN
+A0027,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0028,NO_EXFIL,"CARGO_REGISTRY_TOKEN@615, GITHUB_TOKEN@47",cargo publish@615 -> crates.io,auth-to-owner,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0029,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0030,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0031,UNCLEAR,"ADMIN_EMAIL@17, ADMIN_PASSWORD@18",khong xac dinh duoc,unresolved-repo-script,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,excluded-unclear
+A0032,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0033,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0034,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0035,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0036,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0037,UNCLEAR,"GITCODE_TOKEN@176, GITCODE_OWNER@177, GITCODE_REPO@178, GH_TOKEN@175",khong xac dinh duoc,unresolved-repo-script,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,excluded-unclear
+A0038,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0039,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,EXFIL,TN
+A0040,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0041,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0042,NO_EXFIL,"SIGNING_SECRET@778, github.token@161",cosign sign@795 -> ghcr.io/${{ github.repository_owner }} (registry chinh chu),auth-to-owner,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0043,UNCLEAR,GITHUB_TOKEN@51,khong xac dinh duoc,unresolved-repo-script,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,excluded-unclear
+A0044,NO_EXFIL,"PAT_TOKEN@103, PAT_TOKEN@19",git push@111 -> github.com/${{ github.repository }}@107 (chinh repo),auth-to-owner,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0045,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0046,NO_EXFIL,GITHUB_TOKEN@127,curl@135 -> https://api.github.com/${1}/${OWNER}/packages/maven/${PACKAGE}@139 (hardcode api.github.com),auth-to-owner,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0047,UNCLEAR,"GPG_PRIVATE_KEY@27, ARTIFACTORY_PASSWORD@23, CENTRAL_TOKEN_PASSWORD@25",khong xac dinh duoc,unresolved-action,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,excluded-unclear
+A0048,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0049,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0050,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,NO_EXFIL,EXFIL,NO_EXFIL,TN
+A0051,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0052,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0053,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0054,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0055,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0056,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0057,NO_EXFIL,SNIFFCAT_TOKEN@51 (va _2/_3/_4@52-54),"safe_urlopen@95 -> https://api.sniffcat.com/api/v1/blacklist@132 (dich co dinh, hardcode)",auth-to-owner,NO_EXFIL,NO_EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0058,UNCLEAR,"BILUOCHUN_TOKEN@98, S3_ACCESS_KEY@114, S3_SECRET_KEY@115, S3_ENDPOINT@113",khong xac dinh duoc,unresolved-repo-script,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,excluded-unclear
+A0059,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0060,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0061,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0062,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0063,UNCLEAR,"GITHUB_TOKEN@24 (GH_TOKEN cap job), GIT_EMAIL@121, GIT_NAME@122",khong xac dinh duoc,unresolved-repo-script,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,excluded-unclear
+A0064,UNCLEAR,GITHUB_TOKEN@25 (GH_TOKEN cap job),khong xac dinh duoc,unresolved-repo-script,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,excluded-unclear
+A0065,NO_EXFIL,"NPM_TOKEN@249, GATEWAY_TOKEN@36, GITHUB_TOKEN@334","npm publish@251 -> registry.npmjs.org@202 (sink loai tru muc 2.2, xac thuc dung chu)",auth-to-owner,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0066,NO_EXFIL,STATIC_ANALYSIS_BOT_PRIVATE_KEY@242,actions/create-github-app-token@239 -> GitHub App API cua chinh to chuc bitgo@243,auth-to-owner,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0067,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0068,UNCLEAR,OSC_PASSWORD@58,khong xac dinh duoc,unresolved-repo-script,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,excluded-unclear
+A0069,UNCLEAR,GITHUB_TOKEN@16,khong xac dinh duoc,unresolved-action,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,excluded-unclear
+A0070,NO_EXFIL,GITHUB_TOKEN@63,ghcr.io cua chinh to chuc (sink loai tru muc 2.2),excluded-sink,NO_EXFIL,NO_EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0071,UNCLEAR,"WORKFLOW_BUMP_TOKEN@96, GITHUB_TOKEN@96",khong xac dinh duoc,unresolved-action,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,excluded-unclear
+A0072,NO_EXFIL,"GITHUB_TOKEN@46 (lap lai @69,81,111,156)",git push@178 va cr index --push@198 -> https://github.com/${GITHUB_REPOSITORY}.git@177 (chinh repo),auth-to-owner,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0073,NO_EXFIL,"FLATHUB_TOKEN@252, GITHUB_TOKEN@58","github.com/flathub/com.github.IsmaelMartinez.teams_for_linux@45 (repo dich cua chinh maintainer, sink loai tru muc 2.2)",auth-to-owner,NO_EXFIL,NO_EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0074,NO_EXFIL,"PAT@1255, AZURE_STORAGE_CONNECTION_STRING@218",git push -> github.com/${{ github.repository }}@1255 (chinh repo) ; az storage blob upload@1081 -> Azure Storage cua chinh ho (intunebrew.blob.core.windows.net@1098),auth-to-owner,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0075,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0076,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0077,UNCLEAR,"APPSTORE_TOKEN@158, APP_PRIVATE_KEY@160",khong xac dinh duoc,unresolved-action,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,excluded-unclear
+A0078,NO_EXFIL,-,-,no-source,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0079,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0080,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0081,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0082,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0083,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0084,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0085,UNCLEAR,"DUOLINGO_USERNAME@42, DUOLINGO_PASSWORD@43, DUOLINGO_JWT@44",khong xac dinh duoc,unresolved-repo-script,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,excluded-unclear
+A0086,UNCLEAR,"DOCKER_USERNAME@71, DOCKER_PASSWORD@72",khong xac dinh duoc,unresolved-action,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,excluded-unclear
+A0087,UNCLEAR,REPOSITORY_TOKEN@62,khong xac dinh duoc,unresolved-action,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,excluded-unclear
+A0088,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,NO_EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0089,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0090,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0091,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0092,NO_EXFIL,"GITHUB_TOKEN@56 (lap lai @215,267,305,358,406,578,641,706)","docker/login-action -> ghcr.io (sink loai tru muc 2.2, xac thuc voi dung chu so huu)",excluded-sink,NO_EXFIL,EXFIL,NO_EXFIL,EXFIL,TN
+A0093,UNCLEAR,"AGENTHUB_INTEGRATION_ARTIFACT_TOKEN@122, AGENTHUB_INTEGRATION_ARTIFACT_URL@121, MC_TOKEN@116, GW_TOKEN@118, MCP_TOKEN@120","Invoke-WebRequest@150,156,158,161 -> $env:ARTIFACT_URL@155 ; ARTIFACT_URL la secrets@121 nen khong giai duoc tinh",unresolved-endpoint-ownership,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,excluded-unclear
+A0094,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0095,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,NO_EXFIL,EXFIL,NO_EXFIL,TN
+A0096,NO_EXFIL,"DOCKER_USERNAME@231, DOCKER_PASSWORD@232","requests.post@111 -> https://hub.docker.com/v2/users/login/@108 (hardcode, sink loai tru muc 2.2)",auth-to-owner,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0097,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0098,UNCLEAR,"OTELBOT_DOCS_PRIVATE_KEY@57, steps.otelbot-token.outputs.token@68",khong xac dinh duoc,unresolved-repo-script,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,excluded-unclear
+A0099,UNCLEAR,"CLOUDFLARE_API_TOKEN@118, HCLOUD_TOKEN@121, INFISICAL_TOKEN@124, SSH_PRIVATE_KEY@678, GH_MIRROR_TOKEN@679, R2_SECRET_ACCESS_KEY@707",khong xac dinh duoc,unresolved-repo-script,EXFIL,EXFIL,EXFIL,NO_EXFIL,excluded-unclear
+A0100,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0101,UNCLEAR,CODECOV_TOKEN@68,khong xac dinh duoc,unresolved-action,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,excluded-unclear
+A0102,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0103,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0104,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0105,UNCLEAR,"DISCORD_RELEASE_WEBHOOK@381, TAURI_SIGNING_PRIVATE_KEY@98, WINDOWS_SIGN_STOREPASS@107, POSTHOG_KEY@110",khong xac dinh duoc,unresolved-repo-script,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,excluded-unclear
+A0106,NO_EXFIL,-,-,no-source,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0107,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0108,NO_EXFIL,-,-,agreement-no-review,EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,FP
+A0109,UNCLEAR,"RELEASE_KEY@818 (tu DEV_RELEASE_KEY@146 hoac PROD_RELEASE_KEY@147), COORDINATOR_URL@817",curl@849 -> ${COORDINATOR_URL}/v1/releases ; COORDINATOR_URL cung la secret@144-145 nen khong giai duoc tinh,unresolved-endpoint-ownership,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,excluded-unclear
+A0110,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0111,NO_EXFIL,-,-,agreement-no-review,EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,FP
+A0112,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,NO_EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0113,NO_EXFIL,"CPAC_PRIVATE_REPO_TOKEN@46, GH_USR_TESTING_TOKEN@47",-,co-occurrence-only,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0114,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0115,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0116,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0117,NO_EXFIL,"DOCKER_PASSWORD@103, ALIYUN_DOCKER_PASSWORD@111","docker/login-action -> Docker Hub (zrlog@102) va registry.cn-chengdu.aliyuncs.com (90xchun@110), deu la sink loai tru muc 2.2",auth-to-owner,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0118,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0119,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,NO_EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0120,NO_EXFIL,-,-,agreement-no-review,EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,FP
+A0121,UNCLEAR,"DATABRICKS_CLIENT_SECRET@35, DATABRICKS_HOST@33",curl@39 -> ${DATABRICKS_HOST}/oidc/v1/token ; DATABRICKS_HOST la secrets@33 nen khong giai duoc tinh,unresolved-endpoint-ownership,EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,excluded-unclear
+A0122,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0123,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0124,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0125,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0126,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0127,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0128,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0129,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,NO_EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0130,NO_EXFIL,-,-,agreement-no-review,EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,FP
+A0131,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0132,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0133,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0134,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0135,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0136,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0137,UNCLEAR,"GH_TOKEN@219, SNAPCRAFT_TOKEN@230, VERDACCIO_TOKEN@180, CSC_LINK_BASE64@664, APPLE_ID_APP_PASSWORD@662",khong xac dinh duoc,unresolved-repo-script,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,excluded-unclear
+A0138,NO_EXFIL,"GITHUB_TOKEN@250, GITHUB_TOKEN@1248",GitHub API cua chinh repo (sink loai tru muc 2.2),excluded-sink,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0139,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0140,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,NO_EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0141,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0142,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0143,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0144,NO_EXFIL,"android_keystore_base64@265, android_key_properties_base64@266",-,local-only,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0145,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0146,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0147,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,NO_EXFIL,EXFIL,NO_EXFIL,TN
+A0148,NO_EXFIL,"GITHUB_TOKEN@805, GITHUB_TOKEN@887",api.github.com cua chinh repo (sink loai tru muc 2.2),excluded-sink,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0149,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0150,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,NO_EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0151,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0152,UNCLEAR,"secrets.s@15 (env a1), secrets.f@16 (env b2), secrets.gu@17, secrets.ge@18","curl@23 -> $a1 (gia tri secret, khong giai duoc tinh) ; git push@28 -> remote cua actions/checkout@12",unresolved-runtime-value,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,excluded-unclear
+A0153,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0154,UNCLEAR,"CRATES_KEY@245, PYPI_API_TOKEN@246, CLAUDE_CODE_ALT_OAUTH_TOKEN@248, AGENT_PUSH_SSH_KEY@215",khong xac dinh duoc,unresolved-action,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,excluded-unclear
+A0155,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0156,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0157,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0158,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0159,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0160,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0161,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0162,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0163,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0164,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0165,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0166,NO_EXFIL,"CLOUDFLARE_API_TOKEN@46, CLOUDFLARE_ACCOUNT_ID@47","wrangler pages deploy@49 -> Cloudflare Pages, project thinkrail-website@50 (hardcode, cua chinh ho)",auth-to-owner,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0167,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0168,NO_EXFIL,GITHUB_TOKEN@148,"gh release download@158 -> github.com/ImageMagick/ImageMagick (repo cong khai, sink loai tru muc 2.2)",excluded-sink,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0169,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0170,UNCLEAR,"OPENCODE_API_KEY@75, OC_REVIEW_APP_PRIVATE_KEY@28, steps.app-token.outputs.token@76-77",khong xac dinh duoc,unresolved-action,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,excluded-unclear
+A0171,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0172,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0173,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0174,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0175,UNCLEAR,"OPENCODE_API_KEY@75, OC_REVIEW_APP_PRIVATE_KEY@28, steps.app-token.outputs.token@76-77",khong xac dinh duoc,unresolved-action,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,excluded-unclear
+A0176,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0177,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0178,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0179,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0180,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0181,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,NO_EXFIL,EXFIL,NO_EXFIL,TN
+A0182,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0183,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0184,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0185,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,NO_EXFIL,EXFIL,NO_EXFIL,TN
+A0186,NO_EXFIL,-,-,agreement-no-review,EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,FP
+A0187,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0188,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0189,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0190,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0191,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0192,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0193,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0194,UNCLEAR,GITHUB_TOKEN@24,khong xac dinh duoc,unresolved-repo-script,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,excluded-unclear
+A0195,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0196,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0197,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0198,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0199,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0200,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0201,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0202,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0203,NO_EXFIL,"GITHUB_TOKEN@392, GITHUB_TOKEN@519","api.github.com, GH_REPO=$GITHUB_REPOSITORY@393,520 (sink loai tru muc 2.2)",excluded-sink,NO_EXFIL,NO_EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0204,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0205,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0206,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0207,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0208,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,EXFIL,TN
+A0209,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0210,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0211,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0212,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0213,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0214,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,NO_EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0215,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0216,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0217,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0218,NO_EXFIL,-,-,agreement-no-review,EXFIL,EXFIL,EXFIL,NO_EXFIL,FP
+A0219,NO_EXFIL,"GITHUB_TOKEN@392, GITHUB_TOKEN@519","api.github.com, GH_REPO=$GITHUB_REPOSITORY@393,520 (sink loai tru muc 2.2)",excluded-sink,EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,FP
+A0220,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0221,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0222,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0223,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0224,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0225,NO_EXFIL,"CLOUDFLARE_API_TOKEN@71, CLOUDFLARE_ACCOUNT_ID@72","Cloudflare Pages, project $CF_PROJECT@75 (sink loai tru muc 2.2, xac thuc dung chu so huu)",auth-to-owner,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0226,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0227,NO_EXFIL,-,-,agreement-no-review,EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,FP
+A0228,NO_EXFIL,-,-,agreement-no-review,EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,FP
+A0229,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0230,UNCLEAR,"SLACK_CIFEEDBACK_BOT_TOKEN@236, CI_SLACK_CHANNEL@228",khong xac dinh duoc,unresolved-action,EXFIL,EXFIL,EXFIL,NO_EXFIL,excluded-unclear
+A0231,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0232,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0233,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0234,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0235,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,EXFIL,TN
+A0236,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0237,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0238,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0239,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0240,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,NO_EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0241,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0242,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0243,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,NO_EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0244,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0245,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0246,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0247,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0248,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0249,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0250,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0251,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,NO_EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0252,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0253,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0254,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0255,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,NO_EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0256,NO_EXFIL,-,-,agreement-no-review,EXFIL,EXFIL,EXFIL,NO_EXFIL,FP
+A0257,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0258,UNCLEAR,"DATAFORSEO_LOGIN@389, DATAFORSEO_PASSWORD@390, SEO_MCP_API_KEY@435, CLAUDE_CODE_OAUTH_TOKEN@492, OPENAI_API_KEY@542, CURSOR_API_KEY@602",khong xac dinh duoc,unresolved-action,EXFIL,EXFIL,EXFIL,NO_EXFIL,excluded-unclear
+A0259,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0260,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0261,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0262,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0263,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0264,NO_EXFIL,"NPM_TOKEN@866-867, GITHUB_TOKEN@865","npm registry (registry-url: https://registry.npmjs.org@519), sink loai tru muc 2.2",auth-to-owner,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0265,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0266,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0267,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,NO_EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0268,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0269,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0270,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0271,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0272,NO_EXFIL,-,-,agreement-no-review,EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,FP
+A0273,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0274,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0275,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0276,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0277,UNCLEAR,"TELEGRAM_BOT_TOKEN@50, TELEGRAM_CHAT_ID@51, TOMCAT1235@52",khong xac dinh duoc,unresolved-repo-script,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,excluded-unclear
+A0278,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0279,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0280,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0281,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,NO_EXFIL,EXFIL,NO_EXFIL,TN
+A0282,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0283,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0284,UNCLEAR,STDLIB_BOT_PAT_REPO_WRITE@84,khong xac dinh duoc,unresolved-repo-script,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,excluded-unclear
+A0285,UNCLEAR,"AWS_SECRET_ACCESS_KEY@27, CLERK_PRIVATE_SSH_KEY@28, BACKUP_PASSPHRASE@31",khong xac dinh duoc,unresolved-repo-script,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,excluded-unclear
+A0286,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0287,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0288,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0289,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0290,UNCLEAR,"GET_IPGEO@78, VMESS_URL@56, VLESS_URL@57",khong xac dinh duoc,unresolved-repo-script,EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,excluded-unclear
+A0291,UNCLEAR,MODEL_REGISTRY_PUBLISHING_KEY@157,curl@160 -> ${COORDINATOR_URL%/}/v1/admin/models/register ; COORDINATOR_URL = inputs.coordinator_url@156 la gia tri runtime,unresolved-runtime-value,EXFIL,NO_EXFIL,NO_EXFIL,NO_EXFIL,excluded-unclear
+A0292,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0293,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0294,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0295,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0296,NO_EXFIL,GITHUB_TOKEN@106,"ghcr.io@104, image ghcr.io/xberg-io/liter-llm@160-161 (sink loai tru muc 2.2)",excluded-sink,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN
+A0297,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0298,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,NO_EXFIL,NO_EXFIL,TN
+A0299,UNCLEAR,"LIGHTFRIEND_URL@25, NOTIFY_SERVER_TOKEN@28",curl@46 -> ${NOTIFY_SERVER_URL%/}/alert ; NOTIFY_SERVER_URL la secrets@27 nen khong giai duoc tinh,unresolved-endpoint-ownership,EXFIL,NO_EXFIL,NO_EXFIL,NO_EXFIL,excluded-unclear
+A0300,NO_EXFIL,-,-,agreement-no-review,NO_EXFIL,EXFIL,EXFIL,NO_EXFIL,TN

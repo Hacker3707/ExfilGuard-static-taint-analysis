@@ -1,0 +1,22 @@
+[
+ {
+  "Description": "GitHub Personal Access Token",
+  "StartLine": 8,
+  "EndLine": 8,
+  "StartColumn": 21,
+  "EndColumn": 60,
+  "Match": "REDACTED",
+  "Secret": "REDACTED",
+  "File": "/tmp/glctl/test.yml",
+  "SymlinkFile": "",
+  "Commit": "",
+  "Entropy": 4.0939426,
+  "Author": "",
+  "Email": "",
+  "Date": "",
+  "Message": "",
+  "Tags": [],
+  "RuleID": "github-pat",
+  "Fingerprint": "/tmp/glctl/test.yml:github-pat:8"
+ }
+]
