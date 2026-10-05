@@ -1,0 +1,23 @@
+name: B40-cross-file-bash-python-node
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      SECRET: "${{ secrets.TEST_SECRET }}"
+
+    steps:
+      - name: Write secret to file
+        run: |
+          echo "$SECRET" > secret.txt
+
+      - name: Process with Python
+        run: |
+          python3 scripts/s08_01/process_secret.py
+
+      - name: Send with Node.js
+        run: |
+          node scripts/s08_01/send_secret.js

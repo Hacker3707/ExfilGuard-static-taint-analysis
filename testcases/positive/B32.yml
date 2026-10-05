@@ -1,0 +1,10 @@
+name: B32-node-structured HTTP propagation
+on: workflow_dispatch
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      TOKEN: ${{ secrets.TEST_SECRET }}
+
+    steps:
+      - run: node scripts/s05_06.js
