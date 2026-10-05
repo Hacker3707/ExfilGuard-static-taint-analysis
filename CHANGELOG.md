@@ -1,8 +1,31 @@
 # CHANGELOG
 
-## [9c61afa]([https://github.com/Hacker3707/ExfilGuard-static-taint-analysis/commit/16f417b2f1a8192eccc9e20a2ba73ba6e2533f51](https://github.com/Hacker3707/ExfilGuard-static-taint-analysis/commit/9c61afa01db13de6167f03bd51c9f288d68a213e)) -  2026-09-23 03:40:14
+## [Dataset B v3] [d42fe2f]([https://github.com/Hacker3707/ExfilGuard-static-taint-analysis/commit/d42fe2fc209c8a82c8a83d1b4773ea5907488eff]) - 2026-05-10 14:03:58 UTC
 
-- ### Added
+### Added
+
+- Added 10 new test cases to Dataset B as an extended benchmark.
+- Added 3 new scenarios:
+  1. `S07` - Secret → transformation → sink
+  2. `S08` - Secret → cross-file / cross-language → sink
+  3. `S09` - Secret Fragmentation and Reconstruction
+
+- Extended attack patterns:
+  - third-party actions
+  - reusable workflows
+  - obfuscation/transformation
+  - artifact-mediated propagation
+  - indirect propagation
+  - cross-job propagation
+
+- Added 10 new test cases: `B31`–`B40`
+  - 9 positive / exploit cases
+  - 1 negative / benign case
+
+
+## [9c61afa]([https://github.com/Hacker3707/ExfilGuard-static-taint-analysis/commit/16f417b2f1a8192eccc9e20a2ba73ba6e2533f51](https://github.com/Hacker3707/ExfilGuard-static-taint-analysis/commit/9c61afa01db13de6167f03bd51c9f288d68a213e)) -  2026-09-23 03:40:14 UTC
+
+### Added
 - `run_ablation.py`: Added `--dataset` argument to run ablation experiments on a specified dataset, enabling reproduction of Figure 4 using Dataset B while preserving the existing default behavior on `testcases/`.
 
 ## [16f417b](https://github.com/Hacker3707/ExfilGuard-static-taint-analysis/commit/16f417b2f1a8192eccc9e20a2ba73ba6e2533f51) - 2026-09-22 16:53:00 UTC
