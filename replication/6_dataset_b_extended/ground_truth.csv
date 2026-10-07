@@ -9,3 +9,10 @@ B37,S07_Transformation,exploit,hard,bash_node_inline_bash,secrets.TEST_SECRET > 
 B38,S10_Indirect,exploit,hard,cross_job_github_output,secrets.TEST_SECRET > GITHUB_OUTPUT > needs.produce.outputs.token > curl --data,workflows/B38.yml,,Lan truyen qua job outputs
 B39,S07_Transformation,exploit,hard,node_inline_aes_fetch,secrets.TEST_SECRET > env SECRET > node -e AES encrypt > fetch body,workflows/B39.yml,,Node inline co bien doi ma hoa
 B40,S08_CrossFile,exploit,hard,filesystem_three_language,secrets.TEST_SECRET > secret.txt > process_secret.py > config.json > send_secret.js > fetch,workflows/B40.yml,scripts/s08_01/,Lan truyen qua file xuyen ba ngon ngu
+B41,S11_ThirdPartyAction,exploit,medium,action_input_http_post,secrets.TEST_SECRET > action input data > third party HTTP POST,workflows/B41.yml,,Secret passed as an input to an action that performs the request
+B42,S11_ThirdPartyAction,exploit,hard,action_inline_script_env,secrets.TEST_SECRET > env SECRET > github-script inline fetch body,workflows/B42.yml,,Sink lives inside the script input of an action
+B43,S11_ThirdPartyAction,benign,medium,trusted_action_consumes_secret,secrets.TEST_SECRET > actions/checkout token input with no outbound request,workflows/B43.yml,,Negative control for legitimate secret use by a trusted action
+B44,S12_ReusableWorkflow,exploit,hard,reusable_explicit_secret,secrets.TEST_SECRET > job secrets TOKEN > called workflow > curl --data,workflows/B44.yml,workflows/B44_called.yml,Secret crosses a workflow file boundary
+B45,S12_ReusableWorkflow,exploit,hard,reusable_secrets_inherit,secrets inherit > called workflow env SECRET > curl --data,workflows/B45.yml,workflows/B45_called.yml,Implicit secret propagation through inherit
+B46,S13_ArtifactUpload,exploit,medium,secret_written_then_uploaded,secrets.TEST_SECRET > env SECRET > build.log > upload-artifact,workflows/B46.yml,,Artifact store acts as the exfiltration channel
+B47,S13_ArtifactUpload,exploit,hard,env_dump_then_uploaded,secrets.TEST_SECRET > env SECRET > env dump to env.txt > upload-artifact,workflows/B47.yml,,Whole environment dumped and uploaded

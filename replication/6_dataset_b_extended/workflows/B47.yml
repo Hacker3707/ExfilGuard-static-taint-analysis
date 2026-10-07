@@ -1,0 +1,21 @@
+name: B47-artifact-upload-env-dump
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      SECRET: "${{ secrets.TEST_SECRET }}"
+
+    steps:
+      - name: Dump the environment for debugging
+        run: |
+          env > env.txt
+
+      - name: Upload the dump
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-env
+          path: env.txt

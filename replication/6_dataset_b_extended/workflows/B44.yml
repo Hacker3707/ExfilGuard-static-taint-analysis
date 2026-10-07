@@ -1,0 +1,10 @@
+name: B44-reusable-workflow-explicit-secret
+
+on:
+  workflow_dispatch:
+
+jobs:
+  call:
+    uses: ./.github/workflows/B44_called.yml
+    secrets:
+      TOKEN: "${{ secrets.TEST_SECRET }}"
