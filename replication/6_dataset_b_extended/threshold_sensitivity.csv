@@ -1,0 +1,13 @@
+dataset,min_risk_level,score_cutoff,alerts,n_eval,fpr_percent,tp,fn,fp,tn
+dataset_a,LOW,2.0,11,262,4.2,,,,
+dataset_a,MEDIUM,4.0,11,262,4.2,,,,
+dataset_a,HIGH,6.0,10,262,3.8,,,,
+dataset_a,CRITICAL,8.0,10,262,3.8,,,,
+dataset_b,LOW,2.0,,,0.0,18,0,0,12
+dataset_b,MEDIUM,4.0,,,0.0,18,0,0,12
+dataset_b,HIGH,6.0,,,0.0,18,0,0,12
+dataset_b,CRITICAL,8.0,,,0.0,12,6,0,12
+extended,LOW,2.0,,,50.0,3,12,1,1
+extended,MEDIUM,4.0,,,50.0,3,12,1,1
+extended,HIGH,6.0,,,50.0,2,13,1,1
+extended,CRITICAL,8.0,,,50.0,1,14,1,1
