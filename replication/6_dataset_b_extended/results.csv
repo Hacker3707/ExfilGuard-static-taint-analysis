@@ -1,18 +1,18 @@
-case_id,label,detected,verdict,max_risk,level
-B31,exploit,no,FN,0,
-B32,exploit,no,FN,0,
-B33,exploit,no,FN,0,
-B34,benign,yes,FP,9.0,CRITICAL
-B35,exploit,no,FN,0,
-B36,exploit,yes,TP,9.0,CRITICAL
-B37,exploit,no,FN,0,
-B38,exploit,no,FN,0,
-B39,exploit,yes,TP,7.5,HIGH
-B40,exploit,no,FN,0,
-B41,exploit,no,FN,0,
-B42,exploit,no,FN,0,
-B43,benign,no,TN,0,
-B44,exploit,no,FN,0,
-B45,exploit,no,FN,0,
-B46,exploit,yes,TP,5.4,MEDIUM
-B47,exploit,no,FN,0,
+case_id,label,detected,verdict,max_risk,level,sink,path
+B31,exploit,no,FN,0,,,
+B32,exploit,no,FN,0,,,
+B33,exploit,no,FN,0,,,
+B34,benign,yes,FP,9.0,CRITICAL,curl,${{ secrets.TEST_SECRET }} > job.env.SECRET > curl
+B35,exploit,no,FN,0,,,
+B36,exploit,yes,TP,9.0,CRITICAL,curl,${{ secrets.API_KEY }} > job.env.API_KEY > curl
+B37,exploit,no,FN,0,,,
+B38,exploit,no,FN,0,,,
+B39,exploit,yes,TP,7.5,HIGH,fetch,${{ secrets.TEST_SECRET }} > job.env.SECRET > test.step_1.node.encrypted > fetch
+B40,exploit,no,FN,0,,,
+B41,exploit,no,FN,0,,,
+B42,exploit,no,FN,0,,,
+B43,benign,no,TN,0,,,
+B44,exploit,no,FN,0,,,
+B45,exploit,no,FN,0,,,
+B46,exploit,yes,TP,5.4,MEDIUM,actions/upload-artifact@v4,${{ secrets.TEST_SECRET }} > job.env.SECRET > file:build.log > upload-artifact
+B47,exploit,no,FN,0,,,
