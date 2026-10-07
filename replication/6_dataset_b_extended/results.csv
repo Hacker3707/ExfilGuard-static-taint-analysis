@@ -1,0 +1,11 @@
+case_id,label,detected,verdict
+B31,exploit,no,FN
+B32,exploit,no,FN
+B33,exploit,no,FN
+B34,benign,yes,FP
+B35,exploit,no,FN
+B36,exploit,yes,TP
+B37,exploit,no,FN
+B38,exploit,no,FN
+B39,exploit,no,FN
+B40,exploit,no,FN

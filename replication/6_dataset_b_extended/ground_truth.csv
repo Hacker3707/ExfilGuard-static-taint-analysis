@@ -1,0 +1,11 @@
+case_id,scenario,label,difficulty,pattern,expected_taint_path,workflow_file,script_file,notes
+B31,S07_Transformation,exploit,hard,python_inline_urlencode,secrets.TEST_SECRET > env SECRET > python3 -c quote > curl --data,workflows/B31.yml,,Inline Python doc secret qua os.environ
+B32,S08_CrossFile,exploit,hard,node_script_url_path,secrets.TEST_SECRET > env TOKEN > s05_06.js process.env > https.request path,workflows/B32.yml,scripts/s05_06.js,Secret nam trong duong dan URL
+B33,S10_Indirect,exploit,medium,secret_as_curl_url,secrets.TEST_SECRET > env SECRET > curl positional URL,workflows/B33.yml,,Secret la dia chi dich khong phai payload
+B34,S07_Transformation,benign,medium,overwrite_before_sink,env SECRET bi ghi de bang literal truoc sink,workflows/B34.yml,,Negative control cho assignment kill
+B35,S09_Fragmentation,exploit,hard,substring_split_rejoin,secrets.TEST_SECRET > env SECRET > substring slices > noi lai > curl --data,workflows/B35.yml,,Cat chuoi roi ghep lai
+B36,S07_Transformation,exploit,medium,literal_concatenation,secrets.API_KEY > env API_KEY co tien to va hau to > curl --data,workflows/B36.yml,,Secret long trong chuoi literal lon hon
+B37,S07_Transformation,exploit,hard,bash_node_inline_bash,secrets.TEST_SECRET > env SECRET > node -e base64 > curl --data,workflows/B37.yml,,Vong qua chuong trinh Node inline
+B38,S10_Indirect,exploit,hard,cross_job_github_output,secrets.TEST_SECRET > GITHUB_OUTPUT > needs.produce.outputs.token > curl --data,workflows/B38.yml,,Lan truyen qua job outputs
+B39,S07_Transformation,exploit,hard,node_inline_aes_fetch,secrets.TEST_SECRET > env SECRET > node -e AES encrypt > fetch body,workflows/B39.yml,,Node inline co bien doi ma hoa
+B40,S08_CrossFile,exploit,hard,filesystem_three_language,secrets.TEST_SECRET > secret.txt > process_secret.py > config.json > send_secret.js > fetch,workflows/B40.yml,scripts/s08_01/,Lan truyen qua file xuyen ba ngon ngu

