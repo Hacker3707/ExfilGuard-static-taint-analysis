@@ -81,8 +81,6 @@ ALLOWLISTED_DOMAINS = {
     # Local / internal destinations
     "localhost",
     "127.0.0.1",
-    "vault.internal",
-    "company.com",
 }
 
 def get_python_env_name(expression):

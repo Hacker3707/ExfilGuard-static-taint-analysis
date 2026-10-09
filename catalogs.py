@@ -139,7 +139,7 @@ NODEJS_SINK_PATTERN = re.compile(
 ALLOWLISTED_DOMAINS = {
     "api.github.com", "uploads.github.com", "github.com",
     "pypi.org", "files.pythonhosted.org", "registry.npmjs.org",
-    "ghcr.io", "localhost", "127.0.0.1", "vault.internal", "company.com"
+    "ghcr.io", "localhost", "127.0.0.1"
 }
 
 # ==============================================================================

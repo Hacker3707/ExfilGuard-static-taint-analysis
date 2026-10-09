@@ -32,8 +32,6 @@ ALLOWLISTED_DOMAINS = (
     "ghcr.io",
     "localhost",
     "127.0.0.1",
-    "vault.internal",
-    "company.com",
 )
 
 # ==============================================================================
