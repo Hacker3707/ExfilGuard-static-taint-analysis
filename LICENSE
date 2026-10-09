@@ -1,0 +1,54 @@
+MIT License
+
+Copyright (c) 2026 Group 5, College of Technology and Design,
+University of Economics Ho Chi Minh City (UEH)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+================================================================================
+SCOPE NOTE: THIRD-PARTY CONTENT NOT COVERED BY THIS LICENSE
+================================================================================
+
+The MIT License above applies to the software authored by this group: the
+analyser and its modules, the evaluation and reproduction scripts, the
+hand-written benchmark workflows under replication/3_dataset_b/ and
+replication/6_dataset_b_extended/, the test cases under testcases/, and the
+documentation.
+
+It does NOT apply to the following, which are third-party material collected
+from public GitHub repositories and redistributed here only so that the
+published results can be independently verified:
+
+  - replication/4_dataset_a_sample/
+        300 GitHub Actions workflow files retrieved through the GitHub Search
+        API on 5 September 2026, renamed to AXXXX__<original file name>.yml.
+
+  - The release asset dataset_a_corpus_raw.zip
+        The 23,995 workflow files returned by the same crawl.
+
+Each of those files remains under the license of the project it came from, and
+copyright remains with its original authors. The file name of every sample
+records the source repository, so provenance can be traced. They are included
+under a research and verification rationale only. If you are the owner of a
+repository represented in this corpus and want a file removed, open an issue
+and it will be removed.
+
+The baseline tools compared against in the paper, Gitleaks, Zizmor and Poutine,
+are not redistributed here. Only their output on the two datasets is stored,
+under replication/out/ and replication/out_dsb/.
